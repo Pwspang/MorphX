@@ -188,9 +188,7 @@ def default_smsched_env(user_value: Optional[str]) -> str:
 
 
 def default_smsched_model_env(user_value: Optional[str]) -> str:
-    if user_value:
-        return user_value
-    return default_smsched_env(None)
+    return default_smsched_env(user_value)
 
 
 def python_lib_dir(python_bin: str) -> Optional[Path]:

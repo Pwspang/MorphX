@@ -10,10 +10,10 @@ from typing import IO, Mapping, Optional, Sequence
 
 
 def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5.0) -> None:
-    """Terminate a timed-out command and every descendant in its process group."""
+    """Terminate a command and every descendant in its process group."""
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except OSError:
         pass
 
     try:
@@ -23,9 +23,21 @@ def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5
 
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except OSError:
         pass
-    process.wait()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _close_process_pipes(process: subprocess.Popen) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 def run_process(
@@ -39,7 +51,7 @@ def run_process(
     text: bool = True,
     timeout: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
-    """Run a command, cleaning up its whole process tree if it exceeds timeout."""
+    """Run a command and clean up its process tree on timeout or interruption."""
     process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -54,12 +66,16 @@ def run_process(
         stdout_data, stderr_data = process.communicate(input=stdin_text, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _terminate_process_group(process)
-        stdout_data, stderr_data = process.communicate()
+        _close_process_pipes(process)
         raise subprocess.TimeoutExpired(
             command,
             timeout,
-            output=stdout_data if stdout_data is not None else exc.output,
-            stderr=stderr_data if stderr_data is not None else exc.stderr,
+            output=exc.output,
+            stderr=exc.stderr,
         ) from exc
+    except BaseException:
+        _terminate_process_group(process)
+        _close_process_pipes(process)
+        raise
 
     return subprocess.CompletedProcess(command, process.returncode, stdout_data, stderr_data)
