@@ -434,6 +434,7 @@ def build_for_part(part_name: str, args: argparse.Namespace, *, prefix: str = "[
 
 def pd_smsched_env() -> str:
     return (
+        f"NEUTRINO_HOOK_DRIVER={REPO_ROOT / 'runtime' / 'build' / 'libcuda.so'} "
         f"LD_PRELOAD={REPO_ROOT / 'runtime' / 'build' / 'libcuda.so'}:"
         f"{REPO_ROOT / 'runtime' / 'build' / 'libpreload.so'} "
         "SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
@@ -442,6 +443,7 @@ def pd_smsched_env() -> str:
 
 def part1_mm_smsched_env() -> str:
     return (
+        f"NEUTRINO_HOOK_DRIVER={REPO_ROOT / 'runtime' / 'build' / 'libcuda.so'} "
         f"LD_PRELOAD={REPO_ROOT / 'runtime' / 'build' / 'libcuda.so'}:"
         f"{REPO_ROOT / 'runtime' / 'build' / 'libpreload.so'} "
         "SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1"

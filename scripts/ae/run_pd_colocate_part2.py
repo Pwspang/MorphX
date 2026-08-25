@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from process_control import run_process
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PD_SCRIPT = REPO_ROOT / "scripts" / "test-pd-online.py"
@@ -33,6 +35,7 @@ PD_SCRIPT = REPO_ROOT / "scripts" / "test-pd-online.py"
 DEFAULT_DURATION_SECONDS = 180.0
 DEFAULT_MODEL = "llama-3-8b"
 DEFAULT_REQUEST_TYPE = "poisson"
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 
 VARIANTS = ("baseline", "smsched", "stream", "chunked")
 METRICS = ("avg", "p99", "ttft_avg", "ttft_p99")
@@ -193,6 +196,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-runs", type=int, default=None, help="Stop after this many child runs.")
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=DEFAULT_RUN_TIMEOUT_SECONDS,
+        help="Maximum wall time for one child run in seconds; use 0 to disable.",
+    )
     parser.add_argument("--skip-existing", action="store_true", help="Skip logs that already contain final output.")
     parser.add_argument("--fail-fast", action="store_true", help="Abort on the first failed child run.")
     parser.add_argument(
@@ -589,11 +598,12 @@ def common_env_updates(args: argparse.Namespace) -> dict[str, str]:
 
 
 def default_smsched_env(user_value: Optional[str]) -> str:
-    if user_value:
-        return user_value
     cuda_hook = REPO_ROOT / "runtime" / "build" / "libcuda.so"
     preload = REPO_ROOT / "runtime" / "build" / "libpreload.so"
-    return f"LD_PRELOAD={cuda_hook}:{preload}"
+    assignments = user_value or f"LD_PRELOAD={cuda_hook}:{preload}"
+    if "NEUTRINO_HOOK_DRIVER" not in split_env_assignments(assignments):
+        assignments = f"NEUTRINO_HOOK_DRIVER={cuda_hook} {assignments}"
+    return assignments
 
 
 def write_workload_configs(args: argparse.Namespace, rows: Sequence[WorkloadRow], output_dir: Path) -> dict[tuple[str, str], Path]:
@@ -708,15 +718,14 @@ def run_command(
         stderr_handle = stderr_path.open("a", encoding="utf-8")
         stderr_target = stderr_handle
     try:
-        return subprocess.run(
+        return run_process(
             command,
-            cwd=str(cwd),
+            cwd=cwd,
             env=env,
             stdout=stdout_target,
             stderr=stderr_target,
             text=True,
             timeout=timeout,
-            check=False,
         )
     finally:
         if stdout_handle is not None:
@@ -771,18 +780,27 @@ def run_spec(args: argparse.Namespace, spec: RunSpec) -> dict[str, object]:
     if spec.env_removals:
         append_text(spec.err_path, f"[AE] env removals: {', '.join(spec.env_removals)}\n")
 
-    result = run_command(
-        spec.command,
-        cwd=PD_SCRIPT.parent,
-        env=env,
-        stdout_path=spec.log_path,
-        stderr_path=spec.err_path,
-    )
-    returncode = result.returncode
-    if returncode != 0:
-        status = "failed"
-    elif not has_complete_log(spec.log_path):
-        status = "incomplete"
+    try:
+        result = run_command(
+            spec.command,
+            cwd=PD_SCRIPT.parent,
+            env=env,
+            stdout_path=spec.log_path,
+            stderr_path=spec.err_path,
+            timeout=args.run_timeout if args.run_timeout > 0 else None,
+        )
+        returncode = result.returncode
+        if returncode != 0:
+            status = "failed"
+        elif not has_complete_log(spec.log_path):
+            status = "incomplete"
+    except subprocess.TimeoutExpired:
+        returncode = 124
+        status = "timeout"
+        append_text(
+            spec.err_path,
+            f"[AE] run exceeded {args.run_timeout:g}s; terminated the complete child process group\n",
+        )
 
     return {
         "status": status,
@@ -1065,6 +1083,9 @@ def preflight(args: argparse.Namespace, output_dir: Path) -> tuple[bool, list[st
             for preload_path in ld_preload.split(":"):
                 if preload_path and not Path(preload_path).exists():
                     warnings.append(f"MorphX LD_PRELOAD target is missing: {preload_path}")
+        hook_driver = smsched_updates.get("NEUTRINO_HOOK_DRIVER")
+        if not hook_driver or not Path(hook_driver).exists():
+            warnings.append(f"MorphX hook driver is missing: {hook_driver or '<unset>'}")
     except ValueError as exc:
         errors.append(str(exc))
 

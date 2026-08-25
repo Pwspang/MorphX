@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from process_control import run_process
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COLOCATE_DIR = REPO_ROOT / "scripts" / "colocate"
@@ -39,6 +41,7 @@ DEFAULT_OUTPUT_LENGTH = 2048
 DEFAULT_GGNN_BASE_SIZE = 1_000_000
 DEFAULT_GGNN_QUERY_SIZE = 10_000
 DEFAULT_MM_SIZE = 8192
+DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 
 SCHEDULERS = (
     "mps-30",
@@ -218,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         help="Set SMSCHED_DEBUG=1 for smsched runs. Intended only for short diagnostic runs.",
     )
     parser.add_argument("--max-runs", type=int, default=None, help="Stop after this many scheduler runs.")
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=DEFAULT_RUN_TIMEOUT_SECONDS,
+        help="Maximum wall time for one scheduler run in seconds; use 0 to disable.",
+    )
     parser.add_argument("--skip-existing", action="store_true", help="Skip logs that already contain a results block.")
     parser.add_argument("--fail-fast", action="store_true", help="Abort on the first failed scheduler run.")
     parser.add_argument(
@@ -586,11 +595,12 @@ def mps_client_cuda_visible_devices(value: Optional[str]) -> Optional[str]:
 
 
 def default_smsched_env(user_value: Optional[str]) -> str:
-    if user_value:
-        return user_value
     cuda_hook = REPO_ROOT / "runtime" / "build" / "libcuda.so"
     preload = REPO_ROOT / "runtime" / "build" / "libpreload.so"
-    return f"LD_PRELOAD={cuda_hook}:{preload}"
+    assignments = user_value or f"LD_PRELOAD={cuda_hook}:{preload}"
+    if "NEUTRINO_HOOK_DRIVER" not in split_env_assignments(assignments):
+        assignments = f"NEUTRINO_HOOK_DRIVER={cuda_hook} {assignments}"
+    return assignments
 
 
 def build_tgs_preload_string(priority: str) -> Optional[str]:
@@ -794,16 +804,15 @@ def run_command(
         stderr_handle = stderr_path.open("ab")
         stderr_target = stderr_handle
     try:
-        return subprocess.run(
+        return run_process(
             command,
-            cwd=str(cwd),
+            cwd=cwd,
             env=env,
-            input=input_text,
+            stdin_text=input_text,
             text=True,
             stdout=stdout_target,
             stderr=stderr_target,
             timeout=timeout,
-            check=False,
         )
     finally:
         if stdout_handle is not None:
@@ -1033,16 +1042,25 @@ def run_spec(args: argparse.Namespace, spec: RunSpec) -> dict[str, object]:
         append_text(spec.err_path, f"[AE] env removals: {', '.join(spec.env_removals)}\n")
 
     try:
-        result = run_command(
-            spec.command,
-            cwd=COLOCATE_DIR,
-            env=env,
-            stdout_path=spec.log_path,
-            stderr_path=spec.err_path,
-        )
-        returncode = result.returncode
-        if returncode != 0:
-            status = "failed"
+        try:
+            result = run_command(
+                spec.command,
+                cwd=COLOCATE_DIR,
+                env=env,
+                stdout_path=spec.log_path,
+                stderr_path=spec.err_path,
+                timeout=args.run_timeout if args.run_timeout > 0 else None,
+            )
+            returncode = result.returncode
+            if returncode != 0:
+                status = "failed"
+        except subprocess.TimeoutExpired:
+            returncode = 124
+            status = "timeout"
+            append_text(
+                spec.err_path,
+                f"[AE] run exceeded {args.run_timeout:g}s; terminated the complete child process group\n",
+            )
     finally:
         if spec.scheduler.startswith("mps-"):
             stop_mps(args, spec.err_path)
@@ -1247,6 +1265,9 @@ def preflight(args: argparse.Namespace, output_dir: Path) -> tuple[bool, list[st
             for preload_path in ld_preload.split(":"):
                 if preload_path and not Path(preload_path).exists():
                     warnings.append(f"MorphX LD_PRELOAD target is missing: {preload_path}")
+        hook_driver = smsched_updates.get("NEUTRINO_HOOK_DRIVER")
+        if not hook_driver or not Path(hook_driver).exists():
+            warnings.append(f"MorphX hook driver is missing: {hook_driver or '<unset>'}")
     except ValueError as exc:
         errors.append(str(exc))
 

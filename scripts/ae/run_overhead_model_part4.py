@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from process_control import run_process
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OVERHEAD_DIR = REPO_ROOT / "scripts" / "overhead"
@@ -35,6 +37,7 @@ BENCH_BIN_MODEL = MICROBENCH_MODEL_BUILD / "bench"
 OVERHEAD_TASKS = ("DNN", "GEMM", "GEMV", "GGNN", "LLM")
 OVERHEAD_METHODS = ("base", "ncu", "neutrino", "nvbit", "smsched")
 MODEL_SERIES = ("16", "128", "512", "8192", "ggnn")
+DEFAULT_RUN_TIMEOUT_SECONDS = 7200.0
 SYSTEM_NAME_RE = re.compile("smsched", re.IGNORECASE)
 SMSCHED_CONDA_ENV_RE = re.compile(r"(?<=/envs/)smsched(?=/)", re.IGNORECASE)
 METHOD_LABELS = {"smsched": "MorphX"}
@@ -137,6 +140,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only-series", action="append", choices=MODEL_SERIES, help="Limit Figure16 to selected series.")
     parser.add_argument("--skip-existing", action="store_true", help="Reuse complete logs in the output directory.")
     parser.add_argument("--fail-fast", action="store_true", help="Abort after the first failed child run.")
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=DEFAULT_RUN_TIMEOUT_SECONDS,
+        help="Maximum wall time for one profiler or model run in seconds; use 0 to disable.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Write commands without executing them.")
     parser.add_argument("--preflight-only", action="store_true", help="Run preflight checks and exit.")
     parser.add_argument("--analyze-only", action="store_true", help="Only analyze existing logs in --output-dir.")
@@ -170,11 +179,12 @@ def split_env_assignments(assignments: Optional[str]) -> dict[str, str]:
 
 
 def default_smsched_env(user_value: Optional[str]) -> str:
-    if user_value:
-        return user_value
     cuda_hook = REPO_ROOT / "runtime" / "build" / "libcuda.so"
     preload = REPO_ROOT / "runtime" / "build" / "libpreload.so"
-    return f"LD_PRELOAD={cuda_hook}:{preload}"
+    assignments = user_value or f"LD_PRELOAD={cuda_hook}:{preload}"
+    if "NEUTRINO_HOOK_DRIVER" not in split_env_assignments(assignments):
+        assignments = f"NEUTRINO_HOOK_DRIVER={cuda_hook} {assignments}"
+    return assignments
 
 
 def default_smsched_model_env(user_value: Optional[str]) -> str:
@@ -369,6 +379,7 @@ def run_command(
     log_path: Path,
     err_path: Path,
     dry_run: bool,
+    timeout: Optional[float],
 ) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command_line = " ".join(shlex.quote(part) for part in command)
@@ -382,8 +393,22 @@ def run_command(
             stdout_handle.write("# dry-run: command not executed\n")
             return 0
         start = time.monotonic()
-        process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=stdout_handle, stderr=stderr_handle, text=True)
-        return_code = process.wait()
+        try:
+            result = run_process(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                timeout=timeout,
+            )
+            return_code = result.returncode
+        except subprocess.TimeoutExpired:
+            return_code = 124
+            stderr_handle.write(
+                f"[AE] run exceeded {timeout:g}s; terminated the complete child process group\n"
+            )
         elapsed = time.monotonic() - start
         stdout_handle.write(f"# finished: {dt.datetime.now().isoformat()}\n# returncode: {return_code}\n# elapsed_seconds: {elapsed:.3f}\n")
     return return_code
@@ -539,7 +564,16 @@ def run_overhead(args: argparse.Namespace) -> bool:
             print(f"[AE][part3][Figure15][run {done}/{total}] START task={task} method={method_label(method)}", flush=True)
             run_start = time.monotonic()
             env = build_child_env(args, env_updates, removals)
-            rc = run_command(f"Figure15 {task}/{method_label(method)}", command, OVERHEAD_DIR, env, log_path, err_path, args.dry_run)
+            rc = run_command(
+                f"Figure15 {task}/{method_label(method)}",
+                command,
+                OVERHEAD_DIR,
+                env,
+                log_path,
+                err_path,
+                args.dry_run,
+                args.run_timeout if args.run_timeout > 0 else None,
+            )
             run_elapsed = time.monotonic() - run_start
             total_elapsed = time.monotonic() - wall_start
             remaining = (total_elapsed / done) * (total - done) if done else 0.0
@@ -612,7 +646,16 @@ def run_model(args: argparse.Namespace) -> bool:
         print(f"[AE][part4][Figure16][run {idx}/{len(series_list)}] START series={series}", flush=True)
         run_start = time.monotonic()
         env = build_child_env(args, env_updates, include_mpi_stub=(series == "ggnn"), clean_base=True)
-        rc = run_command(f"Figure16 {series}", command, cwd, env, log_path, err_path, args.dry_run)
+        rc = run_command(
+            f"Figure16 {series}",
+            command,
+            cwd,
+            env,
+            log_path,
+            err_path,
+            args.dry_run,
+            args.run_timeout if args.run_timeout > 0 else None,
+        )
         run_elapsed = time.monotonic() - run_start
         total_elapsed = time.monotonic() - wall_start
         remaining = (total_elapsed / idx) * (len(series_list) - idx) if idx else 0.0
