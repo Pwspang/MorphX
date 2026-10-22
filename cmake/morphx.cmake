@@ -107,6 +107,10 @@ else()
         --cuda-path=${MORPHX_CUDA_ROOT}
         --cuda-gpu-arch=sm_${MORPHX_CUDA_ARCH}
         -Wno-unknown-cuda-version
+        # clang doesn't define these; without them CUTLASS compiles its
+        # tensor-core MMAs as traps (CUTLASS_ARCH_MMA_SM80_SUPPORTED unset).
+        -D__CUDACC_VER_MAJOR__=${MORPHX_CUDA_VERSION_MAJOR}
+        -D__CUDACC_VER_MINOR__=${MORPHX_CUDA_VERSION_MINOR}
     )
     set(MORPHX_STDLIB_COMPILE_FLAGS "")
     set(MORPHX_STDLIB_CXX_FLAGS "")
