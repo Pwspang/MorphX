@@ -745,6 +745,28 @@ On the H200 this row is light (TTFT ≈ 75 ms vs 257 ms on the A100), the
 prefill thread already helps a little (stream −5.5 % latency vs baseline), and
 MorphX is +24 % worse than baseline because it adds per-launch overhead without
 splitting SMs (see the finding above).
+
+Row `in-2048-out-256-rps-5` (job 91476), plus an experiment with a local,
+uncommitted runtime build that forces CI = 1 for grids ≥ 500 blocks (the
+prefill GEMMs) so the PD split actually happens:
+
+| Variant | Served | TTFT avg (ms) | Latency avg (ms) | TBT avg (ms) |
+|---|---|---|---|---|
+| baseline | 242 | 74.1 | 6633 | 25.7 |
+| stream | 242 | 81.1 | 6449 | 25.0 |
+| MorphX | 236 | 89.7 | 8278 | 32.1 |
+| MorphX, forced CI (split 93: prefill `[0,93)`, decode `[93,132)` while a prefill GEMM runs) | 232 | 105.6 | 10296 | 40.0 |
+| rps-3, MorphX forced CI | 145 | 109.8 | 6711 | 25.9 |
+
+With the split forced on, the runtime does what the paper describes (1180
+prefill-stream launches limited to `[0,93)`, decode-stream kernels moved to
+`[93,132)` while prefill runs), but at these loads it makes decode slower, not
+faster: 39 SMs are too few for decode, and the H200 has spare capacity at the
+A100 row loads. Before Fig 13–14 can show a MorphX gain on the H200 the split
+hint needs re-tuning (or rows with more load), on top of the runtime changes
+above. All J3 numbers use the runtime from before Track C3 (`runtime/` as of
+6a2746d, memcpy backend); C3 (ae2f76e) cut the per-launch cost, so the MorphX
+rows should be re-measured on it.
 6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
        (`logs/<timestamp>-sglang/`).
 
