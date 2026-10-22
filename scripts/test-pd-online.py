@@ -9,20 +9,38 @@ import torch.nn as nn
 import sys
 import numpy as np
 from contextlib import contextmanager
-from vllm import EngineArgs, LLMEngine, RequestOutput, SamplingParams
-from vllm.utils import FlexibleArgumentParser
-from vllm.inputs import TokensPrompt
 import threading
 import json
-import smsched_api
+try:
+    import smsched_api  # noqa: F401 (loads runtime/build/libapi.so; unused by this workload)
+except OSError:
+    smsched_api = None
+
+# LLM engine is selectable for the H100/H200 port (scripts/sglang):
+#   MORPHX_LLM_BACKEND=vllm|sglang  (default vllm: the authors' fork with VLLM_PREFILL_THREAD)
+# With sglang, VLLM_PREFILL_THREAD=1 (or MORPHX_PREFILL_THREAD=1) runs prefills in a
+# worker thread on their own stream, and --enable-chunked-prefill uses mixed batches
+# (scripts/sglang/runner.py).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sglang"))
+import backend as llm_backend  # noqa: E402
+
+_LLM = None
+
+
+def get_llm_backend():
+    global _LLM
+    if _LLM is None:
+        _LLM = llm_backend.get_backend()
+    return _LLM
 
 # Machine-specific settings (see scripts/ae/morphx_env.py); defaults match the A100 AE machine.
 HF_CACHE = os.environ.get("MORPHX_HF_CACHE") or "/huggingface-cache/hub"
 _CUDA_ARCH = int(os.environ.get("MORPHX_CUDA_ARCH") or "80")
 os.environ["TORCH_CUDA_ARCH_LIST"] = f"{_CUDA_ARCH // 10}.{_CUDA_ARCH % 10}"
-os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-os.environ["VLLM_USE_V1"] = "0"
+if llm_backend.backend_name() == "vllm":
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+    os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+    os.environ["VLLM_USE_V1"] = "0"
 # os.environ["VLLM_PREFILL_THREAD"] = "1"
 
 
@@ -54,14 +72,15 @@ model_paths = {
     "gpt2-l": f"{HF_CACHE}/models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519"
 }
 
-def create_prompts(vocab_size, num_requests, input_len, output_len) -> list[tuple[TokensPrompt, SamplingParams]]:
+def create_prompts(vocab_size, num_requests, input_len, output_len) -> list:
+    llm = get_llm_backend()
     input_lens = torch.full((num_requests,), input_len, dtype=torch.int32, device="cuda")
     output_lens = torch.full((num_requests,), output_len, dtype=torch.int32, device="cuda")
     requests = []
     for i in range(num_requests):
         token_ids = [(i + j) % vocab_size for j in range(input_lens[i])]
-        prompt = TokensPrompt(prompt_token_ids=token_ids)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=output_lens[i], min_tokens=output_lens[i])
+        prompt = llm.make_prompt(token_ids)
+        sampling_params = llm.make_sampling_params(max_tokens=int(output_lens[i]), min_tokens=int(output_lens[i]))
         requests.append((prompt, sampling_params))
     return requests
 
@@ -103,7 +122,7 @@ def process_in_thread(tid, engine, stream, total_time, task):
             if engine.has_unfinished_requests():
                 # print(f"Step time: {time.time() - start_time:.2f}s", flush=True)
                 # print("step...", flush=True)
-                request_outputs: list[RequestOutput] = engine.step()
+                request_outputs = engine.step()
                 if request_outputs is None:
                     continue
                 elif len(request_outputs) == 0:
@@ -193,19 +212,19 @@ def process_in_thread(tid, engine, stream, total_time, task):
 
         engine.wait_prefill_shutdown()
 
-def initialize_engine(model, input_length, output_length, enable_chunked_prefill: bool) -> LLMEngine:
+def initialize_engine(model, input_length, output_length, enable_chunked_prefill: bool, stream=None):
     context_length = input_length + output_length
-    engine_args = EngineArgs(
-        model=model_paths[model],
-        enforce_eager=True,
-        max_model_len=context_length,
-        max_num_batched_tokens=context_length,
-        max_num_seqs=128,
-        enable_chunked_prefill=enable_chunked_prefill,
-        gpu_memory_utilization=0.9,
-    )
+    model = llm_backend.resolve_model_alias(model)
     with without_child_ld_preload():
-        return LLMEngine.from_engine_args(engine_args)
+        return get_llm_backend().create_engine(
+            model_paths.get(model, model),
+            max_model_len=context_length,
+            max_num_batched_tokens=context_length,
+            max_num_seqs=128,
+            enable_chunked_prefill=enable_chunked_prefill,
+            gpu_memory_utilization=0.9,
+            stream=stream,
+        )
 
 
 def main(data, enable_chunked_prefill: bool = False):
@@ -218,7 +237,13 @@ def main(data, enable_chunked_prefill: bool = False):
             int(data.get("input_length")),
             int(data.get("output_length")),
             enable_chunked_prefill,
+            stream=stream,
         )
+        # SGLang JIT-compiles some kernels on first use, and the MorphX runtime profiles
+        # every kernel on its first launch; do both before the timed workload
+        # (MORPHX_LLM_WARMUP=0 to skip). The vLLM fork has no warmup hook.
+        if hasattr(engine, "warmup") and os.environ.get("MORPHX_LLM_WARMUP", "1") != "0":
+            engine.warmup(int(data.get("input_length")), 4)
     stream.synchronize()
 
     process_in_thread(0, engine, stream, total_time, data)

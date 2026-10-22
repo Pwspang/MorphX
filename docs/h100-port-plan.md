@@ -680,7 +680,93 @@ Fig 11(a) point `llm-1-mm-1` (60 s instead of 180 s, Qwen3-8B, ShareGPT 2048/204
 At this lightest point the GEMM side is rate-limited (≈2 % of the GPU), so there
 is little contention for MorphX to remove; its +15 % TBT matches the memcpy
 backend's per-launch host cost measured in §5 (decode step +15 %).
-5. [ ] Prefill thread/stream in SGLang → Fig 13–14 with SGLang.
+5. [~] Prefill thread/stream in SGLang → Fig 13–14 with SGLang (Track J3). Runs end to
+       end; MorphX doesn't split SMs yet on H200 (runtime change needed, below).
+       - **Prefill thread** (`scripts/sglang/runner.py`, `VLLM_PREFILL_THREAD=1` or
+         `MORPHX_PREFILL_THREAD=1`): a worker thread prefills on its own CUDA stream
+         with its own attention backend (FlashInfer wrappers share one workspace per
+         backend, so a second backend gets `init_new_workspace=True`) while the caller
+         decodes on its stream. Finished prefills join the decode batch at the next
+         `step()`; `get_prefill_result(isBlock=True)` blocks for one when nothing is
+         decoding (the fork's API, used by `test-pd-online.py`). KV/req-slot
+         bookkeeping (`_kv_section()`) is serialized with a lock and ordered across
+         the two streams with events (the allocator's free list is a GPU tensor both
+         threads slice and concatenate); merges sync the decode stream before the
+         prefill-stream tensors are dropped.
+       - **Chunked prefill** (`--enable-chunked-prefill`): vLLM V0-style mixed
+         batches — every running request decodes and the rest of
+         `max_num_batched_tokens` is filled with prompt chunks (the continuing
+         chunked request first) in one forward, via `ScheduleBatch.mix_with_running`.
+       - `test-pd-online.py` goes through `scripts/sglang/backend.py` (vLLM path
+         unchanged) and warms up one request before the timed run
+         (`MORPHX_LLM_WARMUP=0` to skip), so SGLang's JIT compiles and the MorphX
+         runtime's first-launch profiling are not in the measurement.
+       - **Correctness** (`scripts/sglang/check_pd_modes.py`, Qwen3-4B fp16 +
+         mycutlass, 12 × 1024 in / 32 out, greedy): bookkeeping exact in every mode
+         (all KV returned, reservations 0). Token-exact vs running each request
+         alone: prefill thread 12/12 (also under the MorphX runtime), serial 10/12,
+         chunked 11/12. Serial vs serial with reversed submission order is 12/12;
+         the remaining differences come from fp16 numerics of different decode
+         batch shapes (mycutlass picks tiles by shape), not from scheduling.
+       - **What the MorphX LLM runtime (`cuda-llm.cpp`, `SMSCHED_LLM_TRICK_MODE=0`
+         as in `run_all.py`) does with it:** only pass-built kernels are scheduled
+         (here: the mycutlass GEMMs; FlashInfer/sgl-kernel are unpatched). A kernel
+         profiled with CI ≥ 0.9 gets `[0, split)` at launch, and while it runs,
+         `schedule_2` puts the other streams' kernels on `[split, nrSM)`. Kernels
+         with a wave time < 50 µs bypass the runtime. Kernel names containing
+         `float32` are dropped without launching (`cuda-llm.cpp:~950`); greedy
+         tokens under the runtime matched those without it (Qwen3-4B), so nothing
+         needed was dropped here, but it is a trap for other models.
+       - **Finding: no PD split happens on H200.** The prefill GEMMs profile as
+         memory-bound: CI 0.40 (128×128 tile, grid 768: 112 µs/wave at 132 SMs →
+         72 µs at 33 SMs) and 0.41 (64×256, grid 594); decode GEMMs 0.13–0.51. So
+         nothing gets `[0, split)` and `schedule_2` never restricts the decode
+         stream; MorphX only adds overhead. Needed in the runtime (Track C3 or
+         later): a stream-role hint from the app (e.g. the prefill thread marks its
+         stream so its patched kernels get `[0, split)` and the other streams
+         `[split, nrSM)` while a prefill kernel is active), or a CI threshold
+         recalibrated for H200 + these Sm80-style CUTLASS kernels. Also `fix_SM` /
+         `suggest_SM` are C++-mangled, so `libapi.so`'s `dlsym("fix_SM")` can't find
+         them (see the hook-test note above).
+
+#### Track J3 results on hpcc H200 (memcpy backend, sglang + mycutlass, `llama-3-8b` → Qwen3-8B fp16, 60 s instead of 180 s)
+
+Fig 13 row `in-2048-out-256-rps-3` (job 91442; split hint 76 → 93):
+
+| Variant | Served | TTFT avg (ms) | Latency avg (ms) | TBT avg (ms) | avg (s/token) |
+|---|---|---|---|---|---|
+| baseline | 148 | 74.5 | 5811 | 22.5 | 0.023 |
+| stream (prefill thread) | 148 | 79.2 | 5492 | 21.2 | 0.021 |
+| chunked | 148 | 87.7 | 5678 | 21.9 | 0.022 |
+| MorphX (prefill thread + runtime) | 143 | 82.0 | 7178 | 27.8 | 0.028 |
+| A100 ref. baseline / MorphX / stream / chunked (180 s, Llama-3-8B) | 413 / 445 / 437 / 416 | 257 / 532 / 295 / 237 | 18008 / 12427 / 13933 / 16745 | 69.6 / 46.6 / 53.5 / 64.7 | 0.070 / 0.049 / 0.054 / 0.065 |
+
+On the H200 this row is light (TTFT ≈ 75 ms vs 257 ms on the A100), the
+prefill thread already helps a little (stream −5.5 % latency vs baseline), and
+MorphX is +24 % worse than baseline because it adds per-launch overhead without
+splitting SMs (see the finding above).
+
+Row `in-2048-out-256-rps-5` (job 91476), plus an experiment with a local,
+uncommitted runtime build that forces CI = 1 for grids ≥ 500 blocks (the
+prefill GEMMs) so the PD split actually happens:
+
+| Variant | Served | TTFT avg (ms) | Latency avg (ms) | TBT avg (ms) |
+|---|---|---|---|---|
+| baseline | 242 | 74.1 | 6633 | 25.7 |
+| stream | 242 | 81.1 | 6449 | 25.0 |
+| MorphX | 236 | 89.7 | 8278 | 32.1 |
+| MorphX, forced CI (split 93: prefill `[0,93)`, decode `[93,132)` while a prefill GEMM runs) | 232 | 105.6 | 10296 | 40.0 |
+| rps-3, MorphX forced CI | 145 | 109.8 | 6711 | 25.9 |
+
+With the split forced on, the runtime does what the paper describes (1180
+prefill-stream launches limited to `[0,93)`, decode-stream kernels moved to
+`[93,132)` while prefill runs), but at these loads it makes decode slower, not
+faster: 39 SMs are too few for decode, and the H200 has spare capacity at the
+A100 row loads. Before Fig 13–14 can show a MorphX gain on the H200 the split
+hint needs re-tuning (or rows with more load), on top of the runtime changes
+above. All J3 numbers use the runtime from before Track C3 (`runtime/` as of
+6a2746d, memcpy backend); C3 (ae2f76e) cut the per-launch cost, so the MorphX
+rows should be re-measured on it.
 6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
        (`logs/<timestamp>-sglang/`).
 
