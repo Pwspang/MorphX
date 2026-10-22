@@ -7,6 +7,7 @@
 #include <time.h>      // for timing terms
 #include <assert.h>
 #include <limits.h>
+#include "real_driver.h"
 
 #define CHECK_DL() do {                    \
     const char *dl_error = dlerror();      \
@@ -27,7 +28,6 @@
 // Pointer to GLIBC dlopen function, by dlsym(RTLD_NEXT, "dlopen")
 static void* (*real_dlopen)(const char *filename, int flags) = NULL;
 
-static const char* NEUTRINO_REAL_DRIVER = "/usr/lib/x86_64-linux-gnu/libcuda.so";
 static const char* NEUTRINO_HOOK_DRIVER = NULL;
 static const char* NEUTRINO_DRIVER_NAME = "libcuda.so.1";
 static char hook_driver_path[PATH_MAX];
@@ -64,9 +64,7 @@ void* dlopen(const char *filename, int flags) {
     const char* hook_driver_env = getenv("NEUTRINO_HOOK_DRIVER");
     const char* hook_driver =
         hook_driver_env != NULL && hook_driver_env[0] != '\0' ? hook_driver_env : NEUTRINO_HOOK_DRIVER;
-    const char* real_driver_env = getenv("NEUTRINO_REAL_DRIVER");
-    const char* real_driver =
-        real_driver_env != NULL && real_driver_env[0] != '\0' ? real_driver_env : NEUTRINO_REAL_DRIVER;
+    const char* real_driver = morphx_real_driver_path();
     const char* driver_name_env = getenv("NEUTRINO_DRIVER_NAME");
     const char* driver_name =
         driver_name_env != NULL && driver_name_env[0] != '\0' ? driver_name_env : NEUTRINO_DRIVER_NAME;

@@ -71,7 +71,7 @@ cudaError_t CUDARTAPI cudaLaunchKernel(
     sig_h[0] = 0;
     sig_h[1] = 0;
     sig_h[2] = 0;
-    sig_h[3] = 108;
+    sig_h[3] = getDeviceSMCount();
     CHECK_CUDA_ERROR(cudaMemcpyAsync(sig, sig_h, sizeof(int) * 4, cudaMemcpyHostToDevice, stream));
     int *fetched = sig, *finished = sig + 1, *minSM = sig + 2, *maxSM = sig + 3;
     const char* funcName;
@@ -81,7 +81,7 @@ cudaError_t CUDARTAPI cudaLaunchKernel(
         std::cerr << "Kernel " << funcNameStr << " is not registered" << std::endl;
         exit(EXIT_FAILURE);
     }
-    int nrSM = 108;
+    int nrSM = getDeviceSMCount();
     sharedMem = std::max(sharedMem, 4ul);
     int blockSize = blockDim.x * blockDim.y * blockDim.z;
     int gridSize = gridDim.x * gridDim.y * gridDim.z;

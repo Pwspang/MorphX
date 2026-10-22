@@ -24,23 +24,32 @@ signature identical to unversioned.
 
 NOTE You may see warnings functions such as lacking symbols for 
 cuGL, cudbg, cuEGL, cuMem, cuProfiler, cuVDP, but they can be ignored mostly
+
+NOTE Output is per CUDA major version: unmodified_cuda<major>.c and
+signature_cuda<major>.c, selected by CUDA_VERSION in unmodified.c/signature.c.
+cuda.h maps many names to versioned symbols with macros (e.g. CUDA 13
+`#define cuMemAdvise cuMemAdvise_v2`), so the generated signature file
+#undefs every such macro and each wrapper is defined under the exact exported
+symbol name.
 """
 from typing import NamedTuple, List, Tuple, Dict
 import sys
 import os
 import subprocess
+import re
 
 LIB_PATH: str = None
 HEADER_PATH: str = None
-UNMODIFIED_C_NAME = "unmodified.c"
-SIGNATURE_C_NAME  = "signature.c"
+UNMODIFIED_C_NAME = "unmodified_cuda{major}.c"
+SIGNATURE_C_NAME  = "signature_cuda{major}.c"
 
 # NOTE list of modified symbols -> handled by modified.c unless code generation
 MODIFIED_FUNCTIONS: Dict[str, List[str]] = {
     "cu": ["cuModuleLoadData", "cuModuleGetFunction", 
         "cuKernelGetFunction", "cuLibraryGetKernel", "cuLibraryGetModule",
         "cuLibraryLoadData", "cuLaunchKernel", "cuGetProcAddress_v2",  "cuGetProcAddress", 
-        "cuModuleLoadDataEx", "cuModuleLoad", "cuModuleLoadFatBinary", "cuLaunchKernelEx"],
+        "cuModuleLoadDataEx", "cuModuleLoad", "cuModuleLoadFatBinary", "cuLaunchKernelEx",
+        "cuLaunchKernel_ptsz", "cuLaunchKernelEx_ptsz"],
     "hip": ["hipModuleLoadData", "hipModuleLoadDataEx", "hipModuleGetFunction", 
         "hipModuleLaunchKernel", "hipMalloc", "hipFree", "hipModuleLoad", "hipKernelNameRef",
         "hipEventRecord", "hipGetErrorName", "hipGetErrorString", "hipApiName", 
@@ -173,6 +182,31 @@ def parse_version_symbol(symbol: str) -> Tuple[str, str]:
     else:
         return symbol, ""
 
+def parse_alias_macros(headers: List[str], target: str) -> Dict[str, str]:
+    # names cuda.h #defines to another symbol, e.g. `#define cuMemAlloc cuMemAlloc_v2`
+    # or `#define cuMemcpyHtoD __CUDA_API_PTDS(cuMemcpyHtoD_v2)` (default stream build)
+    pattern = re.compile(r"^\s*#\s*define\s+(" + target + r"[A-Za-z0-9_]*)\s+(\S+)")
+    wrapped = re.compile(r"^__CUDA_API_PT[DS][SZ]\((\w+)\)$")
+    aliases: Dict[str, str] = {}
+    for line in headers:
+        match = pattern.match(line)
+        if match is None or match.group(1) in aliases:
+            continue
+        value = match.group(2)
+        inner = wrapped.match(value)
+        if inner:
+            value = inner.group(1)
+        if re.match(r"^\w+$", value):
+            aliases[match.group(1)] = value
+    return aliases
+
+def parse_cuda_major(headers: List[str]) -> int:
+    for line in headers:
+        match = re.match(r"^\s*#\s*define\s+CUDA_VERSION\s+(\d+)", line)
+        if match:
+            return int(match.group(1)) // 1000
+    raise ValueError("[error] CUDA_VERSION not found in header")
+
 def gencode(signature: Signature, template: str) -> str:
     param_list = []
     param_type_list = []
@@ -221,9 +255,6 @@ if __name__ == "__main__":
         print("Usage: python parse.py <HEADER_PATH> <LIB_PATH>")
         exit(1)
 
-    unmodified_c = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), UNMODIFIED_C_NAME), "w")
-    signature_c  = open(os.path.join(os.path.dirname(os.path.realpath(__file__)), SIGNATURE_C_NAME),  "w")
-
     print(f"[INFO] use {HEADER_PATH} and {LIB_PATH}", file=sys.stderr)
 
     if HEADER_PATH.endswith("cuda.h") and "libcuda.so" in LIB_PATH: 
@@ -234,6 +265,7 @@ if __name__ == "__main__":
         raise ValueError(f"[error] {LIB_PATH} is not supported")
 
     signatures: List[Signature] = []
+    aliases: Dict[str, str] = {}
 
     # parse cuda.h to extract cuda headers
     with open(HEADER_PATH, "r") as header_file:
@@ -273,7 +305,15 @@ if __name__ == "__main__":
                 idx = end_idx
             else:
                 idx += 1
+        if target == "cu":
+            aliases = parse_alias_macros(headers[:ending_idx], target)
+            major = parse_cuda_major(headers)
+        else:
+            major = 0
 
+    out_dir = os.path.dirname(os.path.realpath(__file__))
+    unmodified_c = open(os.path.join(out_dir, UNMODIFIED_C_NAME.format(major=major)), "w")
+    signature_c  = open(os.path.join(out_dir, SIGNATURE_C_NAME.format(major=major)),  "w")
 
     # extract missing symbols from libcuda.so
     symbols_so: List[str] = []
@@ -285,15 +325,29 @@ if __name__ == "__main__":
             symbols_so.append(symbol)
     
     # get the symbols missed in our cuda lib
+    # a declaration `cuMemAdvise(...)` under `#define cuMemAdvise cuMemAdvise_v2` really
+    # declares cuMemAdvise_v2, so it is emitted under that name (base name kept for lookup)
     parsed_symbols = {signature.func_name: signature for signature in signatures}
-    missed_symbols = [symbol for symbol in symbols_so if symbol not in parsed_symbols]
+    declared: Dict[str, Signature] = {}
+    for name, signature in parsed_symbols.items():
+        real_name = aliases.get(name, name)
+        if real_name not in declared:
+            declared[real_name] = Signature(func_name=real_name, params=signature.params)
+    missed_symbols = [symbol for symbol in symbols_so if symbol not in declared]
     print(f"[INFO] Extract {len(signatures)} Symbols from {HEADER_PATH}", file=sys.stderr)
 
+    signatures = list(declared.values())
+    seen = set(declared)
     for symbol in missed_symbols:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
         # try to extract symbol and version
         raw_symbol_name, version = parse_version_symbol(symbol)
+        # skip aliases to a different function, e.g. cuGraphInstantiate -> cuGraphInstantiateWithFlags
+        alias_base = parse_version_symbol(aliases.get(raw_symbol_name, raw_symbol_name))[0]
         # check if raw_symbol in parsed_symbols
-        if raw_symbol_name in parsed_symbols:
+        if raw_symbol_name in parsed_symbols and alias_base == raw_symbol_name:
             # versioned symbol share the same parameter list
             raw_symbol = parsed_symbols[raw_symbol_name]
             signatures.append(Signature(func_name=symbol, params=raw_symbol.params))
@@ -304,6 +358,9 @@ if __name__ == "__main__":
 
     print("// auto-generated by parse.py, used with modified.c", file=unmodified_c)
     print("// auto-generated by parse.py, used with modified.c", file=signature_c)
+    # define every wrapper under its exported name, not the macro-mapped one
+    for alias in aliases:
+        print(f"#undef {alias}", file=signature_c)
     inits = []
     for signature in signatures:
         if signature.func_name not in MODIFIED_FUNCTIONS[target]: # REMOVE MODIFIED
@@ -316,4 +373,6 @@ if __name__ == "__main__":
     
     print("\nstatic void init_unmodified(void) {", file=signature_c)
     print("\n".join(inits), file=signature_c)
+    # symbols missing from an older driver stay NULL instead of failing CHECK_DL
+    print("    dlerror();", file=signature_c)
     print("}", file=signature_c)

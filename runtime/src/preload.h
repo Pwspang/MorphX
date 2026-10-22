@@ -11,6 +11,7 @@
 #include <pthread.h>  // for mutex lock
 #include <stdatomic.h> // for atomic operations
 #include <atomic>
+#include "real_driver.h"
 
 #define PROBE_TYPE_THREAD 0
 #define PROBE_TYPE_WARP 1
@@ -23,7 +24,7 @@ static FILE* event_log = stderr; // file pointer to event_log:  NEUTRINO_TRACEDI
  */
 
 static void* shared_lib           = NULL; // handle to real cuda driver
-static const char* NEUTRINO_REAL_DRIVER = "/usr/lib/x86_64-linux-gnu/libcuda.so"; // path to real cuda driver, loaded by env_var NEUTRINO_REAL_DRIVER
+static const char* NEUTRINO_REAL_DRIVER = NULL; // path to real cuda driver, see morphx_real_driver_path()
 
 // simple auto-increasing idx to distinguish kernels of the same name
 static int kernel_idx = 0;
@@ -62,9 +63,9 @@ void mutex_init(void) { pthread_mutex_init(&mutex, NULL); }
  * @note shall be executed with mutex protection!!!
  */
 static void common_init(void) {
-    // if(NEUTRINO_REAL_DRIVER == NULL) {
-    //     NEUTRINO_REAL_DRIVER = getenv("NEUTRINO_REAL_DRIVER");
-    // }
+    if(NEUTRINO_REAL_DRIVER == NULL) {
+        NEUTRINO_REAL_DRIVER = morphx_real_driver_path();
+    }
     if (NEUTRINO_REAL_DRIVER == NULL) {
         fprintf(stderr, "[error] envariable NEUTRINO_REAL_DRIVER not set\n");
         exit(EXIT_FAILURE);

@@ -246,6 +246,22 @@ public:
 };
 #endif
 
+// SM count of the current device; replaces the A100's 108 that used to be hardcoded.
+inline int getDeviceSMCount() {
+    static int nrSM = 0;
+    if(nrSM == 0) {
+        int dev = 0;
+        CHECK_CUDA_ERROR(cudaGetDevice(&dev));
+        CHECK_CUDA_ERROR(cudaDeviceGetAttribute(&nrSM, cudaDevAttrMultiProcessorCount, dev));
+    }
+    return nrSM;
+}
+
+// Default split hints were tuned on a 108-SM A100; scale them to this GPU.
+inline int scaleSplitHint(int a100Hint, int nrSM) {
+    return (a100Hint * nrSM + 54) / 108;
+}
+
 typedef void (*fixSMHandle)(cudaStream_t, int, int);
 typedef void (*suggestSMHandle)(cudaStream_t, int, int);
 
