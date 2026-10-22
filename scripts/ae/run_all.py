@@ -437,7 +437,9 @@ def build_for_part(part_name: str, args: argparse.Namespace, *, prefix: str = "[
     else:
         configure_runtime(use_cuda_llm=False, prefix=prefix)
     if part_name in {"part1-colocate", "part3-overhead", "part4-model"}:
-        build_common_tools(include_model=(part_name == "part4-model"), python_bin=args.python_bin, prefix=prefix)
+        # The pass-built microbench also provides libmycutlass.so for MORPHX_LLM_GEMM=mycutlass.
+        include_model = part_name == "part4-model" or os.environ.get("MORPHX_LLM_GEMM", "").lower() == "mycutlass"
+        build_common_tools(include_model=include_model, python_bin=args.python_bin, prefix=prefix)
 
 
 def pd_smsched_env() -> str:

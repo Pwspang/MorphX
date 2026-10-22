@@ -31,6 +31,18 @@ export MORPHX_NUM_SMS="${MORPHX_NUM_SMS:-132}"  # H100 PCIe: 114
 # works but adds ~5 us per thread block.
 export MORPHX_SYNC_BACKEND="${MORPHX_SYNC_BACKEND:-memcpy}"
 
+# LLM engine (docs/h100-port-plan.md section 9): SGLang in-process instead of the
+# authors' unpublished vLLM fork, with dense GEMMs (LLM linear layers and the
+# GEMM/GEMV workloads) through the pass-built CUTLASS library so MorphX can
+# schedule them. libmycutlass.so comes from the pass-enabled microbench build.
+_morphx_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export MORPHX_LLM_BACKEND="${MORPHX_LLM_BACKEND:-sglang}"
+export MORPHX_LLM_GEMM="${MORPHX_LLM_GEMM:-mycutlass}"
+export MYCUTLASS_LIB_DIR="${MYCUTLASS_LIB_DIR:-${_morphx_repo}/microbench/build-model}"
+# Gated Llama weights aren't downloaded yet: run their experiments on Qwen3.
+export MORPHX_MODEL_ALIASES="${MORPHX_MODEL_ALIASES-llama-3-8b=qwen3-8b,llama-2-7b=qwen3-4b}"
+unset _morphx_repo
+
 # Data and baselines
 export MORPHX_HF_CACHE="${MORPHX_HF_CACHE:-${HOME}/morphx/hf/hub}"
 export MORPHX_NANOFLOW_LIB="${MORPHX_NANOFLOW_LIB:-${HOME}/morphx/envs/nanoflow/lib}"

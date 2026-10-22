@@ -116,6 +116,32 @@ def hf_cache() -> Path:
     return env_path("MORPHX_HF_CACHE")
 
 
+# HuggingFace snapshots the workload scripts load (same table as scripts/colocate/run.py).
+MODEL_SNAPSHOTS = {
+    "llama-2-7b": "models--meta-llama--Llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590",
+    "llama-3-8b": "models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+    "qwen3-4b": "models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f",
+    "qwen3-8b": "models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2",
+    "gpt2-l": "models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519",
+}
+
+
+def model_alias(model: str) -> str:
+    """Apply MORPHX_MODEL_ALIASES ("from=to,..."), as scripts/sglang/backend.py does."""
+    for item in os.environ.get("MORPHX_MODEL_ALIASES", "").split(","):
+        if "=" in item:
+            src, dst = (part.strip() for part in item.split("=", 1))
+            if src == model and dst:
+                return dst
+    return model
+
+
+def model_path(model: str) -> Optional[Path]:
+    """Snapshot directory of a model alias after MORPHX_MODEL_ALIASES, or None if unknown."""
+    snapshot = MODEL_SNAPSHOTS.get(model_alias(model))
+    return hf_cache() / snapshot if snapshot else None
+
+
 def num_sms() -> int:
     return env_int("MORPHX_NUM_SMS")
 

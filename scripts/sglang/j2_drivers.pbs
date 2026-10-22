@@ -1,0 +1,62 @@
+#!/bin/bash
+# Track J2 on hpcc: Fig 15 (LLM/GEMM/GEMV/DNN) and one Fig 11(a) co-location
+# point with MORPHX_LLM_BACKEND=sglang + MORPHX_LLM_GEMM=mycutlass.
+#   cd <repo> && qsub scripts/sglang/j2_drivers.pbs
+#   qsub -v PARTS="matmul fig15" ...   (parts: matmul fig15 fig15ncu fig11)
+# Needs runtime/build (memcpy hook), smsched-pass/build and microbench/build-model
+# (pass-built libmycutlass.so) in this checkout.
+#PBS -N morphx-j2-drivers
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"matmul fig15 fig15ncu fig11"}
+OUT=${OUT:-$HOME/morphx/runs/j2-$PBS_JOBID}
+mkdir -p "$OUT"
+echo "== host=$(hostname) job=$PBS_JOBID backend=$MORPHX_LLM_BACKEND gemm=$MORPHX_LLM_GEMM sync=$MORPHX_SYNC_BACKEND aliases=$MORPHX_MODEL_ALIASES out=$OUT"
+
+if [[ " $PARTS " == *" matmul "* ]]; then
+  echo "== matmul check"
+  timeout 300 python scripts/sglang/check_matmul.py
+fi
+
+if [[ " $PARTS " == *" fig15 "* ]]; then
+  echo "== Fig 15: base + MorphX"
+  timeout 2400 python scripts/ae/run_overhead_model_part4.py --no-build --only-section overhead \
+    --only-task LLM --only-task GEMM --only-task GEMV --only-task DNN \
+    --only-method base --only-method smsched --output-dir "$OUT/fig15" --run-timeout 900 2>&1 \
+    | grep -E "DONE|FAILED|WARNING|ERROR|tables="
+  cat "$OUT/fig15/tables/Figure15.tsv"
+fi
+
+if [[ " $PARTS " == *" fig15ncu "* ]]; then
+  echo "== Fig 15: ncu (GEMM, GEMV, LLM)"
+  export PATH=$CUDA_HOME/bin:$PATH
+  timeout 1500 python scripts/ae/run_overhead_model_part4.py --no-build --only-section overhead \
+    --only-task LLM --only-task GEMM --only-task GEMV --only-method ncu --output-dir "$OUT/fig15" --skip-existing \
+    --run-timeout 600 2>&1 | grep -E "DONE|FAILED|WARNING|ERROR|tables="
+  cat "$OUT/fig15/tables/Figure15.tsv"
+fi
+
+if [[ " $PARTS " == *" fig11 "* ]]; then
+  echo "== Fig 11(a) point llm-1-mm-1: stream + MorphX + MPS-50"
+  timeout 2400 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-1 \
+    --only-scheduler stream --only-scheduler smsched --only-scheduler mps-50 \
+    --model llama-3-8b --duration "${FIG11_DURATION:-60}" --output-dir "$OUT/fig11" --run-timeout 900 2>&1 \
+    | grep -E "DONE|FAILED|WARNING|ERROR|preflight|table"
+  for f in "$OUT"/fig11/logs/colocate/llm-mm/llm-1-mm-1/*.log; do
+    echo "-- $f"; sed -n '/=== Results ===/,$p' "$f" | head -20
+  done
+  cat "$OUT"/fig11/tables/*.txt 2>/dev/null | head -40
+fi
+echo "== done"
