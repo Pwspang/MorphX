@@ -20,7 +20,11 @@ if [[ "$BACKEND" == hostmapped ]]; then
 else
     GDR_LIB+=(-lgdrapi)
 fi
-REAL_LIBCUDA="$(ls /usr/lib64/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null | head -1)"
+REAL_LIBCUDA=""
+for lib in /usr/lib64/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so; do
+    if [[ -e "$lib" ]]; then REAL_LIBCUDA="$lib"; break; fi
+done
+[[ -n "$REAL_LIBCUDA" ]] || { echo "libcuda.so not found" >&2; exit 1; }
 
 for variant in cuda cuda-llm; do
     g++ -std=c++20 -O3 -g -fPIC -shared "${DEFS[@]}" \
