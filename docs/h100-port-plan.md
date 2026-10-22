@@ -1,0 +1,517 @@
+# MorphX H100 Port Plan
+
+Goal: run the MorphX artifact (`./run.sh`) on an NVIDIA H100 instead of the
+original A100 (sm_80, 108 SMs) evaluation machine, then add SGLang as a second
+LLM backend (section 9).
+
+Branch: `h100-port` on `Pwspang/MorphX`.
+
+## Parallel work tracks
+
+The sections below are grouped by topic. This section groups them into
+tracks that can run **at the same time**, by different people or Claude
+sessions, each on its own branch off `h100-port`. Each track owns a separate
+set of files, so merges don't conflict.
+
+### Tracks
+
+| Track | Work (sections) | Owns these files | Needs a GPU? | Blocked by |
+|---|---|---|---|---|
+| **X. External requests** | Ask the authors for the vLLM fork (commit `232ce74` + diff); ask hpcc support about GDRCopy; request Llama-2/Llama-3 access on HuggingFace | none | no | nothing, **start day 1** |
+| **A. Script config** | §1 paths/env vars in Python + shell, §2 `TORCH_CUDA_ARCH_LIST`, §3 SM-count lists and split hints, PBS template (§8) | `run.sh`, `scripts/ae/*.py,*.sh`, `scripts/colocate/`, `scripts/overhead/`, `scripts/test-pd-online.py`, `scripts/ae/env-h100.sh`, `scripts/ae/morphx-hpcc.pbs` | no | nothing |
+| **B. Build config** | §1 CMake paths, §2 sm_90, CUDA 13 version macros, CCCL from the toolkit | `microbench/CMakeLists.txt`, `ggnn/CMakeLists.txt`, `runtime/CMakeLists.txt`, `smsched-pass/CMakeLists.txt`, `TGS/hijack/` | compile-only (login node) | nothing |
+| **C. Runtime on CUDA 13** | §6.1 regenerate `unmodified.c` with `parse.py`, fix `cuGetProcAddress` hooks; §3 runtime SM counts (`base.cpp`, `stub_raw.cpp`); §5 option C `memcpy` backend (later) | `runtime/src/`, `include/common.h` | short GPU tests | nothing (hostmapped backend already done) |
+| **D. LLVM + pass** | §6.2–6.3 build clang/libc++ with NVPTX for CUDA 13; build `smsched-pass` | `$HOME/morphx/llvm` on hpcc; `smsched-pass/` only if the pass needs a newer-LLVM fix | no (long CPU build) | nothing |
+| **E. Models and data** | §6.8 download models + ShareGPT into `MORPHX_HF_CACHE` | data dir on hpcc | no | X (Llama access) |
+| **F. Baselines** | §6.7 NVBit `mem_trace` for sm_90, TGS socket path, `neutrino`, `nanoflow` env | `nvbit-tutorial/tools/`, `TGS/` (coordinate with B) | short GPU tests | nothing |
+| **G. Python stack (vLLM)** | §6.5 PyTorch + FlashInfer + vLLM fork with the pass, sm_90, CUDA 13 | conda env `smsched` on hpcc | build: no; check: short GPU | D; X (vLLM fork) |
+| **H. SGLang spike** | §9 step 1: `sgl-kernel` + FlashInfer with the pass, one request through `ModelRunner` | separate conda env `smsched-sglang` | short GPU | D (does **not** need G) |
+| **I. Integration and runs** | §7 bring-up order, §8 jobs D–F, split-hint re-tuning, full run | none (merges A–C) | yes, long | A, B, C, D, then G for Fig 10–15 |
+
+### Dependency graph
+
+```text
+  X (external) ───────────────┬──────────────┐
+                              │              │
+  A (script config) ─────┐    ▼              ▼
+  B (build config) ──────┤   E (models)     G (PyTorch/vLLM) ──┐
+  C (runtime CUDA 13) ───┤                   ▲                 │
+  D (LLVM + pass) ───────┼───────────────────┘                 │
+                         │                                     ▼
+                         ├──► I1: Fig 16 (Part 4) ──► I2: Fig 15 ──► I3: Fig 10–14 ──► full run
+  F (baselines) ─────────┘                                     ▲
+                                                               │
+  D ──► H (SGLang spike) ──► §9 steps 2–6 (after I3) ──────────┘ (optional)
+```
+
+- **Day 1, all at once:** X, A, B, C, D, F. None of them depend on each other.
+- **First milestone (I1, Fig 16):** needs A + B + C + D only, not the Python
+  stack, so it can be reached while G is still building.
+- **Critical path:** D (LLVM) → G (PyTorch 2.6 / vLLM fork on CUDA 13; also
+  waits for X to get the fork) → I3. Most of the calendar time is here, so
+  start D and X first. If G stalls on CUDA 13, its fallback (CUDA 12.8 from
+  conda, §6) doesn't change any other track.
+- **H runs alongside G.** Both only need D. H's result helps decide whether
+  to continue with vLLM or switch to SGLang-first (§9).
+
+### Sharing hpcc
+
+The free GPU queue allows **one running job per user**, so GPU jobs from
+different tracks queue up behind each other. Keep GPU jobs short and put long
+CPU work somewhere else:
+
+| Work | Queue | Limits | Notes |
+|---|---|---|---|
+| LLVM, PyTorch, vLLM, FlashInfer, `sgl-kernel` builds (D, G, H) | `gpu_datamover` | 4 CPUs, no GPU, ≤ 120 h, **2 concurrent jobs** per user | Slow but doesn't block the GPU queue; D and G (or D and H) can build at the same time. If it's too slow, use a 6 h `gpu_free` job with `ncpus=48` (blocks GPU tests meanwhile); use `ccache` so a build cut off at the time limit picks up where it stopped. Access to this queue not yet tested |
+| Model and dataset downloads (E) | `gpu_datamover` | as above | Shares the 2-job limit with builds; run it while only one build is active |
+| Compile-only checks (B, C) | login node | short, light jobs only | Like the `unmodified.c` check already done |
+| GPU tests (C, F, G, H) and runs (I) | `gpu_free` | 1 GPU job at a time, ≤ 6 h | Chain jobs with `qsub -W depend=afterany:...`; combine small tests from several tracks into one job |
+
+### Merging
+
+- Each track works on `h100-port/<track>` (e.g. `h100-port/a-script-config`)
+  and opens a PR into `h100-port`.
+- Merge order: A, B, C as soon as they're ready (they only add config and
+  defaults to the A100 values, so nothing else breaks); D/G/H produce
+  environments, not code, so they write their build steps into
+  `docs/h100-port-plan.md` §6 / §9 when done.
+- Shared names to agree on before starting: the `MORPHX_*` env vars in §1
+  (A, B and C all read them) and `scripts/ae/env-h100.sh` (owned by A).
+
+## 0. Decisions to settle first
+
+| Question | Why it matters | Default assumed below |
+|---|---|---|
+| H100 SXM (132 SMs) or PCIe (114 SMs)? | Every SM count and split hint scales with it | SXM, 132 SMs (same as the H200 used for smoke tests, see section 8) |
+| CUDA toolkit version | Hardcoded `cuda-12.4` paths and `__CUDACC_VER_MINOR__=4` | **CUDA 13.0** (driver ≥ 580; hpcc has 580.126.20). See section 6 for the knock-on effects |
+| LLVM/clang version for the pass | Must emit CUDA for sm_90 **and accept the CUDA 13 headers** | Recent clang (20+; verify CUDA 13 support) |
+| Is GDRCopy (`gdrdrv` kernel module + `libgdrapi`) installed? | The runtime and patched workloads link `-lgdrapi` | **Not on hpcc.** Use the non-GDR backend in section 5 |
+| Exclusive GPU + permission to run `nvidia-cuda-mps-control`? | MPS baseline in Figures 10–12 | **Works on hpcc** as a normal user (tested, section 8) |
+| Where do models/datasets live? | Hardcoded `/huggingface-cache/hub/...` | Set via `HF_HUB_CACHE`-style env var |
+
+## 1. Make machine-specific values configurable (no behavior change)
+
+Introduce env vars with A100 defaults first, so the original machine still
+works, then set H100 values in one place (e.g. `scripts/ae/env-h100.sh`).
+
+| Variable | Replaces |
+|---|---|
+| `MORPHX_PYTHON` (existing `PYTHON`) | `/home/rtx/miniconda3/envs/smsched/bin/python` |
+| `MORPHX_LLVM_ROOT` | `/home/rtx/llvm-project/install`, `/mnt/data/rtx/llvm-project/...` |
+| `MORPHX_CUDA_ROOT` | `/usr/local/cuda-12.4` (hpcc: `module load cuda/13.0`, then `$CUDA_HOME`) |
+| `MORPHX_SYNC_BACKEND` | `gdr` (default) or `hostmapped` / `memcpy` (section 5) |
+| `MORPHX_CCCL_ROOT` | `/home/rtx/gpu/cccl` |
+| `MORPHX_CUTLASS_ROOT` | `/home/rtx/gpu/cutlass` |
+| `MORPHX_CUDA_ARCH` | `sm_80` / `80` / `"8.0"` |
+| `MORPHX_NUM_SMS` | literal `108` |
+| `MORPHX_HF_CACHE` | `/huggingface-cache/hub` |
+| `MORPHX_NANOFLOW_LIB` | `/home/rtx/miniconda3/envs/nanoflow/lib` |
+
+### Files to edit
+
+**Top-level and AE drivers**
+- [ ] `run.sh:5` – default `PYTHON_BIN`
+- [ ] `scripts/ae/run_colocate_part1.sh:5`, `run_pd_colocate_part2.sh:7`, `run_overhead_model_part4.sh:6` – default `PYTHON_BIN`
+- [ ] `scripts/ae/run_all.py:76-77` – candidate Python paths
+- [ ] `scripts/ae/run_all.py:331-332` – `LLVM_DIR` candidates for building `smsched-pass`
+- [ ] `scripts/ae/run_colocate_part1.py:123, 435-442` – conda Python, LLVM lib dirs, nanoflow lib
+- [ ] `scripts/ae/run_pd_colocate_part2.py:131, 454-461` – same
+- [ ] `scripts/ae/run_overhead_model_part4.py:113, 220-221, 274-275` – same
+
+**Model and dataset paths** (`/huggingface-cache/hub/...`)
+- [ ] `scripts/colocate/run.py:76-84` – model table + ShareGPT dataset
+- [ ] `scripts/test-pd-online.py:45-51` – model table (includes `glm-9b` = GLM-Z1-9B-0414 used by `configs/pd/*.json`)
+- [ ] `scripts/overhead/single_request.py:60-64` – model table
+- [ ] `scripts/ae/run_colocate_part1.py:81-89`, `scripts/ae/run_pd_colocate_part2.py:90-91` – model/dataset existence checks
+- Pinned snapshot hashes may not match a fresh download; resolve by repo name instead of hash, or download those exact revisions.
+
+**Build files**
+- [ ] `runtime/CMakeLists.txt:2-3` – hardcoded `/usr/bin/gcc-12`, `/usr/bin/g++-12` (make overridable; don't force)
+- [ ] `runtime/CMakeLists.txt:104-105, 114-115` – `cuda-12.4` include/lib dirs → `CUDAToolkit` paths
+- [ ] `microbench/CMakeLists.txt:6` – `SMSCHED_LLVM_ROOT` default
+- [ ] `microbench/CMakeLists.txt:19-25` – CUDA and CCCL include dirs
+- [ ] `microbench/CMakeLists.txt:36-37` – `__CUDACC_VER_MAJOR__/MINOR__` → derive from the toolkit
+- [ ] `microbench/CMakeLists.txt:49-50, 61, 67` – CUDA lib dir, `CUTLASS_ROOT`, `CUDA_TOOLKIT_ROOT_DIR`
+- [ ] `ggnn/CMakeLists.txt:4-8, 18-21` – CUDA root, clang paths, CCCL, `python3.10` include/lib (match the env's Python)
+
+**TGS baseline**
+- [ ] `TGS/hijack/src/high_priority_hijack_call.c:104`, `low_priority_hijack_call.c:218` – socket path `/home/rtx/gpu/sm-sched/TGS/gsharing/...`. Make it come from an env var or a compile-time define; keep it under 108 chars (the `SOCKET_PATH` buffer size, which is a Unix socket limit, not an SM count).
+
+## 2. Retarget to sm_90
+
+- [ ] `microbench/CMakeLists.txt:26` – `--cuda-gpu-arch=sm_80` → `sm_90`
+- [ ] `microbench/CMakeLists.txt` – `CMAKE_CUDA_ARCHITECTURES "80"` → `"90"` (currently `FORCE`d; remove the `FORCE`)
+- [ ] `ggnn/CMakeLists.txt:18` – `--cuda-gpu-arch=sm_80` → `sm_90`
+- [ ] `scripts/colocate/run.py:39` – `TORCH_CUDA_ARCH_LIST = "8.0"` → `"9.0"`
+- [ ] `scripts/test-pd-online.py:19` – same
+- [ ] `scripts/overhead/single_request.py:35` – same
+- [ ] `nvbit-tutorial/tools/mem_trace/Makefile` – `ARCH?=all` is fine; NVBit 1.7.6 supports Hopper. No change expected.
+- Keep `cutlass::arch::Sm80` in `microbench/src/my_cutlass_gemm.cu:41` and `microbench/src/generator.py:124`. Sm80 tensor-op kernels run on H100, and switching to Sm90 (WGMMA/TMA) kernels would change what Figure 16 measures.
+
+## 3. Replace hardcoded SM counts
+
+| Location | Current | H100 SXM | Notes |
+|---|---|---|---|
+| `runtime/src/base.cpp:40` | `nrSM = 108` | query `multiProcessorCount` | Same pattern as `cuda.cpp:248` |
+| `runtime/src/base.cpp:56` | `occup * 108` | `occup * nrSM` | |
+| `runtime/src/stub_raw.cpp:74, 84` | `108` | query at runtime | Only if `stub_raw` is used |
+| `microbench/src/green_ctx_bench.cu:147` | `total_sms = 108` | query at runtime | |
+| `microbench/profile.sh:2` | `{8..108..8}` | `{8..132..8}` | Not called by `run.sh` |
+| `runtime/src/cuda.cpp:911` | default split `76` | ~93 | 76/108 × 132; re-tune |
+| `runtime/src/cuda-llm.cpp:746` | default split `60` | ~73 | 60/108 × 132; re-tune |
+| `scripts/ae/run_pd_colocate_part2.py:48+` | `split-76`, `split-88` rows | ~93, ~108 | Row names encode the split; re-tune per row |
+| `scripts/ae/run_colocate_part1.py` (`--smsched-split-hint` selectors) | 76 etc. | scaled | Check every override |
+| `scripts/ae/run_overhead_model_part4.py:46-50` | sweeps start at 108 | start at 132, e.g. `(132, 120, 108, 96, …)` | Figure 16 x-axis |
+| `scripts/ae/run_overhead_model_part4.py:484` | `SMSCHED_SPLIT_HINT "108"` | `MORPHX_NUM_SMS` | Means "all SMs" |
+| `plot_figures.py` / `scripts/analysis/*` | axis limits or labels assuming 108 | check | Grep after the above changes |
+
+Derive the H100 values from `MORPHX_NUM_SMS` instead of writing in new literals.
+
+## 4. Check `%smid` numbering on H100 (correctness risk)
+
+`smsched-pass/SMSched.cpp:174` adds `mov.u32 %smid` and keeps a block only if
+`minSM <= smid < maxSM`, with `maxSM` up to `multiProcessorCount`. On Hopper,
+`%smid` may not be numbered 0..N-1 without gaps (`%nsmid` can be larger than the
+SM count). If there are gaps, some SMs are never used and splits come out uneven.
+
+- [x] Probe kernel written and run on the hpcc H200 (job 91099, 2026-10-22):
+      **`%nsmid`=132 and the IDs are 0..131 with no gaps.** No remapping
+      needed on H200 (and expected the same on H100 SXM). Re-run the probe once
+      on the real H100 box to confirm.
+- [x] Under MPS, `%smid` and `multiProcessorCount` are rescaled per client
+      (30% → 38 SMs, IDs 0..37; 50% → 66 SMs). This only matters if MorphX's
+      runtime were run inside an MPS client, which the AE scripts don't do.
+- [ ] Still check how `fetched/finished/minSM/maxSM` in the runtime assume
+      `smid < nrSM`.
+
+## 5. Replace GDRCopy (`libgdrapi`) where it isn't installed
+
+**Status on hpcc:** no `/dev/gdrdrv`, no `gdrdrv` kernel module, no
+`libgdrapi` on the H200 compute node (job 91099).
+
+### What GDRCopy is used for
+
+All of it is in one class, `GdrPool` in `include/common.h:46-160`, used by
+`runtime/src/cuda.cpp`, `cuda-llm.cpp` (and the unused variants
+`stub.cpp`, `cuda-lithos.cpp`, …). `-lgdrapi` is also linked by
+`microbench/CMakeLists.txt:49-50` and `ggnn/CMakeLists.txt:20-21`.
+
+It allocates a 1 MB pool of 8-byte control words **in GPU memory** and uses
+GDRCopy to map that memory into the CPU's address space. This gives two fast paths:
+
+- **GPU side (hot path):** every block of a pass-instrumented kernel does an
+  atomic sub on `agents`, volatile loads of `minSM`/`maxSM`, an atomic add on
+  `fetched` (block id) and an atomic add on `finished`
+  (`smsched-pass/SMSched.cpp:311-412`). These are plain device-memory
+  atomics, which are fast.
+- **CPU side (scheduler):** the runtime reads `fetched` to track progress and
+  writes `minSM`/`maxSM`/`agents` to resize a running kernel's SM range,
+  each in about 1 µs, without going through a CUDA stream.
+
+### Options
+
+| Option | How | GPU hot path | CPU get/set | Effort | Fidelity |
+|---|---|---|---|---|---|
+| **A. Install GDRCopy** | HPC admins load `gdrdrv` (needs root); `libgdrapi` can be built in `$HOME` | unchanged | ~1 µs | Support ticket | Same as paper |
+| **B. `hostmapped`** | Pool in pinned host memory: `cudaHostAlloc(..., cudaHostAllocMapped \| cudaHostAllocPortable)` + `cudaHostGetDevicePointer`. `GdrEntry{d, h}` maps directly; `get`/`set` become volatile loads/stores plus a memory fence | every per-block atomic/load crosses PCIe (~1–2 µs, contended atomics serialize) | ~100 ns | Small: rewrite `GdrPool` only (~40 lines), drop `-lgdrapi` | Correct, but adds overhead to every block. Inflates Fig 15 and may shift co-location results |
+| **C. `memcpy`** | Pool stays in device memory. CPU `get`/`set` use `cuMemcpyDtoHAsync`/`HtoDAsync` on a dedicated non-blocking, high-priority stream with pinned staging buffers. Must call the **real** driver entry points (not the hooked ones) to avoid re-entering the interception layer | unchanged (same as GDR) | ~5–10 µs, uses a copy engine | Medium (~100–150 lines) | Close to GDR; only the scheduler's reaction time slows down |
+
+**Recommendation**
+
+1. Implement **B** first behind `MORPHX_SYNC_BACKEND=hostmapped` (compile-time
+   `-DMORPHX_SYNC_BACKEND=...`; `gdr` stays the default). This unblocks the hpcc
+   smoke tests quickly.
+2. Before relying on B, run a short probe job. Check
+   `cudaDevAttrHostNativeAtomicSupported`, check that GPU-side `atomicAdd` on
+   mapped host memory gives the right count under contention, and measure
+   per-block latency compared with device memory. On x86/PCIe these atomics
+   are atomic among GPU threads but not with respect to the CPU. That's
+   enough here, because the CPU only reads `fetched`/`finished` and only
+   writes `minSM`/`maxSM`/`agents`.
+3. If B's overhead noticeably changes Fig 15 / Fig 10–12, implement **C**.
+4. In parallel, ask hpcc support whether they can install GDRCopy (option A).
+   Final numbers should come from A or C, not B.
+
+Checklist:
+- [x] `hostmapped` backend in `include/common.h` (`#ifdef MORPHX_SYNC_BACKEND_HOSTMAPPED`, same `GdrPool` API)
+- [x] `MORPHX_SYNC_BACKEND=gdr|hostmapped` CMake option (also read from the env var) in
+      `runtime/`, `microbench/`, `ggnn/`; `-lgdrapi` is only linked for `gdr`
+- [x] Probe job for mapped-memory atomics and latency: `scripts/ae/sync_backend_test.cu`
+- [ ] `memcpy` backend (option C) if the overhead below is too high
+- [ ] Rerun the Part 3 (Fig 15) overhead smoke with each backend and compare
+
+### `hostmapped` results on the hpcc H200 (job 91113, 2026-10-22)
+
+PCIe Gen5, `hostNativeAtomicSupported=0`, `pageableMemoryAccess=0`.
+
+| Test | Result |
+|---|---|
+| Counter correctness: 8448 blocks contending on `agents`/`fetched`/`finished` | PASS: exact counts |
+| CPU sees `finished` increase while the kernel runs | PASS: 1054 distinct values seen |
+| CPU write → running kernel sees it → kernel writes back → CPU sees it | PASS: **2.1 µs** round trip |
+| Kernel reads `maxSM` written by the CPU and skips SMs ≥ maxSM | PASS: 264 of 528 blocks skipped at maxSM=66 |
+| Per-block cost of the protocol vs device memory | **+4.7 µs per block, serialized**: 16 896 blocks take 80 ms vs 0.1 ms |
+
+Conclusion: `hostmapped` is **functionally correct**, so it can be used for
+smoke tests and for checking the scheduling logic. But every block's
+atomics on the same few addresses serialize over PCIe, which caps a kernel at
+about 210k blocks/s. Kernels with many short blocks (GEMM tiles, attention)
+will slow down a lot, so **don't use `hostmapped` for performance numbers**.
+For those, implement option C (atomics stay in device memory) or get GDRCopy
+installed.
+
+## 6. Toolchain and software stack on the H100 host
+
+Target: **CUDA 13.0** (`module load cuda/13.0` on hpcc; driver 580.126.20
+reports CUDA 13.0, so 13.1 is not supported by that driver yet).
+
+1. [ ] CUDA 13.0 toolkit. CUDA 13 changes that affect this repo:
+       - The repo pins `cuda-12.4` paths and `-D__CUDACC_VER_MAJOR__=12 -D__CUDACC_VER_MINOR__=4`
+         (`microbench/CMakeLists.txt:36-37`, `ggnn/CMakeLists.txt:18`) → 13 / 0.
+       - CCCL (Thrust/CUB/libcudacxx) is 3.x in CUDA 13 with API removals. Use
+         the toolkit's bundled CCCL instead of `/home/rtx/gpu/cccl`, and fix any
+         compile errors in `microbench/` and `ggnn/`.
+       - **Confirmed on hpcc:** `runtime/src/unmodified.c` (generated by
+         `runtime/src/parse.py` from the CUDA 12.4 `cuda.h`) does not compile
+         against CUDA 13.0: `cuDeviceGetUuid_v2` is redefined, and
+         `cuMemAdvise_v2`, `cuMemPrefetchAsync_v2`, `cuGraph*_v2` and
+         `cuStreamUpdateCaptureDependencies_v2` have conflicting declarations.
+         Regenerate it with `parse.py` against `$CUDA_HOME/include/cuda.h`
+         (13.0) and fix up the hand-written hooks. `include/common.h` itself
+         compiles fine.
+       - The interception layer hooks `cuGetProcAddress`/`_v2`
+         (`runtime/src/cuda.cpp`, `cuda-llm.cpp`, `cuda_hook_exports.map`).
+         CUDA 13 runtimes ask for different versioned driver symbols
+         (`cudaVersion=13000`). Check that every hooked symbol is still
+         intercepted (run with `SMSCHED_DEBUG=1` and confirm kernels are rewritten).
+       - Deprecated `cudaDeviceProp` fields were removed in 13.0. The runtime
+         only reads `multiProcessorCount` (`cuda.cpp:247`, `cuda-llm.cpp:232`),
+         which is still there, but recompile everything to check.
+       - sm_90 is still supported (CUDA 13 only dropped sm_50–sm_72).
+2. [ ] Build LLVM/clang with the NVPTX target and libc++ (the builds use
+       `-stdlib=libc++`). It must support `--cuda-gpu-arch=sm_90` **and** the
+       CUDA 13.0 headers. Clang releases trail new CUDA versions, so build a
+       recent release (20+) and confirm with a test `.cu`. If clang rejects
+       CUDA 13, try `--cuda-path=$CUDA_HOME -Wno-unknown-cuda-version` before
+       anything else.
+3. [ ] Build `smsched-pass` against it:
+       `cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR=$MORPHX_LLVM_ROOT/lib/cmake/llvm`.
+4. [ ] Build `runtime/` (both the `cuda.cpp` and `cuda-llm.cpp` variants).
+5. [ ] Create the `smsched` conda env (Python 3.10 to match `ggnn/CMakeLists.txt`).
+       Rebuild **PyTorch, vLLM, FlashInfer** from source with
+       `TORCH_CUDA_ARCH_LIST=9.0`, compiled with the patched clang and pass.
+       - **Biggest risk with CUDA 13:** the original env uses
+         `torch==2.6.0a0`, `flashinfer-python==0.2.2.post1` and a **forked vLLM**
+         (`0.1.dev24+g232ce74`, built from `/home/rtx/gpu/vllm`). PyTorch 2.6
+         predates CUDA 13 (official CUDA 13 support starts at PyTorch 2.9), so
+         it probably won't build against 13.0 unchanged. Choices:
+         (a) upgrade to PyTorch ≥ 2.9 + matching vLLM/FlashInfer and re-apply
+         the MorphX vLLM changes (e.g. `VLLM_PREFILL_THREAD`), or
+         (b) backport CUDA 13 build fixes to torch 2.6.
+       - **The forked vLLM source is not in this repo.** Ask the authors for
+         the fork (commit `232ce74` + local diff) before starting this step.
+       - Fallback if CUDA 13 blocks the stack: driver 580 also runs CUDA 12.x
+         toolkits (e.g. `conda install -c nvidia cuda-toolkit=12.8`), keeping
+         the original versions.
+       - Risk: those versions' Hopper-only kernels (FlashAttention-3,
+         WGMMA/TMA paths in FlashInfer/vLLM) may not compile with clang's CUDA
+         frontend. Fallback: disable sm_90a-only kernels and use the sm_80 code
+         paths. This also keeps kernels comparable to the A100 results.
+6. [ ] Build GGNN (`ggnn/`) with the pass.
+7. [ ] Install baselines: `neutrino` CLI (Figure 15; optional, reports N/A if missing),
+       NVBit `mem_trace` tool, TGS hijack libs, `nanoflow` env if used.
+8. [ ] Download models: Llama-2-7b-chat-hf, Meta-Llama-3-8B-Instruct (both gated),
+       Qwen3-4B, Qwen3-8B, GLM-Z1-9B-0414, gpt2-large; ShareGPT_Vicuna_unfiltered dataset.
+
+## 7. Bring-up order and validation
+
+| Step | Command / check | Pass criterion |
+|---|---|---|
+| 1 | `./run.sh analyse-reference` | Tables/figures regenerate (no GPU needed) |
+| 2 | `%smid` probe (section 4) | IDs understood; fix applied if needed |
+| 3 | Build pass + runtime; `./run.sh smoke --no-build` | All four parts' smoke points run |
+| 4 | Part 4 only (Figure 16, microbench GEMM) | Model-accuracy table generated; needs no PyTorch/vLLM |
+| 5 | Part 3 (Figure 15 overhead) | `base` and `smsched` columns present |
+| 6 | Re-tune split hints: sweep `SMSCHED_SPLIT_HINT` for each workload | Pick the best per row; record in part1/part2 scripts |
+| 7 | `./run.sh short` | Fig 10/12(a), 13(a), 15, 16 produced |
+| 8 | `./run.sh` (full, >20 h; run under `tmux` or a batch job) | All figures produced |
+
+## 8. Smoke testing on `hpcc` (H200, free queue)
+
+The H200 is also Hopper: sm_90, 132 SMs, the same as H100 SXM. It has more
+HBM (141 GB) and higher bandwidth. Every change in sections 1–5 can be
+tested there unchanged, so use it for bring-up before the H100 runs.
+
+### Cluster facts (checked from the login node `hpc-gaas-hn2`)
+
+| Item | Value | Impact on the plan |
+|---|---|---|
+| Scheduler | PBS Pro (`qsub`/`qstat`), not Slurm | Jobs below are PBS scripts |
+| Queue | `-q gpu_free` (routes to `gpu_free_normal`) | You have access through `hpc_fs_dmitrii.ustiugov_group` |
+| Project code | `-P fs_ccds_dmitrii.ustiugov` | As in your existing job scripts |
+| Limits | ≤ 4 GPUs, **≤ 6 h walltime**, **1 running job per user** | Full `./run.sh` (>20 h) must be split across jobs using `./run.sh resume` |
+| Resources | Request `select=1:ncpus=12:ngpus=1:mem=120gb` | All AE experiments use only GPU 0 |
+| OS / compilers | Rocky Linux 9.7; modules `gnu/gcc-12.3`, `cuda/13.0`, `cuda/13.1`, `anaconda/2025` | gcc-12 matches `runtime/CMakeLists.txt`; use `cuda/13.0` (matches driver 580) |
+| LLVM/clang | Not available as a module | Build from source into `$HOME` (in a job, not on the login node) |
+| GDRCopy | **Missing** on login and GPU nodes (no `/dev/gdrdrv`, no module, no `libgdrapi`) | Use section 5 backend `hostmapped`/`memcpy` |
+| MPS | **Works** as a normal user (job 91099) | MPS baseline can run on hpcc |
+| GPU | NVIDIA H200, 143 GB, 132 SMs, compute mode Default | |
+| `CUDA_VISIBLE_DEVICES` | PBS may set GPU UUIDs (`GPU-xxxx`) | Convert to index `0` before calling `run.sh` (see script) |
+| Storage | `/home` NFS, ~816 GB free | Fine for the env, LLVM build and models (~80 GB) |
+
+### Cluster-specific risks
+
+- **CUDA version.** We target the cluster's `cuda/13.0` module (driver
+  580.126.20 = CUDA 13.0; don't use `cuda/13.1`). See section 6 for the CUDA 13
+  porting items, especially the PyTorch 2.6 / forked-vLLM problem.
+- **GDRCopy.** Confirmed missing on the compute node. Use the
+  `hostmapped`/`memcpy` backend from section 5, or ask HPC support to install it.
+- **MPS.** Confirmed working (job 91099): a user-level daemon with
+  `CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY` in `/tmp` starts, three
+  concurrent clients connect to one MPS server, and
+  `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` is enforced (30% → 38 SMs, 50% → 66 SMs).
+  The AE scripts already use per-run pipe dirs under `/tmp`
+  (`run_colocate_part1.py:545`), so no change is needed.
+- **Shared node.** Other jobs share the host, so timings are noisy. Use hpcc
+  to check correctness, not to produce final numbers.
+
+### Smoke test stages
+
+Run them in order; each one must pass before the next.
+
+| Job | Walltime | What it does | Pass criterion |
+|---|---|---|---|
+| A. `probe` ✅ | 0:30 | `nvidia-smi`, driver/CUDA version, `ls /dev/gdrdrv`, `lsmod \| grep gdrdrv`, try a user-level MPS daemon, run the `%smid` probe (section 4) | **Done, job 91099 on `hpc-gaas-g25`:** H200, 132 SMs, driver 580.126.20 / CUDA 13.0, nvcc 13.0.48; gdrdrv missing; MPS works; smid 0..131 with no gaps |
+| A2. `probe-hostmapped` ✅ | 0:20 | `scripts/ae/sync_backend_test.cu` (section 5) | **Done, job 91113:** all correctness checks pass; +4.7 µs/block serialized overhead |
+| B. `build-llvm` | 6:00 (`ncpus=48`) | Build LLVM/clang + libc++ with NVPTX into `$HOME/morphx/llvm` | `clang++ --cuda-gpu-arch=sm_90` compiles a test `.cu` |
+| C. `build-stack` | 6:00, chained with `resume` | Build PyTorch, vLLM, FlashInfer with the pass for `TORCH_CUDA_ARCH_LIST=9.0` | `import torch, vllm, flashinfer` works; a tiny model generates text |
+| D. `smoke-part4` | 1:00 | Build pass + runtime + microbench; Part 4 only (Fig 16) | Fig 16 table produced |
+| E. `smoke` | 2:00 | `./run.sh smoke` | All four parts' smoke points finish with `status=ok` |
+| F. `short` | 6:00 ×N | `./run.sh short`, then `./run.sh resume` in chained jobs | Fig 10/12(a), 13(a), 15, 16 produced |
+
+Chain jobs so the next one starts when the previous finishes (only one runs at
+a time anyway):
+
+```bash
+J1=$(qsub -v MODE=short morphx-hpcc.pbs)
+J2=$(qsub -W depend=afterany:$J1 -v MODE=resume morphx-hpcc.pbs)
+J3=$(qsub -W depend=afterany:$J2 -v MODE=resume morphx-hpcc.pbs)
+```
+
+`run.sh resume` restarts at run granularity, so a job killed at the 6 h limit
+only loses the run that was in progress.
+
+### PBS job template (`scripts/ae/morphx-hpcc.pbs`, to be added)
+
+```bash
+#!/bin/bash
+#PBS -N morphx-smoke
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+
+set -euo pipefail
+MODE="${MODE:-smoke}"            # smoke | short | resume | analyse | probe
+
+module purge
+module load gnu/gcc-12.3 cuda/13.0 anaconda/2025
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate smsched
+
+source "$HOME/MorphX/scripts/ae/env-h100.sh"   # MORPHX_* vars (section 1)
+export MORPHX_NUM_SMS=132
+export MORPHX_SYNC_BACKEND=hostmapped   # no GDRCopy on hpcc (section 5)
+
+# PBS may hand out GPU UUIDs; the AE scripts expect index 0.
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then
+    export CUDA_VISIBLE_DEVICES=0
+fi
+
+cd "$HOME/MorphX"
+echo "host=$(hostname) job=${PBS_JOBID} mode=${MODE}"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+
+if [[ "$MODE" == probe ]]; then
+    ls -l /dev/gdrdrv || echo "gdrdrv: MISSING"
+    lsmod | grep gdrdrv || true
+    export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-$PBS_JOBID" CUDA_MPS_LOG_DIRECTORY="/tmp/mps-log-$PBS_JOBID"
+    mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+    nvidia-cuda-mps-control -d && echo "MPS: OK" && echo quit | nvidia-cuda-mps-control || echo "MPS: FAILED"
+    nvcc -arch=sm_90 -o /tmp/smid_probe scripts/ae/smid_probe.cu && /tmp/smid_probe   # section 4 probe
+    exit 0
+fi
+
+./run.sh "$MODE" > "run-${PBS_JOBID}.log" 2> "run-${PBS_JOBID}.err"
+```
+
+### Getting the code there
+
+```bash
+ssh hpcc
+git clone https://github.com/Pwspang/MorphX.git ~/MorphX
+cd ~/MorphX && git checkout h100-port
+qsub -v MODE=probe scripts/ae/morphx-hpcc.pbs
+```
+
+## 9. SGLang backend (phase 2, after the vLLM port works)
+
+Order agreed: finish the H100 port on the original vLLM stack first, to get a
+baseline that matches the paper. Then add SGLang as a **second backend**
+selected with `MORPHX_LLM_BACKEND=vllm|sglang`. Keep vLLM as the default.
+Estimated extra effort: **3–6 weeks**.
+
+### Why it isn't a drop-in swap
+
+| # | Issue | Where in the repo | What has to change |
+|---|---|---|---|
+| 1 | **Process model.** The MorphX runtime splits SMs between the CUDA streams of *one process*. The co-location driver runs vLLM in-process (`LLMEngine`, eager) in one thread and GGNN/GEMM in another. SGLang's `Engine` always runs the model in a separate scheduler subprocess, so the LLM and the co-located task would end up in different processes | `scripts/colocate/run.py:300-312`, thread workers in the same file | Drive SGLang's `ModelRunner` directly in-process (as `bench_one_batch` does) with a small batching loop, **or** run the co-located task inside the scheduler process. Prefer `ModelRunner` |
+| 2 | **PD co-location depends on the vLLM fork.** Fig 13–14 use `VLLM_PREFILL_THREAD`: prefill and decode on separate streams in one process. SGLang's PD disaggregation is multi-process/multi-GPU | `scripts/ae/run_pd_colocate_part2.py:639-650`, `scripts/test-pd-online.py` | Add a prefill thread with its own CUDA stream to the SGLang scheduler (or to the `ModelRunner` loop from #1). Needs the vLLM fork's diff as a reference (not in this repo, see section 6) |
+| 3 | **Kernels must be built with the MorphX pass.** Only pass-built kernels can be resized. SGLang uses `sgl-kernel` (CUTLASS 3.x / FA3, built with nvcc), many **Triton** kernels and JIT kernels (DeepGEMM). The LLVM pass does not touch Triton or JIT kernels, so those run without MorphX control | build stack (section 6) | Build `sgl-kernel` with clang + the pass for sm_90; use `--attention-backend flashinfer` (reuses the pass-built FlashInfer); use dense models so GEMMs go through PyTorch like in vLLM; disable Triton/DeepGEMM paths where SGLang allows it; list which kernels are left unpatched |
+| 4 | **Runtime matches kernels by name.** `cuda-llm.cpp` decides how to split SMs from vLLM/FlashInfer kernel names (`BatchPrefillWithPagedKVCacheKernel`, `BatchDecode…`, `cutlassL6Kernel`, mangled CUTLASS names) | `runtime/src/cuda-llm.cpp:643-655, 1021-1031` | Profile SGLang with `SMSCHED_DEBUG=1` / nsys, then move the patterns into a per-backend list (e.g. `SMSCHED_TARGET_PATTERNS` default per backend) instead of hardcoded strings |
+| 5 | **CUDA graphs.** SGLang captures decode in CUDA graphs by default. Graph replay skips `cuLaunchKernel` interception | engine launch args | Always pass `--disable-cuda-graph` (the equivalent of vLLM's `enforce_eager=True`); also disable the overlap scheduler at first |
+| 6 | **Experiment drivers use the vLLM API.** `EngineArgs`/`LLMEngine.step()`, `SamplingParams`, `TokensPrompt`, `RequestOutput` metrics (`time_in_queue`, TTFT/TBT) | `scripts/colocate/run.py` (1255 lines), `scripts/test-pd-online.py`, `scripts/overhead/single_request.py` | Put a thin `LLMBackend` interface in front (`init`, `add_request`, `step`, `collect_metrics`), with `vllm` and `sglang` implementations; keep the Poisson arrival and timing code shared |
+| 7 | **Environment.** `VLLM_ATTENTION_BACKEND`, `VLLM_USE_V1`, `VLLM_ALLOW_LONG_MAX_MODEL_LEN` env vars; `without_child_ld_preload()` assumes the model runs in-process | same scripts | Backend-specific env setup; make sure `LD_PRELOAD` of the MorphX runtime reaches whichever process launches the kernels |
+
+### Per experiment
+
+| Experiment | SGLang work | Effort |
+|---|---|---|
+| Fig 16 (GEMM model) | None, no LLM | — |
+| Fig 15 (single-request overhead) | `single_request.py` on `ModelRunner`, CUDA graphs off | Small–medium |
+| Fig 10–12 (co-location) | #1 in-process runner, #4 kernel patterns, new driver | Large |
+| Fig 13–14 (PD co-location) | #2 prefill thread/stream in SGLang | Largest |
+| Stack build | `sgl-kernel` with the pass instead of the vLLM fork (#3) | Similar to vLLM, maybe harder because of Hopper-only CUTLASS 3 / FA3 code |
+
+### Steps
+
+1. [ ] **Spike on hpcc (about 1 day):** build `sgl-kernel` + FlashInfer with
+       clang + the pass for sm_90 on CUDA 13.0; run one request through
+       `ModelRunner` in-process with the MorphX runtime preloaded
+       (`MORPHX_SYNC_BACKEND=hostmapped`, `--disable-cuda-graph`,
+       `--attention-backend flashinfer`). Record which kernels are
+       intercepted and patched, and which aren't (Triton/JIT/cuBLAS).
+2. [ ] Add the `LLMBackend` interface; port `single_request.py` → Fig 15 with SGLang.
+3. [ ] Profile kernel names, make the `cuda-llm.cpp` patterns configurable per backend.
+4. [ ] In-process co-location driver on `ModelRunner` → Fig 10–12 with SGLang.
+5. [ ] Prefill thread/stream in SGLang → Fig 13–14 with SGLang.
+6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
+       (`logs/<timestamp>-sglang/`).
+
+### Expected outcome
+
+- A recent SGLang release supports CUDA 13 and Hopper. This avoids
+  forward-porting PyTorch 2.6 and the old vLLM fork, which is the biggest
+  risk in section 6. If getting the vLLM fork turns out to be blocked, consider
+  going SGLang-first instead.
+- SGLang results are **not directly comparable** to the paper's vLLM numbers.
+  Compare MorphX against the baselines (stream / MPS / chunked prefill) within
+  SGLang.
+
+## 10. Expected differences from the paper
+
+- Absolute throughput/latency will differ (H100 vs A100 SM count, memory bandwidth, L2 size).
+- The best split hints are different on H100; the scaled values above are only starting points.
+- `logs/reference/` stays as the A100 baseline; keep H100 logs separate
+  (e.g. `logs/h100-<timestamp>/`) so you can compare.

@@ -1,5 +1,23 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.25.2 FATAL_ERROR)
 
+# Scheduler control-word backend: gdr (GDRCopy, default) or hostmapped (pinned
+# host memory, for machines without the gdrdrv kernel module).
+if(DEFINED ENV{MORPHX_SYNC_BACKEND})
+    set(MORPHX_SYNC_BACKEND_DEFAULT "$ENV{MORPHX_SYNC_BACKEND}")
+else()
+    set(MORPHX_SYNC_BACKEND_DEFAULT "gdr")
+endif()
+set(MORPHX_SYNC_BACKEND "${MORPHX_SYNC_BACKEND_DEFAULT}" CACHE STRING "Scheduler control-word backend: gdr or hostmapped")
+set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped)
+if(MORPHX_SYNC_BACKEND STREQUAL "hostmapped")
+    add_compile_definitions(MORPHX_SYNC_BACKEND_HOSTMAPPED)
+    set(MORPHX_GDR_LINK "")
+elseif(MORPHX_SYNC_BACKEND STREQUAL "gdr")
+    set(MORPHX_GDR_LINK "-lgdrapi")
+else()
+    message(FATAL_ERROR "Unknown MORPHX_SYNC_BACKEND: ${MORPHX_SYNC_BACKEND}")
+endif()
+
 # set the path of cuda toolkit
 set(CUDAToolkit_ROOT "/usr/local/cuda-12.4" CACHE PATH "Path to CUDA Toolkit root directory" FORCE)
 # set(CMAKE_CUDA_COMPILER "${CUDAToolkit_ROOT}/bin/nvcc" CACHE FILEPATH "CUDA compiler" FORCE)
@@ -17,8 +35,8 @@ set(MORPHX_PASS_SO "${MORPHX_REPO_ROOT}/smsched-pass/build/libsmsched.so" CACHE 
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -nostdinc++ -I/usr/include/python3.10 -I/usr/local/cuda-12.4/targets/x86_64-linux/include -I/home/rtx/llvm-project/install/include/c++/v1 -I/home/rtx/llvm-project/install/include/x86_64-unknown-linux-gnu/c++/v1 -I/home/rtx/gpu/cccl/thrust -I/home/rtx/gpu/cccl/libcudacxx/include -I/home/rtx/gpu/cccl/cub --cuda-gpu-arch=sm_80 -std=c++20 -O3 -fplugin=${MORPHX_PASS_SO} -fpass-plugin=${MORPHX_PASS_SO} -mllvm -enable-dump-ir -mllvm -dump-ir-dir=./ir  -D__NVCC__ -D__CUDACC_VER_MAJOR__=12 -D__CUDACC_VER_MINOR__=4 -D__NV_NO_HOST_COMPILER_CHECK -D_ALLOW_UNSUPPORTED_LIBCPP -D_VSTD=std -Wno-invalid-specialization -D__CUDACC__ -include cuda_fp16.h")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -I/usr/include/python3.10 -I/home/rtx/llvm-project/install/include/c++/v1 -I/home/rtx/llvm-project/install/include/x86_64-unknown-linux-gnu/c++/v1 -D_VSTD=std -Wno-error=missing-template-arg-list-after-template-kw -Wno-invalid-specialization -include cuda_fp16.h")
-set(CMAKE_EXE_LINKER_FLAGS "-L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda -lgdrapi -lpython3.10")
-set(CMAKE_SHARED_LINKER_FLAGS "-L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda -lgdrapi -lpython3.10")
+set(CMAKE_EXE_LINKER_FLAGS "-L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK} -lpython3.10")
+set(CMAKE_SHARED_LINKER_FLAGS "-L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK} -lpython3.10")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)

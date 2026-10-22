@@ -3,7 +3,17 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
+#include <atomic>
+#include <cstring>
+// MORPHX_SYNC_BACKEND_HOSTMAPPED: keep the scheduler control words in pinned,
+// device-mapped host memory instead of GDRCopy-mapped device memory. Use it on
+// machines without the gdrdrv kernel module (no libgdrapi dependency).
+#ifndef MORPHX_SYNC_BACKEND_HOSTMAPPED
 #include <gdrapi.h>
+#else
+#define GPU_PAGE_SHIFT 16
+#define GPU_PAGE_SIZE (1UL << GPU_PAGE_SHIFT)
+#endif
 #include <chrono>
 #include <assert.h>
 #include <dlfcn.h>
@@ -55,6 +65,7 @@ struct GdrEntry {
     }
 };
 
+#ifndef MORPHX_SYNC_BACKEND_HOSTMAPPED
 class GdrPool {
 private:
     CUdeviceptr d_pool;
@@ -161,6 +172,79 @@ public:
         }
     }
 };
+#else
+class GdrPool {
+private:
+    uintptr_t h_pool;
+    CUdeviceptr d_pool;
+    boost::lockfree::queue<GdrEntry> buffer{GDR_POOL_SIZE / GDR_ENTRY_SIZE};
+public:
+    GdrPool() {
+        void *h = nullptr;
+        CHECK_CUDA_ERROR(cudaHostAlloc(&h, GDR_POOL_SIZE, cudaHostAllocMapped | cudaHostAllocPortable));
+        memset(h, 0, GDR_POOL_SIZE);
+        void *d = nullptr;
+        CHECK_CUDA_ERROR(cudaHostGetDevicePointer(&d, h, 0));
+        h_pool = (uintptr_t)h;
+        d_pool = (CUdeviceptr)d;
+        for(size_t i = 0; i < GDR_POOL_SIZE; i += GDR_ENTRY_SIZE) {
+            GdrEntry entry({d_pool + i, h_pool + i});
+            if(!buffer.push(entry)) {
+                std::cerr << "GDR pool initialization failed\n";
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    inline GdrEntry gdr_malloc() {
+        GdrEntry entry;
+        if(!buffer.pop(entry)) {
+            std::cerr << "GDR pool is empty\n";
+            exit(EXIT_FAILURE);
+        }
+        return entry;
+    }
+    inline void gdr_free(GdrEntry entry) {
+        if(!buffer.push(entry)) {
+            std::cerr << "GDR pool push failed\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    inline void get_buffer(int bufferId, void *h_buffer) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        memcpy(h_buffer, (void*)(h_pool + bufferId * GDR_BUFFER_SIZE), GDR_BUFFER_SIZE);
+    }
+    inline void set_buffer(int bufferId, void *h_buffer) {
+        memcpy((void*)(h_pool + bufferId * GDR_BUFFER_SIZE), h_buffer, GDR_BUFFER_SIZE);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    inline int get_index(GdrEntry &entry) {
+        return ((entry.h - h_pool) % GDR_BUFFER_SIZE) / sizeof(int);
+    }
+    inline int get_bufferId(GdrEntry &entry) {
+        return (entry.h - h_pool) / GDR_BUFFER_SIZE;
+    }
+
+    // Entries are 8-byte aligned, so these are single 64-bit accesses on x86.
+    inline void set(GdrEntry &entry, uint64_t value) {
+        *(volatile uint64_t*)entry.h = value;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    inline uint64_t get(GdrEntry &entry) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return *(volatile uint64_t*)entry.h;
+    }
+
+    ~GdrPool() {
+        CHECK_CUDA_ERROR(cudaFreeHost((void*)h_pool));
+        while(!buffer.empty()) {
+            GdrEntry entry;
+            buffer.pop(entry);
+        }
+    }
+};
+#endif
 
 typedef void (*fixSMHandle)(cudaStream_t, int, int);
 typedef void (*suggestSMHandle)(cudaStream_t, int, int);
