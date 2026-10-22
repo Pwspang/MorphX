@@ -22,6 +22,8 @@
 #include <chrono>
 #include <assert.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <sched.h>
 #include <boost/lockfree/queue.hpp>
 
 #define CHECK_CUDA_ERROR(call) \
@@ -69,6 +71,39 @@ struct GdrEntry {
         return {d + GDR_ENTRY_SIZE / 2, h + GDR_ENTRY_SIZE / 2};
     }
 };
+
+// Control words of one patched launch: agents, minSM|maxSM and fetched|finished
+// (minSM.half() is maxSM, fetched.half() is finished). The memcpy backend keeps
+// them contiguous so a launch is initialized with one copy.
+struct LaunchSlot {
+    GdrEntry agents;
+    GdrEntry minSM;
+    GdrEntry fetched;
+};
+
+// Slot handling for the backends whose host writes land immediately (gdr,
+// hostmapped): three independent entries, written before the launch.
+#define MORPHX_IMMEDIATE_LAUNCH_SLOTS \
+    inline LaunchSlot launch_alloc() { \
+        return {gdr_malloc(), gdr_malloc(), gdr_malloc()}; \
+    } \
+    inline void launch_free(LaunchSlot &slot) { \
+        gdr_free(slot.agents); \
+        gdr_free(slot.minSM); \
+        gdr_free(slot.fetched); \
+    } \
+    /* withFetched=false (reclaim launches) leaves fetched|finished alone. */ \
+    inline void launch_init(LaunchSlot &slot, uint64_t agents, uint64_t minmax, bool withFetched, CUstream) { \
+        if(withFetched) set(slot.fetched, 0); \
+        set(slot.agents, agents); \
+        set(slot.minSM, minmax); \
+    } \
+    inline void get_many(const GdrEntry *entries, uint64_t *out, int n) { \
+        for(int i = 0; i < n; ++i) { \
+            GdrEntry entry = entries[i]; \
+            out[i] = get(entry); \
+        } \
+    }
 
 #if !defined(MORPHX_SYNC_BACKEND_HOSTMAPPED) && !defined(MORPHX_SYNC_BACKEND_MEMCPY)
 class GdrPool {
@@ -159,6 +194,7 @@ public:
 
     // Host writes are visible immediately; nothing to order before a launch.
     inline void launch_fence(CUstream) {}
+    MORPHX_IMMEDIATE_LAUNCH_SLOTS
 
     ~GdrPool() {
         if(gdr_unmap(g, g_mh, (void*)h_pool, GDR_POOL_SIZE) != 0) {
@@ -246,6 +282,7 @@ public:
 
     // Host writes are visible immediately; nothing to order before a launch.
     inline void launch_fence(CUstream) {}
+    MORPHX_IMMEDIATE_LAUNCH_SLOTS
 
     ~GdrPool() {
         CHECK_CUDA_ERROR(cudaFreeHost((void*)h_pool));
@@ -259,26 +296,45 @@ public:
 // Device-memory pool driven by async copies on a private, non-blocking control
 // stream. All host writes are enqueued there in host order (last writer wins,
 // as with GDRCopy); reads copy device -> pinned slot and sync only that stream.
-// Writes that must land before a kernel starts are followed by launch_fence(),
-// which makes the launch stream wait on the control stream without a host sync
-// (MORPHX_MEMCPY_LAUNCH_SYNC=1 syncs on the host instead).
 // Only copies are used, never memset: a memset may run as a kernel, which could
 // not start while persistent agents occupy every SM.
+//
+// h_pool is a pinned host mirror of the pool: every write updates the mirror
+// before its copy is enqueued, and launch initialization copies straight from
+// the mirror, so a copy that executes late still carries the newest value.
+//
+// A launch's control words (LaunchSlot) are one 32-byte block initialized with
+// one copy. MORPHX_MEMCPY_INIT selects where that copy goes:
+// - control (default): on the control stream, followed by an event the launch
+//   stream waits on (MORPHX_MEMCPY_LAUNCH_SYNC=1 syncs on the host instead).
+// - stream: on the launch stream itself, right before the kernel. No event and
+//   no lock, but a short copy sits between consecutive kernels. Reads of a
+//   block whose copy hasn't run yet must not see the previous launch's
+//   counters, so freed blocks get fetched|finished zeroed on the control
+//   stream and are only reused once that write is known to have completed.
 class GdrPool {
 private:
     static constexpr size_t kSlots = 1 << 14;
+    static constexpr size_t kBlockSize = 32;
+    static constexpr size_t kBlockRegion = GDR_POOL_SIZE / 2;  // blocks live above this offset
+    static constexpr size_t kBlocks = (GDR_POOL_SIZE - kBlockRegion) / kBlockSize;
     CUdeviceptr d_pool;
-    uintptr_t h_pool;        // host-side shadow, only for entry index arithmetic
+    uintptr_t h_pool;        // pinned host mirror
     uint64_t *write_slots;   // pinned sources of in-flight H2D copies
     uint64_t *read_slots;    // pinned targets of D2H copies
     char *buffer_scratch;    // pinned, for get_buffer/set_buffer
     size_t write_next = 0, read_next = 0;
+    uint64_t write_seq = 0;                   // control-stream writes enqueued (under mu)
+    std::atomic<uint64_t> completed_seq{0};   // writes known to have landed
+    std::vector<uint64_t> block_free_seq;     // write_seq of a block's zeroing
     CUcontext ctx = nullptr;
     CUstream stream = nullptr;
     CUevent fence_event = nullptr;
     bool launch_sync = false;
+    bool init_on_launch_stream = false;
     std::mutex mu;
-    boost::lockfree::queue<GdrEntry> buffer{GDR_POOL_SIZE / GDR_ENTRY_SIZE};
+    boost::lockfree::queue<GdrEntry> buffer{kBlockRegion / GDR_ENTRY_SIZE};
+    boost::lockfree::queue<uint32_t> blocks{kBlocks};
 
     inline void bind_context() {
         CUcontext cur = nullptr;
@@ -287,15 +343,24 @@ private:
             CHECK_CU_ERROR(cuCtxSetCurrent(ctx));
         }
     }
+    inline void note_completed(uint64_t seq) {
+        uint64_t cur = completed_seq.load(std::memory_order_relaxed);
+        while(cur < seq && !completed_seq.compare_exchange_weak(cur, seq)) {}
+    }
     // Caller holds mu. A write slot is reused only after a full lap, and the
     // stream is drained at the start of every lap.
     inline void enqueue_write(CUdeviceptr dst, uint64_t value) {
         if(write_next % kSlots == 0 && write_next != 0) {
             CHECK_CU_ERROR(cuStreamSynchronize(stream));
+            note_completed(write_seq);
         }
         uint64_t *src = &write_slots[write_next++ % kSlots];
         *src = value;
         CHECK_CU_ERROR(cuMemcpyHtoDAsync(dst, src, sizeof(uint64_t), stream));
+        write_seq++;
+    }
+    inline GdrEntry entry_at(size_t offset) {
+        return {d_pool + offset, h_pool + offset};
     }
 public:
     GdrPool() {
@@ -304,7 +369,10 @@ public:
         CHECK_CUDA_ERROR(cudaMemset(d, 0, GDR_POOL_SIZE));
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         d_pool = (CUdeviceptr)d;
-        h_pool = (uintptr_t)malloc(GDR_POOL_SIZE);
+        void *mirror = nullptr;
+        CHECK_CUDA_ERROR(cudaHostAlloc(&mirror, GDR_POOL_SIZE, cudaHostAllocPortable));
+        memset(mirror, 0, GDR_POOL_SIZE);
+        h_pool = (uintptr_t)mirror;
         CHECK_CUDA_ERROR(cudaHostAlloc((void**)&write_slots, kSlots * sizeof(uint64_t), cudaHostAllocPortable));
         CHECK_CUDA_ERROR(cudaHostAlloc((void**)&read_slots, kSlots * sizeof(uint64_t), cudaHostAllocPortable));
         CHECK_CUDA_ERROR(cudaHostAlloc((void**)&buffer_scratch, GDR_BUFFER_SIZE, cudaHostAllocPortable));
@@ -315,10 +383,18 @@ public:
         CHECK_CU_ERROR(cuEventCreate(&fence_event, CU_EVENT_DISABLE_TIMING));
         const char *sync = getenv("MORPHX_MEMCPY_LAUNCH_SYNC");
         launch_sync = sync && atoi(sync);
-        for(size_t i = 0; i < GDR_POOL_SIZE; i += GDR_ENTRY_SIZE) {
-            GdrEntry entry({d_pool + i, h_pool + i});
-            if(!buffer.push(entry)) {
+        const char *init = getenv("MORPHX_MEMCPY_INIT");
+        init_on_launch_stream = init && strcmp(init, "stream") == 0;
+        for(size_t i = 0; i < kBlockRegion; i += GDR_ENTRY_SIZE) {
+            if(!buffer.push(entry_at(i))) {
                 std::cerr << "GDR pool initialization failed\n";
+                exit(EXIT_FAILURE);
+            }
+        }
+        block_free_seq.assign(kBlocks, 0);
+        for(uint32_t i = 0; i < kBlocks; ++i) {
+            if(!blocks.push(i)) {
+                std::cerr << "GDR block pool initialization failed\n";
                 exit(EXIT_FAILURE);
             }
         }
@@ -338,19 +414,85 @@ public:
         }
     }
 
+    inline LaunchSlot launch_alloc() {
+        uint32_t idx;
+        if(!blocks.pop(idx)) {
+            std::cerr << "GDR block pool is empty\n";
+            exit(EXIT_FAILURE);
+        }
+        // Blocks are recycled FIFO, so the zeroing has almost always landed.
+        if(completed_seq.load(std::memory_order_acquire) < block_free_seq[idx]) {
+            uint64_t seq;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                bind_context();
+                seq = write_seq;
+            }
+            CHECK_CU_ERROR(cuStreamSynchronize(stream));
+            note_completed(seq);
+        }
+        size_t base = kBlockRegion + idx * kBlockSize;
+        return {entry_at(base), entry_at(base + 8), entry_at(base + 16)};
+    }
+    inline void launch_free(LaunchSlot &slot) {
+        uint32_t idx = (uint32_t)((slot.agents.d - d_pool - kBlockRegion) / kBlockSize);
+        if(init_on_launch_stream) {
+            std::lock_guard<std::mutex> lock(mu);
+            bind_context();
+            *(volatile uint64_t*)slot.fetched.h = 0;
+            enqueue_write(slot.fetched.d, 0);
+            block_free_seq[idx] = write_seq;
+        }
+        if(!blocks.push(idx)) {
+            std::cerr << "GDR block pool push failed\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+    // Initialize a launch's words before it starts; withFetched=false (reclaim
+    // launches) leaves fetched|finished alone. Later set()s still win: they
+    // update the mirror this copy reads from.
+    inline void launch_init(LaunchSlot &slot, uint64_t agents, uint64_t minmax, bool withFetched, CUstream launchStream) {
+        *(volatile uint64_t*)slot.agents.h = agents;
+        *(volatile uint64_t*)slot.minSM.h = minmax;
+        if(withFetched) {
+            *(volatile uint64_t*)slot.fetched.h = 0;
+        }
+        size_t bytes = withFetched ? 3 * GDR_ENTRY_SIZE : 2 * GDR_ENTRY_SIZE;
+        if(init_on_launch_stream) {
+            bind_context();
+            CHECK_CU_ERROR(cuMemcpyHtoDAsync(slot.agents.d, (void*)slot.agents.h, bytes, launchStream));
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        bind_context();
+        CHECK_CU_ERROR(cuMemcpyHtoDAsync(slot.agents.d, (void*)slot.agents.h, bytes, stream));
+        write_seq++;
+        if(launch_sync) {
+            CHECK_CU_ERROR(cuStreamSynchronize(stream));
+            note_completed(write_seq);
+            return;
+        }
+        CHECK_CU_ERROR(cuEventRecord(fence_event, stream));
+        CHECK_CU_ERROR(cuStreamWaitEvent(launchStream, fence_event, 0));
+    }
+
     inline void get_buffer(int bufferId, void *h_buffer) {
         std::lock_guard<std::mutex> lock(mu);
         bind_context();
         CHECK_CU_ERROR(cuMemcpyDtoHAsync(buffer_scratch, d_pool + bufferId * GDR_BUFFER_SIZE, GDR_BUFFER_SIZE, stream));
         CHECK_CU_ERROR(cuStreamSynchronize(stream));
+        note_completed(write_seq);
         memcpy(h_buffer, buffer_scratch, GDR_BUFFER_SIZE);
     }
     inline void set_buffer(int bufferId, void *h_buffer) {
         std::lock_guard<std::mutex> lock(mu);
         bind_context();
+        memcpy((void*)(h_pool + bufferId * GDR_BUFFER_SIZE), h_buffer, GDR_BUFFER_SIZE);
         memcpy(buffer_scratch, h_buffer, GDR_BUFFER_SIZE);
         CHECK_CU_ERROR(cuMemcpyHtoDAsync(d_pool + bufferId * GDR_BUFFER_SIZE, buffer_scratch, GDR_BUFFER_SIZE, stream));
+        write_seq++;
         CHECK_CU_ERROR(cuStreamSynchronize(stream));
+        note_completed(write_seq);
     }
 
     inline int get_index(GdrEntry &entry) {
@@ -364,19 +506,36 @@ public:
     inline void set(GdrEntry &entry, uint64_t value) {
         std::lock_guard<std::mutex> lock(mu);
         bind_context();
+        *(volatile uint64_t*)entry.h = value;
         enqueue_write(entry.d, value);
     }
     // Sees every write issued before it; the lock is dropped while waiting.
     inline uint64_t get(GdrEntry &entry) {
-        uint64_t *dst;
+        uint64_t out;
+        get_many(&entry, &out, 1);
+        return out;
+    }
+    // n reads, one sync. Each value sees every write issued before the call.
+    inline void get_many(const GdrEntry *entries, uint64_t *out, int n) {
+        static constexpr int kMaxReads = 64;
+        assert(n <= kMaxReads);
+        if(n <= 0) return;
+        uint64_t *dst[kMaxReads];
+        uint64_t seq;
         {
             std::lock_guard<std::mutex> lock(mu);
             bind_context();
-            dst = &read_slots[read_next++ % kSlots];
-            CHECK_CU_ERROR(cuMemcpyDtoHAsync(dst, entry.d, sizeof(uint64_t), stream));
+            for(int i = 0; i < n; ++i) {
+                dst[i] = &read_slots[read_next++ % kSlots];
+                CHECK_CU_ERROR(cuMemcpyDtoHAsync(dst[i], entries[i].d, sizeof(uint64_t), stream));
+            }
+            seq = write_seq;
         }
         CHECK_CU_ERROR(cuStreamSynchronize(stream));
-        return *(volatile uint64_t*)dst;
+        note_completed(seq);
+        for(int i = 0; i < n; ++i) {
+            out[i] = *(volatile uint64_t*)dst[i];
+        }
     }
     // Make work later enqueued on launchStream wait for all writes issued so far.
     inline void launch_fence(CUstream launchStream) {
@@ -384,6 +543,7 @@ public:
         bind_context();
         if(launch_sync) {
             CHECK_CU_ERROR(cuStreamSynchronize(stream));
+            note_completed(write_seq);
             return;
         }
         CHECK_CU_ERROR(cuEventRecord(fence_event, stream));
@@ -398,7 +558,7 @@ public:
         cudaFreeHost(read_slots);
         cudaFreeHost(buffer_scratch);
         cudaFree((void*)d_pool);
-        free((void*)h_pool);
+        cudaFreeHost((void*)h_pool);
         while(!buffer.empty()) {
             GdrEntry entry;
             buffer.pop(entry);
@@ -406,6 +566,39 @@ public:
     }
 };
 #endif
+
+// Pin the calling (scheduler) thread to one CPU the process may run on. The
+// k-th call takes the k-th CPU from the end of the allowed set, so under a batch
+// scheduler's cpuset it stays inside the job's CPUs (pinning to CPU 0, 1, ...
+// fails there). MORPHX_AGENT_CPU=<n> pins to CPU n, -1 disables pinning.
+inline void pinThreadToAllowedCpu(int k) {
+    int cpu = -1;
+    const char *env = getenv("MORPHX_AGENT_CPU");
+    if(env != nullptr && env[0] != '\0') {
+        cpu = atoi(env);
+        if(cpu < 0) return;
+    } else {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if(sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+        int n = CPU_COUNT(&allowed);
+        if(n < 2) return;  // don't take the only CPU away from the application
+        int want = n - 1 - (k % n);
+        for(int c = 0, seen = 0; c < CPU_SETSIZE; ++c) {
+            if(CPU_ISSET(c, &allowed) && seen++ == want) {
+                cpu = c;
+                break;
+            }
+        }
+        if(cpu < 0) return;
+    }
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("pthread_setaffinity_np failed");
+    }
+}
 
 // SM count of the current device; replaces the A100's 108 that used to be hardcoded.
 inline int getDeviceSMCount() {

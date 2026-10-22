@@ -1,0 +1,51 @@
+#!/bin/bash
+# Track C3 micro benchmarks on hpcc: sync backend tests, hook/pass tests,
+# launch overhead and the Fig16 GEMM (M=16) before vs after the C3 changes.
+#   cd <checkout> && qsub -v BEFORE=$HOME/morphx/trackC3-before runtime/test/c3_micro.pbs
+#PBS -N morphx-c3-micro
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:50:00
+#PBS -j oe
+module purge
+module load cuda/13.0 gnu/gcc-12.3
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+B=/tmp/c3-$PBS_JOBID
+mkdir -p $B
+echo "== host=$(hostname) job=$PBS_JOBID cpus=$(taskset -pc $$ | awk -F': ' '{print $2}')"
+
+echo "######## sync_backend_test"
+nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_MEMCPY -I include -lcuda -o $B/sbt-memcpy scripts/ae/sync_backend_test.cu
+nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_HOSTMAPPED -I include -lcuda -o $B/sbt-hostmapped scripts/ae/sync_backend_test.cu
+for cfg in "memcpy:MORPHX_MEMCPY_INIT=control" "memcpy:MORPHX_MEMCPY_INIT=stream" "hostmapped:X=1"; do
+  echo "== ${cfg}"
+  env ${cfg#*:} timeout 300 $B/sbt-${cfg%%:*} | grep -vE "^\[env\]"
+done
+
+echo "######## run_hook_test / run_pass_test (memcpy control + stream)"
+for mode in control stream; do
+  echo "== MORPHX_MEMCPY_INIT=$mode"
+  MORPHX_SYNC_BACKEND=memcpy MORPHX_MEMCPY_INIT=$mode OUT=$B/hook-$mode timeout 600 bash runtime/test/run_hook_test.sh 2>&1 | grep -E "RESULT|^== "
+  MORPHX_SYNC_BACKEND=memcpy MORPHX_MEMCPY_INIT=$mode OUT=$B/pass-$mode timeout 600 bash runtime/test/run_pass_test.sh 2>&1 | grep -E "RESULT|^== |launch 0\]"
+done
+
+echo "######## launch overhead"
+OUT=$B/lo BEFORE_REPO=${BEFORE:-} timeout 900 bash runtime/test/run_launch_overhead.sh
+
+echo "######## Fig16 bench M=16"
+cd microbench
+export SMSCHED_BENCH_M_SIZES=16 SMSCHED_BENCH_N_SIZES=65536 SMSCHED_BENCH_K_SIZES=65536 SMSCHED_BENCH_WARMUP_ITERS=2 SMSCHED_BENCH_TIMED_ITERS=5
+for cfg in "none:" "before:" "lo/memcpy:" "lo/memcpy:MORPHX_MEMCPY_INIT=stream"; do
+  hook=${cfg%%:*}; extra=${cfg#*:}
+  case $hook in
+    none) PRE= ;;
+    before) PRE="LD_PRELOAD=$BEFORE/hook/libcuda.so:$BEFORE/hook/libpreload.so" ;;
+    *) PRE="LD_PRELOAD=$B/$hook/libcuda.so:$B/$hook/libpreload.so" ;;
+  esac
+  echo "== $hook $extra"
+  timeout 300 env $PRE $extra MORPHX_LAUNCH_STATS=1 ./build-model/bench 2>&1 | grep -E "^M=|MorphX-stats|rror"
+done
+echo "== done"
