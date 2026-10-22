@@ -1,10 +1,12 @@
-// Checks the hostmapped GdrPool backend (include/common.h) on a real GPU.
+// Checks a GdrPool sync backend (include/common.h) on a real GPU.
 // Mimics the per-block protocol the MorphX pass inserts (SMSched.cpp):
 // atomic sub on agents, volatile loads of minSM/maxSM, atomic add on fetched
 // and finished. Compares control words in device memory vs the pool.
 //
-// Build: nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_HOSTMAPPED -I include \
-//            -o sync_backend_test scripts/ae/sync_backend_test.cu
+// Build (pick one backend define):
+//   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_HOSTMAPPED -I include -lcuda \
+//        -o sync_backend_test scripts/ae/sync_backend_test.cu
+//   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_MEMCPY -I include -lcuda ...
 #include "common.h"
 #include <cstdio>
 #include <thread>
@@ -43,12 +45,16 @@ static double now_us() {
     return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+static uint64_t pack(uint32_t lo, uint32_t hi) {
+    return (uint64_t)hi << 32 | lo;
+}
+
+// Every pool write the next launch depends on goes through set() + launch_fence().
 static Ctl ctl_from_pool(GdrPool &pool, GdrEntry *e) {
     for(int i = 0; i < 4; ++i) e[i] = pool.gdr_malloc();
     GdrEntry maxE = e[1].half();
     pool.set(e[0], 1 << 30);
-    pool.set(e[1], 0);
-    *(volatile int*)maxE.h = 1 << 30;
+    pool.set(e[1], pack(0, 1 << 30));
     pool.set(e[2], 0);
     pool.set(e[3], 0);
     return {(int*)e[0].d, (int*)e[1].d, (int*)maxE.d, (int*)e[2].d, (int*)e[3].d};
@@ -62,14 +68,19 @@ static Ctl ctl_device() {
     return {d, d + 1, d + 2, d + 3, d + 4};
 }
 
-static float time_protocol(Ctl c, int blocks, int *skipped) {
+// Reads the value the host wrote right before the launch.
+__global__ void read_back(const int *src, int *dst) {
+    *dst = *(volatile const int*)src;
+}
+
+static float time_protocol(Ctl c, int blocks, int *skipped, cudaStream_t s) {
     cudaEvent_t a, b;
     cudaEventCreate(&a); cudaEventCreate(&b);
-    protocol<<<blocks, 128>>>(c, 0, skipped);   // warm-up
+    protocol<<<blocks, 128, 0, s>>>(c, 0, skipped);   // warm-up
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-    cudaEventRecord(a);
-    protocol<<<blocks, 128>>>(c, 0, skipped);
-    cudaEventRecord(b);
+    cudaEventRecord(a, s);
+    protocol<<<blocks, 128, 0, s>>>(c, 0, skipped);
+    cudaEventRecord(b, s);
     CHECK_CUDA_ERROR(cudaEventSynchronize(b));
     float ms;
     cudaEventElapsedTime(&ms, a, b);
@@ -87,6 +98,8 @@ int main() {
            p.name, p.major, p.minor, p.multiProcessorCount, native, pageable);
 
     GdrPool pool;
+    cudaStream_t s;
+    CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     int *skipped;
     CHECK_CUDA_ERROR(cudaMallocManaged(&skipped, sizeof(int)));
     *skipped = 0;
@@ -95,7 +108,8 @@ int main() {
     GdrEntry e[4];
     Ctl hc = ctl_from_pool(pool, e);
     int blocks = p.multiProcessorCount * 64;
-    protocol<<<blocks, 128>>>(hc, 0, skipped);
+    pool.launch_fence(s);
+    protocol<<<blocks, 128, 0, s>>>(hc, 0, skipped);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     int fetched = (int)pool.get(e[2]), finished = (int)pool.get(e[3]);
     int agents = (int)(uint32_t)pool.get(e[0]);
@@ -104,25 +118,29 @@ int main() {
     printf("[1 counters] blocks=%d fetched=%d finished=%d agents_delta=%d -> %s\n",
            blocks, fetched, finished, (1 << 30) - agents, ok ? "PASS" : "FAIL");
 
-    // 2. Host sees progress while the kernel runs.
+    // 2. Host sees progress while the kernel runs. Use many short waves: blocks
+    //    that all fit at once would finish together and look like one step.
     pool.set(e[3], 0);
-    protocol<<<p.multiProcessorCount * 8, 128>>>(hc, 20000000, skipped);
+    pool.launch_fence(s);
+    const int live_blocks = p.multiProcessorCount * 128;
+    protocol<<<live_blocks, 128, 0, s>>>(hc, 2000000, skipped);
     int seen = 0, last = -1;
-    while(cudaStreamQuery(0) == cudaErrorNotReady) {
+    while(cudaStreamQuery(s) == cudaErrorNotReady) {
         int f = (int)pool.get(e[3]);
         if(f != last) { ++seen; last = f; }
     }
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     ok = seen > 2;
     fails += !ok;
-    printf("[2 live progress] distinct finished values observed while running=%d final=%d -> %s\n",
-           seen, (int)pool.get(e[3]), ok ? "PASS" : "FAIL");
+    printf("[2 live progress] distinct finished values observed while running=%d final=%d/%d -> %s\n",
+           seen, (int)pool.get(e[3]), live_blocks, ok ? "PASS" : "FAIL");
 
     // 3. Host writes reach a running kernel (minSM/maxSM resize path); round-trip latency.
     GdrEntry in = pool.gdr_malloc(), out = pool.gdr_malloc();
     pool.set(in, 0); pool.set(out, 0);
     const int rounds = 2000;
-    pingpong<<<1, 1>>>((int*)in.d, (int*)out.d, rounds);
+    pool.launch_fence(s);
+    pingpong<<<1, 1, 0, s>>>((int*)in.d, (int*)out.d, rounds);
     double t0 = now_us();
     for(int r = 1; r <= rounds; ++r) {
         pool.set(in, (uint32_t)r);
@@ -132,26 +150,62 @@ int main() {
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     printf("[3 host<->kernel] %d round trips, avg %.2f us -> PASS\n", rounds, rtt);
 
-    // 4. Per-block cost of the protocol: device memory vs hostmapped pool.
+    // 4. Per-block cost of the protocol: device memory vs the pool.
     Ctl dc = ctl_device();
     for(int mult : {1, 16, 128}) {
         int nb = p.multiProcessorCount * mult;
-        float dms = time_protocol(dc, nb, skipped);
-        float hms = time_protocol(hc, nb, skipped);
-        printf("[4 overhead] blocks=%-6d device=%.3f ms  hostmapped=%.3f ms  (+%.2f us/block)\n",
+        float dms = time_protocol(dc, nb, skipped, s);
+        float hms = time_protocol(hc, nb, skipped, s);
+        printf("[4 overhead] blocks=%-6d device=%.3f ms  pool=%.3f ms  (+%.2f us/block)\n",
                nb, dms, hms, (hms - dms) * 1000.0f / nb);
     }
 
     // 5. maxSM restricts work: with maxSM=half, blocks on SMs >= half are marked skipped.
     *skipped = 0;
-    *(volatile int*)e[1].half().h = p.multiProcessorCount / 2;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    protocol<<<p.multiProcessorCount * 4, 128>>>(hc, 100000, skipped);
+    pool.set(e[1], pack(0, p.multiProcessorCount / 2));
+    pool.launch_fence(s);
+    protocol<<<p.multiProcessorCount * 4, 128, 0, s>>>(hc, 100000, skipped);
     CHECK_CUDA_ERROR(cudaDeviceSynchronize());
     ok = *skipped > 0 && *skipped < p.multiProcessorCount * 4;
     fails += !ok;
     printf("[5 maxSM read] maxSM=%d skipped=%d of %d -> %s\n",
            p.multiProcessorCount / 2, *skipped, p.multiProcessorCount * 4, ok ? "PASS" : "FAIL");
+
+    // 6. Launch ordering: a kernel sees at least the write issued right before
+    //    its launch on a busy stream, with no host sync in between. Later writes
+    //    may already have landed too (last writer wins, as with GDRCopy).
+    const int iters = 200;
+    int *seen_vals;
+    CHECK_CUDA_ERROR(cudaMallocManaged(&seen_vals, iters * sizeof(int)));
+    GdrEntry v = pool.gdr_malloc();
+    pool.set(e[3], 0);
+    pool.launch_fence(s);
+    protocol<<<p.multiProcessorCount * 8, 128, 0, s>>>(hc, 2000000, skipped);  // keep s busy
+    double tl = now_us();
+    for(int i = 0; i < iters; ++i) {
+        pool.set(v, 1000 + i);
+        pool.launch_fence(s);
+        read_back<<<1, 1, 0, s>>>((int*)v.d, &seen_vals[i]);
+    }
+    double per_launch = (now_us() - tl) / iters;
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    int wrong = 0;
+    for(int i = 0; i < iters; ++i) wrong += seen_vals[i] < 1000 + i;
+    ok = wrong == 0;
+    fails += !ok;
+    printf("[6 launch order] %d set+fence+launch, wrong=%d, host cost %.2f us/launch -> %s\n",
+           iters, wrong, per_launch, ok ? "PASS" : "FAIL");
+
+    // 7. Host cost of one read and one write.
+    const int n = 5000;
+    double tr = now_us();
+    for(int i = 0; i < n; ++i) pool.get(v);
+    tr = (now_us() - tr) / n;
+    double tw = now_us();
+    for(int i = 0; i < n; ++i) pool.set(v, i);
+    pool.get(v);
+    tw = (now_us() - tw) / n;
+    printf("[7 host cost] get %.2f us, set %.2f us\n", tr, tw);
 
     printf("%s\n", fails ? "RESULT: FAIL" : "RESULT: PASS");
     return fails != 0;

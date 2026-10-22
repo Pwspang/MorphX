@@ -3,7 +3,7 @@
 # under it. Needs a GPU node, e.g. inside a PBS job on hpcc:
 #   module load cuda/13.0 gnu/gcc-12.3
 #   bash runtime/test/run_hook_test.sh
-# Env: CUDA_HOME (toolkit), MORPHX_SYNC_BACKEND (hostmapped|gdr, default hostmapped),
+# Env: CUDA_HOME (toolkit), MORPHX_SYNC_BACKEND (hostmapped|memcpy|gdr, default hostmapped),
 #      NEUTRINO_REAL_DRIVER (optional; auto-detected), OUT (build dir).
 set -euo pipefail
 
@@ -17,6 +17,8 @@ DEFS=()
 GDR_LIB=()
 if [[ "$BACKEND" == hostmapped ]]; then
     DEFS+=(-DMORPHX_SYNC_BACKEND_HOSTMAPPED)
+elif [[ "$BACKEND" == memcpy ]]; then
+    DEFS+=(-DMORPHX_SYNC_BACKEND_MEMCPY)
 else
     GDR_LIB+=(-lgdrapi)
 fi

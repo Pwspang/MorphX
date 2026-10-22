@@ -489,6 +489,7 @@ bool launchReclaim(KernelInfo *info, int minSM, int maxSM, int nrSM) {
     void **args = new void*[info->numArgs];
     fillKernelArgs(info, agentsEntry, minEntry, maxEntry, args);
     std::shared_lock<std::shared_mutex> readLock(launchMutex);
+    gGdrPool->launch_fence(gReclaimStream);
     CUresult res = real_cuLaunchKernel(
         info->func,
         agents, 1, 1,
@@ -1265,6 +1266,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         }
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
         profile = new std::thread(profileThread, launchInfo, std::ref(profileWaves));
+        gGdrPool->launch_fence(hStream);
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
         profile->join();
         delete profile;
@@ -1292,6 +1294,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         // printf("[smsched] kernel launched: %.40s, func: %p, grid: (%d, %d, %d), block: (%d, %d, %d), sharedMemBytes: %u, stream: %p, numArgs: %d, occup: %d, agents: %d\n", 
         //     launchInfo->name, (void*)f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, numArgs, launchInfo->occup, agents);
         // if(!inWhiteList)
+        gGdrPool->launch_fence(hStream);
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
         streamInfo->pending->push(launchInfo);
         // if(strstr(launchInfo->name, "blocked_floyd_phase")) {
