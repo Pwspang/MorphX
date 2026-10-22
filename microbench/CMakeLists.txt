@@ -2,30 +2,19 @@ cmake_minimum_required(VERSION 3.20)
 
 option(SMSCHED_ENABLE_PASS "Build CUDA kernels with the SMSched LLVM pass" OFF)
 
-# Scheduler control-word backend: gdr (GDRCopy, default) or hostmapped (pinned
-# host memory, for machines without the gdrdrv kernel module).
-if(DEFINED ENV{MORPHX_SYNC_BACKEND})
-    set(MORPHX_SYNC_BACKEND_DEFAULT "$ENV{MORPHX_SYNC_BACKEND}")
-else()
-    set(MORPHX_SYNC_BACKEND_DEFAULT "gdr")
-endif()
-set(MORPHX_SYNC_BACKEND "${MORPHX_SYNC_BACKEND_DEFAULT}" CACHE STRING "Scheduler control-word backend: gdr or hostmapped")
-set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped)
-if(MORPHX_SYNC_BACKEND STREQUAL "hostmapped")
-    add_compile_definitions(MORPHX_SYNC_BACKEND_HOSTMAPPED)
-    set(MORPHX_GDR_LINK "")
-elseif(MORPHX_SYNC_BACKEND STREQUAL "gdr")
-    set(MORPHX_GDR_LINK "-lgdrapi")
-else()
-    message(FATAL_ERROR "Unknown MORPHX_SYNC_BACKEND: ${MORPHX_SYNC_BACKEND}")
-endif()
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/morphx.cmake)
 
 if(SMSCHED_ENABLE_PASS)
-    set(SMSCHED_LLVM_ROOT "/home/rtx/llvm-project/install" CACHE PATH "LLVM install prefix for SMSched pass builds")
-    set(CMAKE_CUDA_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang++" CACHE FILEPATH "" FORCE)
-    set(CMAKE_CXX_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang++" CACHE FILEPATH "" FORCE)
-    set(CMAKE_C_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang" CACHE FILEPATH "" FORCE)
+    # Pass builds need clang; still overridable with -DCMAKE_<LANG>_COMPILER.
+    set(SMSCHED_LLVM_ROOT "${MORPHX_LLVM_ROOT}" CACHE PATH "LLVM install prefix for SMSched pass builds")
+    set(CMAKE_CUDA_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang++" CACHE FILEPATH "")
+    set(CMAKE_CXX_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang++" CACHE FILEPATH "")
+    set(CMAKE_C_COMPILER "${SMSCHED_LLVM_ROOT}/bin/clang" CACHE FILEPATH "")
+elseif(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX} AND EXISTS "${MORPHX_CUDA_ROOT}/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "${MORPHX_CUDA_ROOT}/bin/nvcc" CACHE FILEPATH "")
 endif()
+set(CMAKE_CUDA_ARCHITECTURES "${MORPHX_CUDA_ARCH}" CACHE STRING "CUDA SM architectures to target")
+set(CUDAToolkit_ROOT "${MORPHX_CUDA_ROOT}" CACHE PATH "CUDA Toolkit root directory")
 
 project(microbench LANGUAGES C CXX CUDA)
 
@@ -34,14 +23,11 @@ if(SMSCHED_ENABLE_PASS)
     set(SMSCHED_PASS_SO "${SMSCHED_REPO_ROOT}/smsched-pass/build/libsmsched.so" CACHE FILEPATH "SMSched LLVM pass plugin")
     set(SMSCHED_CUDA_COMMON_FLAGS
         -nostdinc++
-        -I/usr/local/cuda-12.4/include
-        -I/usr/local/cuda-12.4/targets/x86_64-linux/include
+        -I${MORPHX_CUDA_ROOT}/include
+        -I${MORPHX_CUDA_ROOT}/targets/x86_64-linux/include
         -I${SMSCHED_LLVM_ROOT}/include/c++/v1
         -I${SMSCHED_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1
-        -I/home/rtx/gpu/cccl/thrust
-        -I/home/rtx/gpu/cccl/libcudacxx/include
-        -I/home/rtx/gpu/cccl/cub
-        --cuda-gpu-arch=sm_80
+        ${MORPHX_CCCL_INCLUDE_FLAGS}
         -std=c++17
         -O3
         -fplugin=${SMSCHED_PASS_SO}
@@ -50,22 +36,15 @@ if(SMSCHED_ENABLE_PASS)
         -enable-dump-ir
         -mllvm
         -dump-ir-dir=${CMAKE_CURRENT_BINARY_DIR}/ir
-        -D__NVCC__
-        -D__CUDACC_VER_MAJOR__=12
-        -D__CUDACC_VER_MINOR__=4
-        -D__NV_NO_HOST_COMPILER_CHECK
-        -D_ALLOW_UNSUPPORTED_LIBCPP
-        -D_VSTD=std
-        -Wno-invalid-specialization
-        -D__CUDACC__
+        ${MORPHX_CLANG_CUDA_FLAGS}
         -include
         cuda_fp16.h
     )
     string(REPLACE ";" " " SMSCHED_CUDA_FLAGS_STR "${SMSCHED_CUDA_COMMON_FLAGS}")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${SMSCHED_CUDA_FLAGS_STR}")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -I${SMSCHED_LLVM_ROOT}/include/c++/v1 -I${SMSCHED_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1 -D_VSTD=std -Wno-error=missing-template-arg-list-after-template-kw -Wno-invalid-specialization -include cuda_fp16.h")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L/usr/local/cuda-12.4/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -74,15 +53,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(CMAKE_CUDA_ARCHITECTURES "80" CACHE STRING "CUDA SM architectures to target" FORCE)
-
-set(CUTLASS_ROOT "/home/rtx/gpu/cutlass" CACHE PATH "CUTLASS install prefix")
+set(CUTLASS_ROOT "${MORPHX_CUTLASS_ROOT}" CACHE PATH "CUTLASS install prefix")
 set(CUTLASS_INCLUDE_DIRS
     "${CUTLASS_ROOT}/include"
     "${CUTLASS_ROOT}/tools/util/include"
 )
 
-set(CUDA_TOOLKIT_ROOT_DIR "/usr/local/cuda-12.4" CACHE PATH "CUDA Toolkit root directory")
 find_package(CUDAToolkit REQUIRED cublas)
 
 add_library(mycutlass SHARED src/my_cutlass_gemm.cu)
