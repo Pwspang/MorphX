@@ -37,7 +37,7 @@ cudaError_t CUDARTAPI cudaLaunchKernel(
     CHECK_CUDA_ERROR(cudaMallocAsync((void**)&finished, sizeof(int), stream));
     CHECK_CUDA_ERROR(cudaMallocAsync((void**)&minSM, sizeof(int), stream));
     CHECK_CUDA_ERROR(cudaMallocAsync((void**)&maxSM, sizeof(int), stream));
-    int t = 0, nrSM = 108;
+    int t = 0, nrSM = getDeviceSMCount();
     int h_fetched = 0, h_finished = 0, h_minSM = 0, h_maxSM = 0;
     CHECK_CUDA_ERROR(cudaMemcpyAsync(fetched, &t, sizeof(int), cudaMemcpyHostToDevice, stream));
     CHECK_CUDA_ERROR(cudaMemcpyAsync(finished, &t, sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -53,7 +53,7 @@ cudaError_t CUDARTAPI cudaLaunchKernel(
     nargs[n - 1] = &maxSM;
     // printf("Launch kernel %p, grid: (%d, %d, %d), block: (%d, %d, %d), sharedMem: %lu, stream: %p, numArgs: %d, occup: %d\n", 
     //     func, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, sharedMem, stream, n - 5, occup);
-    auto ret = _cudaLaunchKernel(func, dim3(occup * 108, 1, 1), blockDim, nargs, sharedMem, stream);
+    auto ret = _cudaLaunchKernel(func, dim3(occup * nrSM, 1, 1), blockDim, nargs, sharedMem, stream);
     // cudaStreamSynchronize(stream);
     // cudaMemcpyAsync(&h_fetched, fetched, sizeof(int), cudaMemcpyDeviceToHost, stream);
     // cudaMemcpyAsync(&h_finished, finished, sizeof(int), cudaMemcpyDeviceToHost, stream);

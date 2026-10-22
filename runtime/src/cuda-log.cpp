@@ -451,7 +451,7 @@ void generateProfileWaves(int nrSM, KernelInfo *info, std::vector<int> &profileW
         int remain = info->gridSize % baseBlocks;
         // printf("[smsched] baseWaves: %d, dec: %d, baseBlocks: %d, repeat: %d, remain: %d\n", baseWaves, dec, baseBlocks, repeat, remain);
         // printf("[smsched] nrSM: %d, occup: %d\n", nrSM, info->occup);
-        for(int k = nrSM * info->occup; k; k -= dec * info->occup) {
+        for(int k = nrSM * info->occup; k > 0; k -= dec * info->occup) {
             for(int i = 0; i < repeat; ++i) {
                 profileWaves.push_back(k);
             }

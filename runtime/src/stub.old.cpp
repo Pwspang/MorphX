@@ -313,7 +313,7 @@ void generateProfileWaves(int nrSM, KernelRuntimeInfo *info, std::vector<int> &p
         int baseBlocks = (dec + nrSM) * info->occup * baseWaves / 2;
         int repeat = info->gridSize / baseBlocks;
         int remain = info->gridSize % baseBlocks;
-        for(int k = nrSM * info->occup; k; k -= dec * info->occup) {
+        for(int k = nrSM * info->occup; k > 0; k -= dec * info->occup) {
             for(int i = 0; i < repeat; ++i) {
                 profileWaves.push_back(k);
             }

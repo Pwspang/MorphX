@@ -217,6 +217,7 @@ std::thread agent;
 std::atomic<bool> gAgentRunning{true};
 
 std::unordered_map<CUfunction, CUmodule> gFuncModuleMap;
+std::unordered_map<CUkernel, bool> gKernelSet;
 
 int with_profile;
 int split_hint;
@@ -231,6 +232,9 @@ inline int getNrSM() {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, 0);
         gNrSM = prop.multiProcessorCount;
+        if(split_hint == 0) { // SMSCHED_SPLIT_HINT unset
+            split_hint = scaleSplitHint(60, gNrSM);
+        }
     }
     return gNrSM;
 }
@@ -291,7 +295,7 @@ void generateProfileWaves(int nrSM, KernelInfo *info, std::vector<int> &profileW
         int remain = info->gridSize % baseBlocks;
         // printf("[smsched] baseWaves: %d, dec: %d, baseBlocks: %d, repeat: %d, remain: %d\n", baseWaves, dec, baseBlocks, repeat, remain);
         // printf("[smsched] nrSM: %d, occup: %d\n", nrSM, info->occup);
-        for(int k = nrSM * info->occup; k; k -= dec * info->occup) {
+        for(int k = nrSM * info->occup; k > 0; k -= dec * info->occup) {
             for(int i = 0; i < repeat; ++i) {
                 profileWaves.push_back(k);
             }
@@ -741,10 +745,8 @@ static void ld_init(void) {
         return;
     }
     with_profile = getenv_int("SMSCHED_PROFILE", 1);
+    // 0 = default: 60 on a 108-SM A100, scaled to the SM count in getNrSM()
     split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
-    if(split_hint == 0) {
-        split_hint = 60;
-    }
     llm_trick_mode = getenv_int("SMSCHED_LLM_TRICK_MODE", 0);
     llm_trace_limit = getenv_int("SMSCHED_LLM_TRACE_LIMIT", 0);
     llm_trace_prints.store(0);
@@ -834,6 +836,12 @@ CUresult cuKernelGetFunction(CUfunction* pFunc, CUkernel kernel) {
     }
     // fprintf(stderr, "[mod] cuKernelGetFunction called for %p\n", kernel);
     CUresult result = real_cuKernelGetFunction(pFunc, kernel);
+    // lazy loading (cuLibrary*) never calls cuModuleGetFunction; record the
+    // module so cuLaunchKernel can find the patched "_pk" kernel
+    CUmodule mod;
+    if(result == CUDA_SUCCESS && real_cuFuncGetModule(&mod, *pFunc) == CUDA_SUCCESS) {
+        gFuncModuleMap[*pFunc] = mod;
+    }
     return result;
 }
 
@@ -844,6 +852,9 @@ CUresult cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, const char* na
         ld_init();
     }
     CUresult result = real_cuLibraryGetKernel(pKernel, library, name);
+    if(result == CUDA_SUCCESS) {
+        gKernelSet[*pKernel] = true;
+    }
     return result;
 }
 
@@ -855,6 +866,28 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
     // fprintf(stderr, "[mod] cuLibraryGetModule called for library %p\n", library);
     CUresult result = real_cuLibraryGetModule(pMod, library);
     return result;
+}
+
+/**
+ * cuLaunchKernelEx attributes that cuLaunchKernel can drop without changing
+ * what the kernel computes. Anything else (thread block clusters, cooperative
+ * launch, launch events, ...) needs the original launch, e.g. Hopper CUTLASS 3.
+ */
+static bool hasRequiredLaunchAttrs(const CUlaunchConfig* config) {
+    for(unsigned int i = 0; i < config->numAttrs; ++i) {
+        switch(config->attrs[i].id) {
+        case CU_LAUNCH_ATTRIBUTE_IGNORE:
+        case CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW:
+        case CU_LAUNCH_ATTRIBUTE_PRIORITY:
+        case CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION:
+        case CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP:
+        case CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN:
+            break;
+        default:
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -873,6 +906,14 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     if (shared_lib == NULL) {
         // fprintf(event_log, "[mod] cuLaunchKernel called before ld_init, calling ld_init now...\n");
         ld_init();
+    }
+
+    // cudart may pass a CUkernel as the CUfunction; use its context function
+    if(gKernelSet.count((CUkernel)f)) {
+        CUfunction kernelFunc;
+        if(cuKernelGetFunction(&kernelFunc, (CUkernel)f) == CUDA_SUCCESS) {
+            f = kernelFunc;
+        }
     }
 
     int nrSM = getNrSM();
@@ -1058,6 +1099,9 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** ker
 
     if(config == nullptr) {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    if(hasRequiredLaunchAttrs(config)) {
+        return real_cuLaunchKernelEx(config, f, kernelParams, extra);
     }
     return cuLaunchKernel(
         f,
