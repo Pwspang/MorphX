@@ -559,9 +559,47 @@ Estimated effort: **3–6 weeks** after the spike.
          vLLM fallback (§6.5).
        - Early look before the pass-built stack exists: stock SGLang wheels +
          runtime hook to list kernel names and the time split.
-2. [ ] Add the `LLMBackend` interface; port `single_request.py` → Fig 15 with SGLang.
+2. [x] Add the `LLMBackend` interface; port `single_request.py` → Fig 15 with SGLang
+       (Track J0/J2). `MORPHX_LLM_BACKEND=sglang` + `MORPHX_LLM_GEMM=mycutlass`
+       (selected by `env-h100.sh`; the vLLM path is unchanged and stays the default).
+       The GEMM/GEMV workloads also go through mycutlass: the reference A100 Fig 15
+       shows MorphX overhead on GEMM (1.44×) and GEMV (1.34×), so the authors'
+       `torch.matmul` ran pass-built kernels, not cuBLAS. DNN (ResNet-50, cuDNN)
+       stays on torch, as in the reference (1.01×). GGNN waits for Track K.
 3. [ ] Profile kernel names, make the `cuda-llm.cpp` patterns configurable per backend.
-4. [ ] In-process co-location driver on `ModelRunner` → Fig 10–12 with SGLang.
+4. [~] In-process co-location driver on `ModelRunner` → Fig 10–12 with SGLang (Track J2):
+       `scripts/colocate/run.py` uses the backend switch; its GEMM worker uses
+       mycutlass. Fig 11 (LLM + GEMM) runs; Fig 10/12 need GGNN (Track K).
+       `configs/multitask/*.json` (incl. A.json with two LLMs) are not used by any
+       AE script — `run.py` only ever starts one LLM — so two SGLang runners per
+       process are not needed for the AE.
+
+#### Track J2 results on hpcc H200 (job 91384, memcpy backend, sglang + mycutlass, Llama → Qwen3 via `MORPHX_MODEL_ALIASES`)
+
+Fig 15 (ms; LLM = Qwen3-8B fp16, 4096 in / 3 out; A100 reference in brackets):
+
+| Task | base | MorphX | MorphX rel. | ncu rel. |
+|---|---|---|---|---|
+| DNN | 33.09 | 33.08 | 1.000 (1.010) | N/A |
+| GEMM 8192³ | 2.368 | 2.484 | 1.049 (1.441) | 395 (200) |
+| GEMV 8192×16×8192 | 0.087 | 0.149 | 1.713 (1.342) | 8156 (5553) |
+| LLM | 177.4 | 192.7 | 1.087 (1.027) | 955 (103) |
+
+GGNN, NVBit, neutrino: N/A (not built / not installed). mycutlass vs cuBLAS on
+the raw shapes: 8192³ 2.32 vs 1.44 ms; GEMV 0.050 vs 0.048 ms; same max error.
+
+Fig 11(a) point `llm-1-mm-1` (60 s instead of 180 s, Qwen3-8B, ShareGPT 2048/2048):
+
+| Scheduler | Served | Avg TTFT (ms) | Avg latency (ms) | Avg TBT (ms) | Matmuls |
+|---|---|---|---|---|---|
+| stream | 48 | 28.9 | 3787 | 15.5 | 490 |
+| MorphX | 48 | 33.6 | 4345 | 17.7 | 490 |
+| MPS-50 | 48 | 46.9 | 4395 | — | 490 |
+| A100 ref. stream / MorphX / MPS-50 (180 s, Llama-3-8B) | 156 | 46.6 / 45.9 / 61.4 | 5266 / 4910 / 5367 | — | 1700 |
+
+At this lightest point the GEMM side is rate-limited (≈2 % of the GPU), so there
+is little contention for MorphX to remove; its +15 % TBT matches the memcpy
+backend's per-launch host cost measured in §5 (decode step +15 %).
 5. [ ] Prefill thread/stream in SGLang → Fig 13–14 with SGLang.
 6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
        (`logs/<timestamp>-sglang/`).
