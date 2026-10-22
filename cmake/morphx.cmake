@@ -109,8 +109,10 @@ else()
         -Wno-unknown-cuda-version
         # clang doesn't define these; without them CUTLASS compiles its
         # tensor-core MMAs as traps (CUTLASS_ARCH_MMA_SM80_SUPPORTED unset).
-        -D__CUDACC_VER_MAJOR__=${MORPHX_CUDA_VERSION_MAJOR}
-        -D__CUDACC_VER_MINOR__=${MORPHX_CUDA_VERSION_MINOR}
+        # Claim 12.4 (the original artifact's toolkit): >= 12.8 makes CUTLASS
+        # use nvcc-only __nv_atomic_* builtins that clang lacks.
+        -D__CUDACC_VER_MAJOR__=12
+        -D__CUDACC_VER_MINOR__=4
     )
     set(MORPHX_STDLIB_COMPILE_FLAGS "")
     set(MORPHX_STDLIB_CXX_FLAGS "")
