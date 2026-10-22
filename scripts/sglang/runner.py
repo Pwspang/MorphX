@@ -194,12 +194,14 @@ class SglangRunner:
             raise ValueError(f"request {request_id}: prompt + max_tokens = {need} > max_model_len {self.max_model_len}")
         if need > self.kv_capacity:
             raise ValueError(f"request {request_id}: needs {need} KV tokens, pool holds {self.kv_capacity}")
+        # vLLM's min_tokens == max_tokens means "always generate exactly max_tokens":
+        # ignore EOS instead, which avoids the min-new-tokens penalizer's extra kernels.
+        exact = int(min_tokens) >= int(max_tokens)
         sampling_params = SamplingParams(
             max_new_tokens=int(max_tokens),
-            min_new_tokens=int(min_tokens),
+            min_new_tokens=0 if exact else int(min_tokens),
             temperature=temperature,
-            # vLLM's min_tokens == max_tokens means "always generate exactly max_tokens"
-            ignore_eos=int(min_tokens) >= int(max_tokens),
+            ignore_eos=exact,
         )
         sampling_params.normalize(None)
         req = Req(
@@ -210,6 +212,7 @@ class SglangRunner:
             eos_token_ids=self.model_config.hf_eos_token_id,
             vocab_size=self.model_config.vocab_size,
         )
+        req.tokenizer = self.tokenizer  # read by the min-new-tokens penalizer and stop checks
         req.fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
         req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
@@ -261,6 +264,8 @@ class SglangRunner:
         now = time.time()
         for state in states:
             state.metrics.first_scheduled_time = now
+        # Everything touching the GPU stays on self.stream, including the
+        # post-processing (KV index copies in cache_unfinished_req, filter/merge).
         with torch.cuda.stream(self.stream):
             batch = ScheduleBatch.init_new(
                 reqs=[s.req for s in states],
@@ -275,14 +280,14 @@ class SglangRunner:
             next_token_ids = self._forward(batch)
             batch.output_ids = next_token_ids
             next_ids = next_token_ids.tolist()  # waits for this stream only
-        self.num_prefill_steps += 1
-        outputs = self._process_tokens(batch, next_ids, first=True)
-        batch.filter_batch()
-        if not batch.is_empty():
-            if self.running is None or self.running.is_empty():
-                self.running = batch
-            else:
-                self.running.merge_batch(batch)
+            self.num_prefill_steps += 1
+            outputs = self._process_tokens(batch, next_ids, first=True)
+            batch.filter_batch()
+            if not batch.is_empty():
+                if self.running is None or self.running.is_empty():
+                    self.running = batch
+                else:
+                    self.running.merge_batch(batch)
         return outputs
 
     @torch.no_grad()
@@ -293,9 +298,9 @@ class SglangRunner:
             next_token_ids = self._forward(batch)
             batch.output_ids = next_token_ids
             next_ids = next_token_ids.tolist()
-        self.num_decode_steps += 1
-        outputs = self._process_tokens(batch, next_ids, first=False)
-        batch.filter_batch()
+            self.num_decode_steps += 1
+            outputs = self._process_tokens(batch, next_ids, first=False)
+            batch.filter_batch()
         return outputs
 
     def _forward(self, batch: ScheduleBatch) -> torch.Tensor:

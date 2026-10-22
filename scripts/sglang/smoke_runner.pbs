@@ -1,0 +1,25 @@
+#!/bin/bash
+# In-process SGLang runner smoke test + kernel census on hpcc (stock wheels).
+#   cd <repo> && qsub scripts/sglang/smoke_runner.pbs
+#PBS -N morphx-j0-smoke
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+cd "$PBS_O_WORKDIR"
+MODEL=${MODEL:-$HOME/morphx/hf/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f}
+echo "== host=$(hostname) job=$PBS_JOBID"
+nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+echo "== run 1: main thread, census"
+python scripts/sglang/smoke_runner.py --model "$MODEL" --census-out docs/sglang-kernel-census.raw.md
+echo "exit=$?"
+echo "== run 2: non-main thread (as colocate/run.py)"
+python scripts/sglang/smoke_runner.py --model "$MODEL" --in-thread --num-requests 10 --census-decode-steps 4
+echo "exit=$?"
