@@ -43,7 +43,11 @@ else()
     set(_morphx_cccl_default "/home/rtx/gpu/cccl")
 endif()
 set(MORPHX_CCCL_ROOT "${_morphx_cccl_default}" CACHE PATH "CCCL checkout; empty uses the CUDA toolkit's bundled CCCL")
-if(MORPHX_CCCL_ROOT)
+if(MORPHX_CCCL_ROOT AND NOT EXISTS "${MORPHX_CCCL_ROOT}/thrust/thrust")
+    # Installed/bundled layout (thrust/, cub/, cuda/ side by side).
+    set(MORPHX_CCCL_INCLUDE_FLAGS -I${MORPHX_CCCL_ROOT})
+elseif(MORPHX_CCCL_ROOT)
+    # Source checkout layout.
     set(MORPHX_CCCL_INCLUDE_FLAGS
         -I${MORPHX_CCCL_ROOT}/thrust
         -I${MORPHX_CCCL_ROOT}/libcudacxx/include
