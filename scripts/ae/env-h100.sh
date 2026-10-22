@@ -41,6 +41,9 @@ export MORPHX_LLM_GEMM="${MORPHX_LLM_GEMM:-mycutlass}"
 export MYCUTLASS_LIB_DIR="${MYCUTLASS_LIB_DIR:-${_morphx_repo}/microbench/build-model}"
 # Gated Llama weights aren't downloaded yet: run their experiments on Qwen3.
 export MORPHX_MODEL_ALIASES="${MORPHX_MODEL_ALIASES-llama-3-8b=qwen3-8b,llama-2-7b=qwen3-4b}"
+# Fig 13-14: the A100 request rates leave the H200 lightly loaded; 3x puts the
+# baseline's saturation knee on the same rows (docs/h100-port-plan.md section 9, J4).
+export MORPHX_PD_RPS_SCALE="${MORPHX_PD_RPS_SCALE:-3}"
 unset _morphx_repo
 
 # Data and baselines
