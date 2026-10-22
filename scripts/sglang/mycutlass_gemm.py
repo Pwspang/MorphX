@@ -120,6 +120,39 @@ def linear(owner: torch.nn.Module, x: torch.Tensor, weight: torch.Tensor, bias: 
     return y.view(*lead, n_out)
 
 
+def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """c = a @ b for row-major 2-D fp16 tensors, through mycutlass without copies.
+
+    Row-major c[M, N] is column-major c^T[N, M] = b^T[N, K] @ a^T[K, M], and the
+    row-major a and b already are column-major a^T and b^T, so
+    myCutlassHgemm(m=N, n=M, k=K, A=b, lda=N, B=a, ldb=K, C=c, ldc=N).
+    Used by the GEMM/GEMV workloads (Fig 11, Fig 15); falls back to torch.matmul.
+    """
+    _load()
+    if a.dim() != 2 or b.dim() != 2 or a.dtype != torch.float16 or b.dtype != torch.float16:
+        _count("matmul:fallback_dtype")
+        return torch.matmul(a, b)
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul shape mismatch: {tuple(a.shape)} @ {tuple(b.shape)}")
+    if n % _ALIGN or k % _ALIGN or m == 0:
+        _count("matmul:fallback_shape")
+        return torch.matmul(a, b)
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    c = torch.empty((m, n), dtype=torch.float16, device=a.device)
+    if not (_aligned(a) and _aligned(b) and _aligned(c)):
+        _count("matmul:fallback_align")
+        return torch.matmul(a, b)
+    _hgemm(n, m, k, b.data_ptr(), n, a.data_ptr(), k, c.data_ptr(), n,
+           1.0, 0.0, torch.cuda.current_stream(a.device).cuda_stream)
+    _count("matmul:mycutlass")
+    return c
+
+
 def prepare(model: torch.nn.Module) -> int:
     """Materialize W^T for every routed fp16 weight now, instead of on the first forward."""
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod

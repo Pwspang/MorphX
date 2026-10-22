@@ -96,6 +96,22 @@ class _ReqState:
     reserved_tokens: int
 
 
+def _reserve_for_weight_copy(model_path: str, mem_fraction_static: float, gpu_id: int) -> float:
+    """Lower mem_fraction_static by the checkpoint size (fp16/bf16 safetensors ~ dense weights)."""
+    try:
+        weight_bytes = sum(
+            os.path.getsize(os.path.join(model_path, name))
+            for name in os.listdir(model_path)
+            if name.endswith(".safetensors")
+        )
+    except OSError:
+        return mem_fraction_static
+    total = torch.cuda.get_device_properties(gpu_id).total_memory
+    reduced = max(0.3, mem_fraction_static - weight_bytes / total)
+    logger.info("mycutlass: mem_fraction_static %.3f -> %.3f for the transposed weights", mem_fraction_static, reduced)
+    return reduced
+
+
 class SglangRunner:
     """Single-GPU, single-process SGLang model runner with continuous batching."""
 
@@ -131,6 +147,10 @@ class SglangRunner:
         self.max_num_batched_tokens = int(max_num_batched_tokens or max_model_len)
         torch.cuda.set_device(gpu_id)
         self.stream = stream if stream is not None else torch.cuda.current_stream()
+        if self.gemm == "mycutlass":
+            # mycutlass_gemm.prepare() adds a transposed copy of the dense weights after
+            # ModelRunner has sized the KV pool, so leave room for it.
+            mem_fraction_static = _reserve_for_weight_copy(model_path, mem_fraction_static, gpu_id)
 
         self.server_args = ServerArgs(
             model_path=model_path,
@@ -146,6 +166,11 @@ class SglangRunner:
             log_level=log_level,
             **server_kwargs,
         )
+        # SGLang turns on programmatic dependent launch (TRTLLM_ENABLE_PDL) process-wide
+        # unless it is "0". The MorphX hook passes PDL launches through unscheduled and
+        # co-located workloads share this process, so keep it off unless asked for
+        # (MORPHX_SGLANG_PDL=1). FlashInfer's norm kernels still pick PDL from the device.
+        os.environ["TRTLLM_ENABLE_PDL"] = os.environ.get("MORPHX_SGLANG_PDL", "0")
         _set_envs_and_config(self.server_args)
         initialize_moe_config(self.server_args)
         initialize_fp8_gemm_config(self.server_args)

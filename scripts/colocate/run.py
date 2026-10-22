@@ -21,16 +21,35 @@ try:
 except Exception:
     ggnn = None
 
-try:
-    # vLLM is optional. If not present, script will exit with helpful message.
-    from vllm import EngineArgs, LLMEngine, RequestOutput, SamplingParams
-    from vllm.inputs import TokensPrompt
-except Exception:
-    LLMEngine = None
-    EngineArgs = None
-    RequestOutput = None
-    SamplingParams = None
-    TokensPrompt = None
+# LLM engine and dense GEMMs are selectable for the H100/H200 port (scripts/sglang):
+#   MORPHX_LLM_BACKEND=vllm|sglang  (default vllm, the original stack)
+#   MORPHX_LLM_GEMM=torch|mycutlass  (mycutlass: pass-built CUTLASS, so MorphX can schedule it)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sglang"))
+import backend as llm_backend  # noqa: E402
+
+_LLM = None
+
+
+def get_llm_backend():
+    global _LLM
+    if _LLM is None:
+        try:
+            _LLM = llm_backend.get_backend()
+        except ImportError as exc:
+            raise RuntimeError(f"LLM backend '{llm_backend.backend_name()}' is not available in this Python environment") from exc
+    return _LLM
+
+
+def gemm_backend():
+    return os.environ.get("MORPHX_LLM_GEMM", "torch").strip().lower() or "torch"
+
+
+def matmul(a, b):
+    if gemm_backend() == "mycutlass":
+        import mycutlass_gemm
+
+        return mycutlass_gemm.matmul(a, b)
+    return torch.matmul(a, b)
 
 import torchvision
 from collections import deque
@@ -198,11 +217,12 @@ def create_cuda_stream(label: str = "", is_llm: bool = False):
 def create_prompts(vocab_size, num_requests, input_len, output_len):
     input_lens = torch.full((num_requests,), input_len, dtype=torch.int32, device="cuda")
     output_lens = torch.full((num_requests,), output_len, dtype=torch.int32, device="cuda")
+    llm = get_llm_backend()
     requests = []
     for i in range(num_requests):
         token_ids = [(i + j) % vocab_size for j in range(int(input_lens[i]))]
-        prompt = TokensPrompt(prompt_token_ids=token_ids)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=int(output_lens[i]), min_tokens=int(output_lens[i]))
+        prompt = llm.make_prompt(token_ids)
+        sampling_params = llm.make_sampling_params(max_tokens=int(output_lens[i]), min_tokens=int(output_lens[i]))
         requests.append((prompt, sampling_params))
     return requests
 
@@ -299,20 +319,18 @@ def build_sharegpt_specs(tokenizer, samples, default_output_len, max_context_len
     return specs
 
 
-def initialize_engine(model, input_length, output_length, enable_chunked_prefill: bool):
-    if LLMEngine is None:
-        raise RuntimeError("vLLM (vllm) is not available in this Python environment")
+def initialize_engine(model, input_length, output_length, enable_chunked_prefill: bool, stream=None):
     context_length = int(input_length) + int(output_length)
-    engine_args = EngineArgs(
-        model=model_paths.get(model, model),
-        enforce_eager=True,
-        max_model_len=context_length,
-        max_num_batched_tokens=context_length,
-        enable_chunked_prefill=enable_chunked_prefill,
-        gpu_memory_utilization=0.9,
-    )
+    model = llm_backend.resolve_model_alias(model)
     with without_child_ld_preload():
-        return LLMEngine.from_engine_args(engine_args)
+        return get_llm_backend().create_engine(
+            model_paths.get(model, model),
+            max_model_len=context_length,
+            max_num_batched_tokens=context_length,
+            enable_chunked_prefill=enable_chunked_prefill,
+            gpu_memory_utilization=0.9,
+            stream=stream,
+        )
 
 
 def llm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup_lock, ready_barrier, start_barrier):
@@ -348,7 +366,8 @@ def llm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup_
 
     with warmup_lock:
         with torch.cuda.stream(stream):
-            engine = initialize_engine(config.get("model"), input_len, output_len, enable_chunked_prefill=config.get("enable_chunked_prefill", False))
+            llm = get_llm_backend()
+            engine = initialize_engine(config.get("model"), input_len, output_len, enable_chunked_prefill=config.get("enable_chunked_prefill", False), stream=stream)
             print(f"[LLM] Worker {thread_id} (PID {os.getpid()}): engine initialized", flush=True)
             dataset_path = dataset_paths.get(config.get("dataset"))
             if dataset_path:
@@ -365,11 +384,11 @@ def llm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup_
             # warmup: execute one request
             if sharegpt_specs:
                 warmup_spec = sharegpt_specs[0]
-                warmup_prompt = TokensPrompt(prompt_token_ids=warmup_spec["prompt_ids"])
-                warmup_sampling = SamplingParams(temperature=0.0, max_tokens=warmup_spec["max_tokens"], min_tokens=warmup_spec["max_tokens"])
+                warmup_prompt = llm.make_prompt(warmup_spec["prompt_ids"])
+                warmup_sampling = llm.make_sampling_params(max_tokens=warmup_spec["max_tokens"], min_tokens=warmup_spec["max_tokens"])
             else:
-                warmup_prompt = TokensPrompt(prompt_token_ids=[0] * input_len)
-                warmup_sampling = SamplingParams(temperature=0.0, max_tokens=output_len, min_tokens=output_len)
+                warmup_prompt = llm.make_prompt([0] * input_len)
+                warmup_sampling = llm.make_sampling_params(max_tokens=output_len, min_tokens=output_len)
             engine.add_request("warmup", warmup_prompt, warmup_sampling)
             while engine.has_unfinished_requests():
                 request_outputs = engine.step()
@@ -394,8 +413,8 @@ def llm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup_
             prompts = []
             for idx in range(num_requests):
                 spec = sharegpt_specs[idx % len(sharegpt_specs)]
-                prompt = TokensPrompt(prompt_token_ids=spec["prompt_ids"])
-                sampling_params = SamplingParams(temperature=0.0, max_tokens=spec["max_tokens"], min_tokens=spec["max_tokens"])
+                prompt = llm.make_prompt(spec["prompt_ids"])
+                sampling_params = llm.make_sampling_params(max_tokens=spec["max_tokens"], min_tokens=spec["max_tokens"])
                 prompts.append((prompt, sampling_params))
         else:
             prompts = create_prompts(engine.get_tokenizer().vocab_size, num_requests, input_len, output_len)
@@ -494,10 +513,10 @@ def gemm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup
             A = torch.randn((size, size), dtype=dtype_t, device=device)
             B = torch.randn((size, size), dtype=dtype_t, device=device)
             # warm up
-            C = torch.matmul(A, B)
+            C = matmul(A, B)
         torch.cuda.synchronize()
 
-    print(f"[GEMM] Worker {thread_id} (PID {os.getpid()}): warmup completed, waiting for start")
+    print(f"[GEMM] Worker {thread_id} (PID {os.getpid()}): warmup completed (gemm={gemm_backend()}), waiting for start")
     if ready_barrier is not None:
         ready_barrier.wait(timeout=total_time + 5)
     print(f"[GEMM] Worker {thread_id} (PID {os.getpid()}): started")
@@ -536,7 +555,7 @@ def gemm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup
             for i in range(10):
                 A = torch.randn((size, size), dtype=dtype_t, device=device)
                 B = torch.randn((size, size), dtype=dtype_t, device=device)
-                C = torch.matmul(A, B)
+                C = matmul(A, B)
             # ensure completion to count definitively
             torch.cuda.synchronize()
             ops += 10

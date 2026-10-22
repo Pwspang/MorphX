@@ -25,11 +25,13 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     ggnn = None
 
-EngineArgs: Any = None
-LLMEngine: Any = None
-RequestOutput: Any = None
-SamplingParams: Any = None
-TokensPrompt: Any = None
+# LLM engine and dense GEMMs are selectable for the H100/H200 port (scripts/sglang):
+#   MORPHX_LLM_BACKEND=vllm|sglang  (default vllm, the original stack)
+#   MORPHX_LLM_GEMM=torch|mycutlass  (mycutlass: pass-built CUTLASS, so MorphX can schedule it)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sglang"))
+import backend as llm_backend  # noqa: E402
+
+_LLM: Any = None
 
 # Machine-specific settings (see scripts/ae/morphx_env.py); defaults match the A100 AE machine.
 HF_CACHE = os.environ.get("MORPHX_HF_CACHE") or "/huggingface-cache/hub"
@@ -73,21 +75,26 @@ def set_smsched_bypass(enabled: bool) -> None:
     os.environ["SMSCHED_BYPASS"] = "1" if enabled else "0"
 
 
-def ensure_vllm_available() -> None:
-    global EngineArgs, LLMEngine, RequestOutput, SamplingParams, TokensPrompt
-    if LLMEngine is not None:
-        return
-    try:
-        from vllm import EngineArgs as _EngineArgs, LLMEngine as _LLMEngine, RequestOutput as _RequestOutput, SamplingParams as _SamplingParams  # type: ignore
-        from vllm.inputs import TokensPrompt as _TokensPrompt  # type: ignore
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("vLLM (vllm) is not available in this Python environment") from exc
+def get_llm_backend() -> Any:
+    global _LLM
+    if _LLM is None:
+        try:
+            _LLM = llm_backend.get_backend()
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(f"LLM backend '{llm_backend.backend_name()}' is not available in this Python environment") from exc
+    return _LLM
 
-    EngineArgs = _EngineArgs
-    LLMEngine = _LLMEngine
-    RequestOutput = _RequestOutput
-    SamplingParams = _SamplingParams
-    TokensPrompt = _TokensPrompt
+
+def gemm_backend() -> str:
+    return os.environ.get("MORPHX_LLM_GEMM", "torch").strip().lower() or "torch"
+
+
+def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if gemm_backend() == "mycutlass":
+        import mycutlass_gemm
+
+        return mycutlass_gemm.matmul(a, b)
+    return torch.matmul(a, b)
 
 
 def parse_args() -> argparse.Namespace:
@@ -262,25 +269,22 @@ def pretty_print_summary(label: str, summary: Dict[str, float]) -> None:
 def resolve_model_path(model: Optional[str]) -> str:
     if not model:
         model = "llama-2-7b"
+    model = llm_backend.resolve_model_alias(model)
     return MODEL_PATHS.get(model, model)
 
 
-def initialize_engine(model: str, input_length: int, output_length: int, enable_chunked_prefill: bool) -> Any:
-    ensure_vllm_available()
-    if LLMEngine is None or EngineArgs is None:
-        raise RuntimeError("vLLM (vllm) is not available in this Python environment")
+def initialize_engine(model: str, input_length: int, output_length: int, enable_chunked_prefill: bool, stream: Any = None) -> Any:
     context_length = int(input_length) + int(output_length)
-    engine_args = EngineArgs(
-        model=model,
-        enforce_eager=True,
-        max_model_len=context_length,
-        max_num_batched_tokens=context_length,
-        max_num_seqs=1,
-        enable_chunked_prefill=enable_chunked_prefill,
-        gpu_memory_utilization=0.9,
-    )
     with without_child_ld_preload():
-        return LLMEngine.from_engine_args(engine_args)
+        return get_llm_backend().create_engine(
+            model,
+            max_model_len=context_length,
+            max_num_batched_tokens=context_length,
+            max_num_seqs=1,
+            enable_chunked_prefill=enable_chunked_prefill,
+            gpu_memory_utilization=0.9,
+            stream=stream,
+        )
 
 
 def build_prompt_ids(tokenizer, input_length: int) -> List[int]:
@@ -295,7 +299,6 @@ def build_prompt_ids(tokenizer, input_length: int) -> List[int]:
 
 
 def wait_for_request(engine: Any, request_id: str) -> Any:
-    ensure_vllm_available()
     while True:
         outputs = engine.step()
         torch.cuda.synchronize()
@@ -320,10 +323,7 @@ def maybe_stop_cuda_profiler() -> None:
 
 
 def benchmark_llm(args: argparse.Namespace) -> Dict[str, float]:
-    ensure_vllm_available()
-    if TokensPrompt is None or SamplingParams is None:
-        raise RuntimeError("vLLM dependencies were not imported successfully")
-
+    llm = get_llm_backend()
     runs = max(args.runs, 1)
     model_path = resolve_model_path(args.model)
     input_len = int(args.input_length)
@@ -332,12 +332,12 @@ def benchmark_llm(args: argparse.Namespace) -> Dict[str, float]:
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         set_smsched_bypass(True)
-        engine = initialize_engine(model_path, input_len, output_len, args.enable_chunked_prefill)
+        engine = initialize_engine(model_path, input_len, output_len, args.enable_chunked_prefill, stream=stream)
         tokenizer = engine.get_tokenizer()
         prompt_ids = build_prompt_ids(tokenizer, input_len)
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=output_len, min_tokens=output_len)
+        sampling_params = llm.make_sampling_params(max_tokens=output_len, min_tokens=output_len)
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+        prompt = llm.make_prompt(prompt_ids)
         engine.add_request("warmup", prompt, sampling_params)
         while engine.has_unfinished_requests():
             wait_for_request(engine, "warmup")
@@ -388,9 +388,9 @@ def benchmark_gemm(args: argparse.Namespace) -> Dict[str, float]:
     with torch.cuda.stream(stream):
         A = torch.randn((m, k), dtype=dtype, device=device)
         B = torch.randn((k, n), dtype=dtype, device=device)
-        torch.matmul(A, B)
+        matmul(A, B)
     torch.cuda.synchronize()
-    print("[GEMM] Warmup finished.")
+    print(f"[GEMM] Warmup finished (gemm={gemm_backend()}).")
 
     latencies = []
     flops_per_matmul = 2 * m * n * k
@@ -400,7 +400,7 @@ def benchmark_gemm(args: argparse.Namespace) -> Dict[str, float]:
         with torch.cuda.stream(stream):
             start = time.perf_counter()
             for _ in range(1):
-                C = torch.matmul(A, B)
+                C = matmul(A, B)
         torch.cuda.synchronize()
         end = time.perf_counter()
         latency_ms = (end - start) * 1000.0 / 1

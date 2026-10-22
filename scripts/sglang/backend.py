@@ -17,6 +17,10 @@ have to swap `EngineArgs`/`LLMEngine`/`TokensPrompt`/`SamplingParams` for
 `backend.make_sampling_params(...)`.
 
 Select with MORPHX_LLM_BACKEND=vllm|sglang (default: vllm, the original stack).
+
+Model aliases can be redirected with MORPHX_MODEL_ALIASES, e.g.
+"llama-3-8b=qwen3-8b,llama-2-7b=qwen3-4b" while the gated Llama weights are
+not available; see resolve_model_alias().
 """
 
 from __future__ import annotations
@@ -137,6 +141,10 @@ class SglangEngine:
         # Prefill results come back from step(); the separate prefill thread is a later track.
         return []
 
+    def wait_prefill_shutdown(self):
+        # vLLM-fork name; there is no prefill thread to stop yet.
+        pass
+
 
 class SglangBackend(LLMBackend):
     """SGLang ModelRunner in this process and thread (scripts/sglang/runner.py)."""
@@ -197,3 +205,19 @@ def get_backend(name: Optional[str] = None) -> LLMBackend:
 
 def backend_names() -> List[str]:
     return sorted(_BACKENDS)
+
+
+def model_aliases() -> dict:
+    """MORPHX_MODEL_ALIASES="from=to,..." as a dict (empty when unset)."""
+    aliases = {}
+    for item in os.environ.get("MORPHX_MODEL_ALIASES", "").split(","):
+        if "=" in item:
+            src, dst = item.split("=", 1)
+            if src.strip() and dst.strip():
+                aliases[src.strip()] = dst.strip()
+    return aliases
+
+
+def resolve_model_alias(model: str) -> str:
+    """Apply MORPHX_MODEL_ALIASES to a model alias (paths and unknown names pass through)."""
+    return model_aliases().get(model, model)
