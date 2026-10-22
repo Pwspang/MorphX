@@ -1,0 +1,79 @@
+#!/bin/bash
+# Track J3 on hpcc: SGLang prefill-thread / chunked-prefill modes and Fig 13 points.
+#   cd <repo> && qsub scripts/sglang/j3_pd.pbs
+#   qsub -v PARTS="check fig13",FIG13_CONFIG=Figure13:in-2048-out-256-rps-3 ...
+# Parts: check (greedy tokens serial vs thread vs chunked), fig13 (one row, all
+# variants), debug (one short MorphX run with runtime/build-debug, see below).
+# Needs runtime/build (USE_CUDA_LLM=ON, memcpy) in this checkout and a pass-built
+# libmycutlass.so (MYCUTLASS_LIB_DIR, default <repo>/microbench/build-model).
+#PBS -N morphx-j3-pd
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"check fig13"}
+OUT=${OUT:-$HOME/morphx/runs/j3-$PBS_JOBID}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f}
+FIG13_CONFIG=${FIG13_CONFIG:-Figure13:in-2048-out-256-rps-3}
+FIG13_DURATION=${FIG13_DURATION:-60}
+mkdir -p "$OUT"
+echo "== host=$(hostname) job=$PBS_JOBID backend=$MORPHX_LLM_BACKEND gemm=$MORPHX_LLM_GEMM sync=$MORPHX_SYNC_BACKEND aliases=$MORPHX_MODEL_ALIASES out=$OUT"
+HOOK="NEUTRINO_HOOK_DRIVER=$PWD/runtime/build/libcuda.so LD_PRELOAD=$PWD/runtime/build/libcuda.so:$PWD/runtime/build/libpreload.so SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
+
+if [[ " $PARTS " == *" check "* ]]; then
+  for mode in serial thread chunked; do
+    echo "== check $mode"
+    timeout 600 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode $mode --warmup --out "$OUT/check-$mode.json" 2>&1 \
+      | grep -E "^\[|Error|error|Traceback" | grep -v "^\[20" | tail -5
+  done
+  python scripts/sglang/check_pd_modes.py --compare "$OUT/check-serial.json" "$OUT/check-thread.json" "$OUT/check-chunked.json"
+  echo "== check thread under the MorphX runtime (cuda-llm, split 93)"
+  env $HOOK SMSCHED_SPLIT_HINT=93 timeout 900 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode thread --warmup \
+    --out "$OUT/check-thread-morphx.json" 2>&1 | grep -E "^\[|Error|error|Traceback" | grep -v "^\[20" | tail -5
+  python scripts/sglang/check_pd_modes.py --compare "$OUT/check-serial.json" "$OUT/check-thread-morphx.json"
+fi
+
+if [[ " $PARTS " == *" fig13 "* ]]; then
+  echo "== Fig 13 $FIG13_CONFIG, ${FIG13_DURATION}s, variants ${FIG13_VARIANTS:-all}"
+  VARIANT_ARGS=()
+  for v in ${FIG13_VARIANTS:-baseline stream chunked smsched}; do VARIANT_ARGS+=(--only-variant "$v"); done
+  timeout 3000 python scripts/ae/run_pd_colocate_part2.py --only-config "$FIG13_CONFIG" "${VARIANT_ARGS[@]}" \
+    --model llama-3-8b --duration "$FIG13_DURATION" --smsched-env "$HOOK" --output-dir "$OUT/fig13" \
+    --run-timeout 900 2>&1 | grep -E "DONE|FAILED|WARNING|ERROR|preflight|split"
+  for f in "$OUT"/fig13/logs/pd-online/*/*/*.log; do
+    echo "-- $f"; grep -E "^\[final\]" "$f"; grep -cE "prefill step|Request .* finished" "$f"
+  done
+  for f in "$OUT"/fig13/logs/pd-online/*/*/*.err; do
+    [[ -s "$f" ]] && { echo "-- $f"; grep -vE "^\[20|Warning|warn" "$f" | tail -5; }
+  done
+  cat "$OUT"/fig13/tables/Figure13.tsv 2>/dev/null
+fi
+
+if [[ " $PARTS " == *" debug "* ]]; then
+  # runtime/build-debug: cuda-llm.cpp with a print in writeSM (local, uncommitted)
+  echo "== debug: SM ranges per stream under MorphX (stream mode, 40s)"
+  DBG="NEUTRINO_HOOK_DRIVER=$PWD/runtime/build-debug/libcuda.so LD_PRELOAD=$PWD/runtime/build-debug/libcuda.so:$PWD/runtime/build-debug/libpreload.so SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=400"
+  mkdir -p "$OUT/debug"
+  python - <<EOF
+import json; json.dump({"time": 40, "model": "llama-3-8b", "type": "poisson", "rps": 3, "input_length": 2048, "output_length": 256}, open("$OUT/debug/cfg.json", "w"))
+EOF
+  env $DBG SMSCHED_SPLIT_HINT=93 VLLM_PREFILL_THREAD=1 timeout 900 python scripts/test-pd-online.py "$OUT/debug/cfg.json" \
+    > "$OUT/debug/run.log" 2> "$OUT/debug/run.err"
+  echo "rc=$?"; grep "^\[final\]" "$OUT/debug/run.log"
+  echo "-- patched kernels per stream (first launch of each name)"
+  grep -oE "phase=patched .* stream=0x[0-9a-f]+" "$OUT/debug/run.err" | grep -oE "stream=0x[0-9a-f]+" | sort | uniq -c
+  echo "-- writeSM ranges per stream x CI"
+  grep -oE "\[J3-dbg\] writeSM stream=0x[0-9a-f]+ range=\[[0-9]+,[0-9]+\) ci=[01]" "$OUT/debug/run.err" | sort | uniq -c | sort -rn | head -20
+  grep -E "\[J3-dbg\] writeSM" "$OUT/debug/run.err" | head -5
+fi
+echo "== done"

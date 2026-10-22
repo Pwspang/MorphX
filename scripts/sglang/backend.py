@@ -7,7 +7,7 @@ scripts/overhead/single_request.py) drive a vLLM V0 `LLMEngine` directly:
     outputs = engine.step()                     # -> [RequestOutput]
     engine.has_unfinished_requests()
     engine.get_tokenizer()                      # .vocab_size / len() / .encode()
-    engine.get_prefill_result(isBlock=True)     # vLLM-fork only (VLLM_PREFILL_THREAD)
+    engine.get_prefill_result(isBlock=True)     # vLLM fork / SGLang runner prefill thread (VLLM_PREFILL_THREAD)
     ro.request_id, ro.finished, ro.outputs[0].token_ids,
     ro.metrics.{arrival_time, first_scheduled_time, first_token_time, finished_time, time_in_queue}
 
@@ -138,12 +138,16 @@ class SglangEngine:
         return self.runner.get_tokenizer()
 
     def get_prefill_result(self, isBlock=True):  # noqa: N803 (vLLM-fork name)
-        # Prefill results come back from step(); the separate prefill thread is a later track.
-        return []
+        # Only the prefill-thread mode (MORPHX_PREFILL_THREAD / VLLM_PREFILL_THREAD)
+        # returns anything here; otherwise prefill results come back from step().
+        return self.runner.get_prefill_result(isBlock=isBlock)
 
     def wait_prefill_shutdown(self):
-        # vLLM-fork name; there is no prefill thread to stop yet.
-        pass
+        # vLLM-fork name: stop the prefill thread, if any.
+        self.runner.shutdown()
+
+    def warmup(self, input_len, output_len=4):
+        self.runner.warmup(input_len, output_len)
 
 
 class SglangBackend(LLMBackend):
@@ -169,8 +173,6 @@ class SglangBackend(LLMBackend):
         stream=None,
         **runner_kwargs,
     ):
-        if enable_chunked_prefill:
-            raise NotImplementedError("chunked prefill is not implemented in the in-process SGLang runner yet")
         runner = self._SglangRunner(
             model_path=model_path,
             max_model_len=max_model_len,
@@ -178,7 +180,8 @@ class SglangBackend(LLMBackend):
             max_num_batched_tokens=max_num_batched_tokens,
             mem_fraction_static=gpu_memory_utilization,
             stream=stream,
-            **runner_kwargs,  # e.g. dtype, gemm (see runner.SglangRunner)
+            chunked_prefill=enable_chunked_prefill,
+            **runner_kwargs,  # e.g. dtype, gemm, prefill_thread (see runner.SglangRunner)
         )
         return SglangEngine(runner)
 

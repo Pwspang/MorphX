@@ -11,10 +11,21 @@ CUDA stream, with a minimal continuous-batching loop:
   runs them as one prefill (extend) batch;
 - otherwise the step decodes the running batch by one token.
 
-CUDA graphs, the radix cache, chunked prefill and the overlap scheduler are
-off, so every kernel goes through cuLaunchKernel(Ex) where the MorphX hook can
-see it. prefill() and decode() are separate so a later prefill thread
-(Fig 13-14) can call them on different streams.
+CUDA graphs, the radix cache and the overlap scheduler are off, so every
+kernel goes through cuLaunchKernel(Ex) where the MorphX hook can see it.
+
+Two optional scheduling modes stand in for the authors' vLLM fork in the PD
+co-location experiment (Fig 13-14, scripts/test-pd-online.py):
+
+- prefill thread (MORPHX_PREFILL_THREAD=1, or the fork's VLLM_PREFILL_THREAD=1):
+  a worker thread runs prefill batches on its own CUDA stream and attention
+  backend while the caller keeps decoding on its stream. Finished prefills join
+  the decode batch at the next step(); get_prefill_result() blocks for one when
+  there is nothing to decode. Under MorphX the two streams let the runtime give
+  prefill and decode kernels different SM ranges.
+- chunked prefill (chunked_prefill=True): vLLM-style mixed batches. Each step
+  decodes every running request and fills the rest of the max_num_batched_tokens
+  budget with prompt chunks, in one forward pass.
 
 Not a package on purpose: scripts/sglang has no __init__.py, so it never
 shadows the real `sglang` package (a regular package always wins over a
@@ -23,10 +34,12 @@ namespace directory on sys.path).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import os
 import sys
+import threading
 import time
 from collections import deque
 from typing import Deque, Dict, List, Optional
@@ -94,6 +107,11 @@ class _ReqState:
     max_tokens: int
     metrics: RequestMetrics
     reserved_tokens: int
+    prefill_done: int = 0  # prompt tokens already prefilled (chunked prefill)
+
+
+def _env_flag(*names: str) -> bool:
+    return any(os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on") for name in names)
 
 
 def _reserve_for_weight_copy(model_path: str, mem_fraction_static: float, gpu_id: int) -> float:
@@ -128,6 +146,8 @@ class SglangRunner:
         dtype: str = "auto",
         log_level: str = "error",
         gemm: Optional[str] = None,
+        prefill_thread: Optional[bool] = None,
+        chunked_prefill: bool = False,
         **server_kwargs,
     ):
         # Dense linear layers: "torch" (cuBLASLt) or "mycutlass" (pass-buildable CUTLASS, fp16 only)
@@ -145,6 +165,12 @@ class SglangRunner:
         self.max_model_len = int(max_model_len)
         self.max_num_seqs = int(max_num_seqs)
         self.max_num_batched_tokens = int(max_num_batched_tokens or max_model_len)
+        if prefill_thread is None:
+            prefill_thread = _env_flag("MORPHX_PREFILL_THREAD", "VLLM_PREFILL_THREAD")
+        self.prefill_thread = bool(prefill_thread)
+        self.chunked_prefill = bool(chunked_prefill)
+        if self.prefill_thread and self.chunked_prefill:
+            raise ValueError("the prefill thread and chunked prefill are separate modes")
         torch.cuda.set_device(gpu_id)
         self.stream = stream if stream is not None else torch.cuda.current_stream()
         if self.gemm == "mycutlass":
@@ -218,6 +244,19 @@ class SglangRunner:
         self.num_prefill_steps = 0
         self.num_decode_steps = 0
 
+        # KV pool, req slots, reservations and the waiting queue are shared with the
+        # prefill thread. _kv_section() serializes their bookkeeping and orders the GPU
+        # side of the allocator ops (slices/cats of the free list) across streams.
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._kv_event: Optional[torch.cuda.Event] = None
+        self._num_running = 0  # len(self.running.reqs), readable from the prefill thread
+        self._chunk_state: Optional[_ReqState] = None
+        self._prefill_worker: Optional[threading.Thread] = None
+        self._inflight = 0
+        if self.prefill_thread:
+            self._start_prefill_thread()
+
     # ------------------------------------------------------------------ API
 
     def get_tokenizer(self):
@@ -267,26 +306,106 @@ class SglangRunner:
             metrics=RequestMetrics(arrival_time=arrival_time if arrival_time is not None else time.time()),
             reserved_tokens=need,
         )
-        self.states[request_id] = state
-        self.waiting.append(state)
+        with self._cond:
+            self.states[request_id] = state
+            self.waiting.append(state)
+            self._cond.notify_all()
 
     def has_unfinished_requests(self) -> bool:
-        return bool(self.waiting) or (self.running is not None and not self.running.is_empty())
+        with self._lock:
+            pending = bool(self.waiting) or self._chunk_state is not None
+            if self.prefill_thread:
+                pending = pending or self._inflight > 0 or bool(self._done)
+        return pending or self._has_running()
 
     def step(self) -> List[RequestOutput]:
-        """One scheduling step: a prefill batch if any waiting request fits, else one decode step."""
-        admitted = self._admit()
+        """One scheduling step.
+
+        Default: a prefill batch if any waiting request fits, else one decode step.
+        Prefill thread: merge finished prefills, then one decode step (prefills run
+        concurrently in the worker). Chunked prefill: one mixed decode + chunk step.
+        """
+        if self.chunked_prefill:
+            return self._step_chunked()
+        if self.prefill_thread:
+            outputs = self._collect_prefilled()
+            if self._has_running():
+                outputs += self.decode()
+            return outputs
+        with self._kv_section():
+            admitted = self._admit()
         if admitted:
             return self.prefill(admitted)
-        if self.running is not None and not self.running.is_empty():
+        if self._has_running():
             return self.decode()
         return []
 
+    def get_prefill_result(self, isBlock: bool = True) -> List[RequestOutput]:  # noqa: N803 (vLLM-fork name)
+        """Outputs of finished prefills (prefill thread mode); waits for one if isBlock."""
+        if not self.prefill_thread:
+            return []
+        with self._cond:
+            while isBlock and not self._done and (self.waiting or self._inflight) and self._prefill_error is None:
+                self._cond.wait()
+        return self._collect_prefilled()
+
+    def shutdown(self) -> None:
+        """Stop the prefill thread (vLLM fork: wait_prefill_shutdown)."""
+        worker = self._prefill_worker
+        if worker is None:
+            return
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        worker.join()
+        self._prefill_worker = None
+
+    def warmup(self, input_len: int, output_len: int = 4) -> None:
+        """Run one request end to end so JIT compiles and first-launch work (e.g. the
+        MorphX runtime's per-kernel profiling) happen before the timed workload."""
+        vocab = self.model_config.vocab_size
+        ids = [(7 + j) % vocab for j in range(int(input_len))]
+        self.add_request("__warmup__", ids, max_tokens=int(output_len), min_tokens=int(output_len))
+        while self.has_unfinished_requests():
+            if not self.step():
+                self.get_prefill_result(isBlock=True)
+        self.num_prefill_steps = 0
+        self.num_decode_steps = 0
+
     # ------------------------------------------------------------ internals
 
+    def _has_running(self) -> bool:
+        return self.running is not None and not self.running.is_empty()
+
+    def _set_running(self, batch: Optional[ScheduleBatch]) -> None:
+        self.running = batch
+        with self._lock:
+            self._num_running = 0 if batch is None or batch.is_empty() else len(batch.reqs)
+
+    @contextlib.contextmanager
+    def _kv_section(self):
+        """Lock the shared KV/req-slot bookkeeping. With the prefill thread, also make
+        the current stream wait for the previous section's GPU work (the allocator's
+        free list is a GPU tensor sliced and concatenated by both threads) and
+        record where this section's work ends."""
+        with self._lock:
+            if not self.prefill_thread:
+                yield
+                return
+            stream = torch.cuda.current_stream()
+            if self._kv_event is not None:
+                stream.wait_event(self._kv_event)
+            try:
+                yield
+            finally:
+                event = torch.cuda.Event()
+                event.record(stream)
+                self._kv_event = event
+
     def _admit(self) -> List[_ReqState]:
+        """Pop waiting requests that fit (call with the lock held)."""
         admitted: List[_ReqState] = []
-        num_running = 0 if self.running is None else len(self.running.reqs)
+        num_running = self._num_running + self._inflight
         batch_tokens = 0
         free_req_slots = self.model_runner.req_to_token_pool.available_size()
         while self.waiting:
@@ -304,82 +423,237 @@ class SglangRunner:
             admitted.append(state)
         return admitted
 
+    def _new_batch(self, reqs: List[Req], chunked_req: Optional[Req] = None) -> ScheduleBatch:
+        return ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            chunked_req=chunked_req,
+        )
+
     @torch.no_grad()
-    def prefill(self, states: List[_ReqState]) -> List[RequestOutput]:
+    def _run_prefill(self, states: List[_ReqState], stream: torch.cuda.Stream, attn_backend=None):
+        """Prefill `states` on `stream`; returns the filtered batch (not merged) and outputs."""
         now = time.time()
         for state in states:
             state.metrics.first_scheduled_time = now
-        # Everything touching the GPU stays on self.stream, including the
-        # post-processing (KV index copies in cache_unfinished_req, filter/merge).
-        with torch.cuda.stream(self.stream):
-            batch = ScheduleBatch.init_new(
-                reqs=[s.req for s in states],
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
-                tree_cache=self.tree_cache,
-                model_config=self.model_config,
-                enable_overlap=False,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
-            )
-            batch.prepare_for_extend()
-            next_token_ids = self._forward(batch)
+        # Everything touching the GPU stays on `stream`, including the
+        # post-processing (KV index copies in cache_unfinished_req, filter).
+        with torch.cuda.stream(stream):
+            batch = self._new_batch([s.req for s in states])
+            with self._kv_section():
+                batch.prepare_for_extend()
+            next_token_ids = self._forward(batch, attn_backend)
             batch.output_ids = next_token_ids
             next_ids = next_token_ids.tolist()  # waits for this stream only
             self.num_prefill_steps += 1
-            outputs = self._process_tokens(batch, next_ids, first=True)
+            outputs = self._process_tokens(batch, next_ids, ["first"] * len(next_ids))
             batch.filter_batch()
-            if not batch.is_empty():
-                if self.running is None or self.running.is_empty():
-                    self.running = batch
-                else:
-                    self.running.merge_batch(batch)
+        return batch, outputs
+
+    @torch.no_grad()
+    def prefill(self, states: List[_ReqState]) -> List[RequestOutput]:
+        batch, outputs = self._run_prefill(states, self.stream)
+        with torch.cuda.stream(self.stream):
+            self._merge_into_running(batch)
         return outputs
+
+    def _merge_into_running(self, batch: ScheduleBatch) -> None:
+        if batch.is_empty():
+            return
+        if not self._has_running():
+            self._set_running(batch)
+        else:
+            self.running.merge_batch(batch)
+            self._set_running(self.running)
 
     @torch.no_grad()
     def decode(self) -> List[RequestOutput]:
         batch = self.running
         with torch.cuda.stream(self.stream):
-            batch.prepare_for_decode()
+            with self._kv_section():
+                batch.prepare_for_decode()
             next_token_ids = self._forward(batch)
             batch.output_ids = next_token_ids
             next_ids = next_token_ids.tolist()
             self.num_decode_steps += 1
-            outputs = self._process_tokens(batch, next_ids, first=False)
+            outputs = self._process_tokens(batch, next_ids, ["decode"] * len(next_ids))
             batch.filter_batch()
+            self._set_running(batch)
         return outputs
 
-    def _forward(self, batch: ScheduleBatch) -> torch.Tensor:
+    def _forward(self, batch: ScheduleBatch, attn_backend=None) -> torch.Tensor:
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
+        if attn_backend is None:
+            logits_output = self.model_runner.forward(forward_batch).logits_output
+        else:
+            # The prefill thread has its own attention backend (FlashInfer wrappers and
+            # workspace) so its planning never races the decode thread's.
+            forward_batch.attn_backend = attn_backend
+            attn_backend.init_forward_metadata(forward_batch)
+            logits_output = self.model_runner.forward(forward_batch, skip_attn_backend_init=True).logits_output
         return self.model_runner.sample(logits_output, forward_batch)
 
-    def _process_tokens(self, batch: ScheduleBatch, next_ids: List[int], first: bool) -> List[RequestOutput]:
+    def _process_tokens(self, batch: ScheduleBatch, next_ids: List[int], kinds: List[str]) -> List[RequestOutput]:
+        """kinds[i]: "first" (prompt finished, first token), "decode", or "chunk" (a
+        non-final prompt chunk: its sampled token is discarded)."""
         now = time.time()
         outputs: List[RequestOutput] = []
-        for req, token_id in zip(batch.reqs, next_ids):
-            state = self.states[req.rid]
-            req.output_ids.append(int(token_id))
-            m = state.metrics
-            if first:
-                m.first_token_time = now
-            m.last_token_time = now
-            m.token_times.append(now)
-            req.check_finished()
-            if req.finished():
-                release_kv_cache(req, self.tree_cache)
-                self.reserved_tokens -= state.reserved_tokens
-                m.finished_time = now
-                del self.states[req.rid]
-            elif first:
-                self.tree_cache.cache_unfinished_req(req)
-            outputs.append(
-                RequestOutput(
-                    request_id=req.rid,
-                    prompt_token_ids=req.origin_input_ids,
-                    outputs=[CompletionOutput(token_ids=req.output_ids)],
-                    finished=req.finished(),
-                    metrics=m,
+        with self._cond, self._kv_section():
+            for req, token_id, kind in zip(batch.reqs, next_ids, kinds):
+                if kind == "chunk":
+                    self.tree_cache.cache_unfinished_req(req, chunked=True)
+                    continue
+                state = self.states[req.rid]
+                req.output_ids.append(int(token_id))
+                m = state.metrics
+                if kind == "first":
+                    m.first_token_time = now
+                m.last_token_time = now
+                m.token_times.append(now)
+                req.check_finished()
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    self.reserved_tokens -= state.reserved_tokens
+                    m.finished_time = now
+                    del self.states[req.rid]
+                    self._cond.notify_all()  # freed KV may admit a waiting prefill
+                elif kind == "first":
+                    self.tree_cache.cache_unfinished_req(req)
+                outputs.append(
+                    RequestOutput(
+                        request_id=req.rid,
+                        prompt_token_ids=req.origin_input_ids,
+                        outputs=[CompletionOutput(token_ids=req.output_ids)],
+                        finished=req.finished(),
+                        metrics=m,
+                    )
                 )
-            )
+        return outputs
+
+    # ------------------------------------------------------ prefill thread
+
+    def _start_prefill_thread(self) -> None:
+        self.prefill_stream = torch.cuda.Stream()
+        # A second attention backend with its own workspace: FlashInfer's default
+        # workspace buffer is shared by every wrapper of one backend.
+        self.prefill_attn_backend = self.model_runner._get_attention_backend(init_new_workspace=True)
+        self._done: Deque = deque()
+        self._stop = False
+        self._prefill_error: Optional[BaseException] = None
+        self._prefill_worker = threading.Thread(target=self._prefill_loop, name="morphx-prefill", daemon=True)
+        self._prefill_worker.start()
+
+    def _prefill_loop(self) -> None:
+        torch.cuda.set_device(self.model_runner.gpu_id)
+        try:
+            while True:
+                with self._cond:
+                    admitted: List[_ReqState] = []
+                    while not self._stop:
+                        admitted = self._admit()
+                        if admitted:
+                            break
+                        self._cond.wait()
+                    if self._stop:
+                        return
+                    self._inflight += len(admitted)
+                batch, outputs = self._run_prefill(admitted, self.prefill_stream, self.prefill_attn_backend)
+                with self._cond:
+                    self._done.append((batch, outputs))
+                    self._inflight -= len(admitted)
+                    self._cond.notify_all()
+        except BaseException as exc:  # surfaced by the caller's next step()
+            logger.exception("prefill thread failed")
+            with self._cond:
+                self._prefill_error = exc
+                self._inflight = 0
+                self._cond.notify_all()
+
+    def _collect_prefilled(self) -> List[RequestOutput]:
+        """Merge finished prefill batches into the decode batch (caller's thread)."""
+        if self._prefill_error is not None:
+            raise RuntimeError("prefill thread failed") from self._prefill_error
+        with self._lock:
+            done = list(self._done)
+            self._done.clear()
+        outputs: List[RequestOutput] = []
+        if not done:
+            return outputs
+        with torch.cuda.stream(self.stream):
+            for batch, batch_outputs in done:
+                self._merge_into_running(batch)
+                outputs += batch_outputs
+            # The merged-away prefill tensors were allocated on the prefill stream;
+            # don't let the caching allocator hand them back out before the merge
+            # kernels on this stream have read them.
+            self.stream.synchronize()
+        return outputs
+
+    # ------------------------------------------------------- chunked prefill
+
+    @torch.no_grad()
+    def _step_chunked(self) -> List[RequestOutput]:
+        """Decode all running requests and fill the remaining token budget with
+        prompt chunks (the continuing chunked request first), in one forward."""
+        running = self.running if self._has_running() else None
+        budget = self.max_num_batched_tokens - (len(running.reqs) if running is not None else 0)
+        plan = []  # (state, prompt tokens prefilled after this step)
+        now = time.time()
+        with self._kv_section():
+            if self._chunk_state is not None and budget > 0:
+                state = self._chunk_state
+                n = min(len(state.req.origin_input_ids) - state.prefill_done, budget)
+                plan.append((state, state.prefill_done + n))
+                budget -= n
+            num_running = len(running.reqs) if running is not None else 0
+            free_req_slots = self.model_runner.req_to_token_pool.available_size()
+            new = 0
+            while budget > 0 and self.waiting:
+                state = self.waiting[0]
+                if num_running + len(plan) >= self.max_num_seqs or new >= free_req_slots:
+                    break
+                if self.reserved_tokens + state.reserved_tokens > self.kv_capacity:
+                    break
+                self.waiting.popleft()
+                self.reserved_tokens += state.reserved_tokens
+                state.metrics.first_scheduled_time = now
+                n = min(len(state.req.origin_input_ids), budget)
+                plan.append((state, n))
+                budget -= n
+                new += 1
+        if not plan:
+            return self.decode() if running is not None else []
+
+        partial = None
+        for state, end in plan:
+            req = state.req
+            req.fill_ids = req.origin_input_ids[:end]
+            req.set_extend_input_len(end - len(req.prefix_indices))
+            state.prefill_done = end
+            if end < len(req.origin_input_ids):
+                partial = state
+        self._chunk_state = partial
+
+        with torch.cuda.stream(self.stream):
+            batch = self._new_batch([s.req for s, _ in plan], chunked_req=partial.req if partial else None)
+            kinds = ["chunk" if s is partial else "first" for s, _ in plan]
+            with self._kv_section():
+                batch.prepare_for_extend()
+                if running is not None:
+                    running.prepare_for_decode()
+                    batch.mix_with_running(running)
+                    kinds += ["decode"] * len(running.reqs)
+            next_token_ids = self._forward(batch)
+            batch.output_ids = next_token_ids
+            next_ids = next_token_ids.tolist()
+            self.num_prefill_steps += 1
+            outputs = self._process_tokens(batch, next_ids, kinds)
+            batch.filter_batch(chunked_req_to_exclude=partial.req if partial else None)
+            self._set_running(batch if not batch.is_empty() else None)
         return outputs
