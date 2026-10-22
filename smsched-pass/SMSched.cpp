@@ -3,10 +3,16 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/GlobalValue.h"
+// LLVM 23 moved PassPlugin.h from llvm/Passes to llvm/Plugins.
+#if __has_include("llvm/Plugins/PassPlugin.h")
+#include "llvm/Plugins/PassPlugin.h"
+#else
 #include "llvm/Passes/PassPlugin.h"
+#endif
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -197,7 +203,17 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 	Function *tidX = getNVVMFunc(&M, ctx, "llvm.nvvm.read.ptx.sreg.tid.x", Type::getInt32Ty(ctx));
 	Function *tidY = getNVVMFunc(&M, ctx, "llvm.nvvm.read.ptx.sreg.tid.y", Type::getInt32Ty(ctx));
 	Function *tidZ = getNVVMFunc(&M, ctx, "llvm.nvvm.read.ptx.sreg.tid.z", Type::getInt32Ty(ctx));
-	Function *barrier0 = getNVVMFunc(&M, ctx, "llvm.nvvm.barrier0", Type::getVoidTy(ctx));	
+	// llvm.nvvm.barrier0 was replaced by llvm.nvvm.barrier.cta.sync.aligned.all(i32 0)
+	// in newer LLVM releases.
+	bool hasBarrier0 = Intrinsic::lookupIntrinsicID("llvm.nvvm.barrier0") != Intrinsic::not_intrinsic;
+	Function *barrier0;
+	if(hasBarrier0) {
+		barrier0 = getNVVMFunc(&M, ctx, "llvm.nvvm.barrier0", Type::getVoidTy(ctx));
+	} else {
+		FunctionType *barrierTy = FunctionType::get(Type::getVoidTy(ctx), {Type::getInt32Ty(ctx)}, false);
+		barrier0 = cast<Function>(M.getOrInsertFunction("llvm.nvvm.barrier.cta.sync.aligned.all", barrierTy).getCallee());
+		barrier0->addFnAttr(Attribute::NoUnwind);
+	}
 	Function *ctaX = M.getFunction("llvm.nvvm.read.ptx.sreg.ctaid.x");
 	Function *ctaY = M.getFunction("llvm.nvvm.read.ptx.sreg.ctaid.y");
 	Function *ctaZ = M.getFunction("llvm.nvvm.read.ptx.sreg.ctaid.z");
@@ -343,7 +359,8 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		Builder.CreateBr(blockCheckBlock);
 
 		Builder.SetInsertPoint(blockCheckBlock);
-		CallInst *callBarrier0 = Builder.CreateCall(barrier0);
+		CallInst *callBarrier0 = hasBarrier0 ? Builder.CreateCall(barrier0)
+			: Builder.CreateCall(barrier0, {Builder.getInt32(0)});
 		callBarrier0->setTailCallKind(CallInst::TCK_Tail);
 		Value *castLoad = Builder.CreateAddrSpaceCast(dynSmem, PointerType::get(ctx, 0));
 		LoadInst *loadBlockId = Builder.CreateAlignedLoad(Type::getInt32Ty(ctx), castLoad, Align(4));
