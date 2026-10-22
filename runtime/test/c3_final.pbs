@@ -1,0 +1,101 @@
+#!/bin/bash
+# Track C3 before/after comparison with repeats on hpcc: Fig 15 (x3), SGLang
+# decode (x2) and the Fig 11(a) llm-1-mm-1 point.
+#   cd <after checkout> && qsub -v BEFORE_CHECKOUT=<checkout with the old runtime/build> runtime/test/c3_final.pbs
+# Both checkouts need runtime/build (memcpy), smsched-pass/build and
+# microbench/build-model. AFTER_VARIANTS lists the "after" configurations as
+# <name>:<env,comma-separated> (default: plain and MORPHX_AGENTS=grid).
+#PBS -N morphx-c3-final
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+AFTER=$PBS_O_WORKDIR
+OUT=${OUT:-$HOME/morphx/runs/c3f-$PBS_JOBID}
+mkdir -p "$OUT"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+AFTER_VARIANTS=${AFTER_VARIANTS:-"after:X=1 after-grid:MORPHX_AGENTS=grid"}
+echo "== host=$(hostname) job=$PBS_JOBID after=$AFTER before=$BEFORE_CHECKOUT variants=$AFTER_VARIANTS out=$OUT"
+
+# in_checkout <dir> <cmd...>: run with that checkout's env-h100.sh
+in_checkout() {
+  local dir=$1; shift
+  (cd "$dir" && source scripts/ae/env-h100.sh && export MORPHX_PYTHON="$(command -v python)" && "$@")
+}
+
+fig15() {  # fig15 <label> <dir> [env...]
+  local label=$1 dir=$2; shift 2
+  in_checkout "$dir" env "$@" timeout 900 python scripts/ae/run_overhead_model_part4.py --no-build --only-section overhead \
+    --only-task LLM --only-task GEMM --only-task GEMV --only-task DNN \
+    --only-method base --only-method smsched --output-dir "$OUT/fig15-$label" --run-timeout 600 > "$OUT/fig15-$label.log" 2>&1
+  echo "-- fig15 $label"; grep -E "^(DNN|GEMM|GEMV|LLM)" "$OUT/fig15-$label/tables/Figure15.tsv" | awk -F'\t' '{printf "   %s base=%s MorphX=%s rel=%s\n", $1, $2, $6, $11}'
+}
+
+if [[ " ${PARTS:-tests fig15 sglang fig11} " == *" tests "* ]]; then
+  echo "######## functional tests (memcpy, control + stream init)"
+  for mode in control stream; do
+    for t in run_hook_test run_pass_test; do
+      in_checkout "$AFTER" env -u CONDA_PREFIX MORPHX_SYNC_BACKEND=memcpy MORPHX_MEMCPY_INIT=$mode MORPHX_AGENTS=grid OUT=/tmp/c3f-$PBS_JOBID-$t-$mode \
+        bash -c "module load gnu/gcc-12.3 && timeout 600 bash runtime/test/$t.sh" > "$OUT/$t-$mode.log" 2>&1
+      echo "-- $t $mode: $(grep -c 'RESULT: PASS' "$OUT/$t-$mode.log") PASS, $(grep -c 'RESULT: FAIL' "$OUT/$t-$mode.log") FAIL"
+    done
+  done
+  in_checkout "$AFTER" bash -c "module load gnu/gcc-12.3 && nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_MEMCPY -I include -lcuda -o /tmp/c3f-$PBS_JOBID-sbt scripts/ae/sync_backend_test.cu"
+  for mode in control stream; do
+    echo "-- sync_backend_test $mode: $(MORPHX_MEMCPY_INIT=$mode timeout 300 /tmp/c3f-$PBS_JOBID-sbt | grep -E 'RESULT|FAIL' | tr '\n' ' ')"
+  done
+fi
+
+if [[ " ${PARTS:-tests fig15 sglang fig11} " == *" fig15 "* ]]; then
+  echo "######## Fig 15 x${FIG15_REPEATS:-2} (before / after variants interleaved)"
+  for r in $(seq 1 ${FIG15_REPEATS:-2}); do
+    fig15 before-$r "$BEFORE_CHECKOUT"
+    for v in $AFTER_VARIANTS; do
+      fig15 ${v%%:*}-$r "$AFTER" ${v#*:}
+    done
+  done
+fi
+
+if [[ " ${PARTS:-tests fig15 sglang fig11} " == *" sglang "* ]]; then
+  echo "######## SGLang Qwen3-4B fp16 + mycutlass x2"
+  MODEL=$HOME/morphx/hf/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f
+  for r in 1 2; do
+    for v in none:X=1 before:X=1 $AFTER_VARIANTS; do
+      cfg=${v%%:*}
+      case $cfg in
+        none) PRE= ;;
+        before) PRE="LD_PRELOAD=$BEFORE_CHECKOUT/runtime/build/libcuda.so:$BEFORE_CHECKOUT/runtime/build/libpreload.so" ;;
+        *) PRE="LD_PRELOAD=$AFTER/runtime/build/libcuda.so:$AFTER/runtime/build/libpreload.so ${v#*:}" ;;
+      esac
+      in_checkout "$AFTER" env $PRE timeout 900 python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16 --gemm mycutlass \
+        --num-requests 8 --output-len 32 --census-decode-steps 4 > "$OUT/sglang-$cfg-$r.log" 2>&1
+      echo "-- sglang $cfg run $r: $(grep -oE "TBT  ms: mean=[0-9.]+|TTFT ms: mean=[0-9.]+|decode: [0-9]+ kernels, [0-9.]+ ms|SMOKE: [A-Z]+" "$OUT/sglang-$cfg-$r.log" | tr '\n' ' ')"
+    done
+  done
+  for v in $AFTER_VARIANTS; do
+    echo "-- greedy tokens (${v%%:*}): $(in_checkout "$AFTER" env LD_PRELOAD=$AFTER/runtime/build/libcuda.so:$AFTER/runtime/build/libpreload.so ${v#*:} \
+      timeout 600 python scripts/sglang/check_mycutlass.py --model "$MODEL" 2>&1 | grep -E "^\[e2e\] greedy|Error")"
+  done
+fi
+
+if [[ " ${PARTS:-tests fig15 sglang fig11} " == *" fig11 "* ]]; then
+  echo "######## Fig 11(a) llm-1-mm-1, 60 s"
+  fig11() {  # fig11 <label> <dir> <scheduler> [env...]
+    local label=$1 dir=$2 sched=$3; shift 3
+    in_checkout "$dir" env "$@" timeout 900 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-1 \
+      --only-scheduler $sched --model llama-3-8b --duration 60 --output-dir "$OUT/fig11-$label" --run-timeout 600 > "$OUT/fig11-$label.log" 2>&1
+    local f="$OUT/fig11-$label/logs/colocate/llm-mm/llm-1-mm-1/$sched.log"
+    echo "-- fig11 $label: $(grep -E "Served requests|Avg first token|Avg finished latency|Completed matmuls" "$f" | sed 's/^ *//' | tr '\n' ';')"
+  }
+  fig11 stream "$AFTER" stream
+  fig11 before "$BEFORE_CHECKOUT" smsched
+  for v in $AFTER_VARIANTS; do
+    fig11 ${v%%:*} "$AFTER" smsched ${v#*:}
+  done
+fi
+echo "== done"

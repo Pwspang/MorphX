@@ -7,9 +7,12 @@
 //   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_HOSTMAPPED -I include -lcuda \
 //        -o sync_backend_test scripts/ae/sync_backend_test.cu
 //   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_MEMCPY -I include -lcuda ...
+// With the memcpy backend, run it with MORPHX_MEMCPY_INIT=control (default) and
+// MORPHX_MEMCPY_INIT=stream to cover both launch_init() paths.
 #include "common.h"
 #include <cstdio>
 #include <thread>
+#include <vector>
 
 struct Ctl {
     int *agents, *minSM, *maxSM, *fetched, *finished;
@@ -71,6 +74,19 @@ static Ctl ctl_device() {
 // Reads the value the host wrote right before the launch.
 __global__ void read_back(const int *src, int *dst) {
     *dst = *(volatile const int*)src;
+}
+
+// Reads a LaunchSlot the way a patched kernel would at its first block.
+__global__ void read_slot(const uint64_t *agents, const uint64_t *minmax, const uint64_t *fetched, uint64_t *dst) {
+    dst[0] = *(volatile const uint64_t*)agents;
+    dst[1] = *(volatile const uint64_t*)minmax;
+    dst[2] = *(volatile const uint64_t*)fetched;
+}
+
+// Leaves non-zero counters behind, like a finished patched launch.
+__global__ void dirty_slot(int *fetched, int *finished, int n) {
+    atomicAdd(fetched, n);
+    atomicAdd(finished, n);
 }
 
 static float time_protocol(Ctl c, int blocks, int *skipped, cudaStream_t s) {
@@ -206,6 +222,80 @@ int main() {
     pool.get(v);
     tw = (now_us() - tw) / n;
     printf("[7 host cost] get %.2f us, set %.2f us\n", tr, tw);
+
+    // 8. launch_init(): every launch on a busy stream sees exactly its own
+    //    slot's agents, minSM|maxSM and fetched|finished=0, even when the slot
+    //    was used and freed with non-zero counters just before.
+    const int nslots = 200;
+    std::vector<LaunchSlot> slots(nslots);
+    for(int i = 0; i < nslots; ++i) {
+        slots[i] = pool.launch_alloc();
+        pool.launch_init(slots[i], 0, 0, true, s);
+        dirty_slot<<<1, 1, 0, s>>>((int*)slots[i].fetched.d, (int*)slots[i].fetched.half().d, 1000 + i);
+    }
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    for(int i = 0; i < nslots; ++i) pool.launch_free(slots[i]);
+    // MORPHX_MEMCPY_INIT=stream zeroes fetched|finished on free (its reads can
+    // run ahead of a reused block's init copy); the other modes don't need to.
+    int zeroed = 0;
+    for(int i = 0; i < nslots; ++i) zeroed += pool.get(slots[i].fetched) == 0;
+    const char *init_mode = getenv("MORPHX_MEMCPY_INIT");
+    bool want_zeroed = init_mode && strcmp(init_mode, "stream") == 0;
+#ifndef MORPHX_SYNC_BACKEND_MEMCPY
+    want_zeroed = false;
+#endif
+    uint64_t *slot_vals;
+    CHECK_CUDA_ERROR(cudaMallocManaged(&slot_vals, nslots * 3 * sizeof(uint64_t)));
+    pool.set(e[3], 0);
+    pool.launch_fence(s);
+    protocol<<<p.multiProcessorCount * 8, 128, 0, s>>>(hc, 2000000, skipped);  // keep s busy
+    int stale = 0;
+    double ti = now_us();
+    for(int i = 0; i < nslots; ++i) {
+        slots[i] = pool.launch_alloc();
+        pool.launch_init(slots[i], pack(1000 + i, 0), pack(i, i + 1), true, s);
+        read_slot<<<1, 1, 0, s>>>((uint64_t*)slots[i].agents.d, (uint64_t*)slots[i].minSM.d,
+                                  (uint64_t*)slots[i].fetched.d, &slot_vals[3 * i]);
+    }
+    double per_init = (now_us() - ti) / nslots;
+    // Before the busy kernel ends, no reader may see the previous counters.
+    for(int i = 0; i < nslots; i += 20) stale += pool.get(slots[i].fetched) != 0;
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    int bad = 0;
+    for(int i = 0; i < nslots; ++i) {
+        bad += slot_vals[3 * i] != pack(1000 + i, 0) || slot_vals[3 * i + 1] != pack(i, i + 1) || slot_vals[3 * i + 2] != 0;
+    }
+    ok = bad == 0 && stale == 0 && (!want_zeroed || zeroed == nslots);
+    fails += !ok;
+    printf("[8 launch_init] %d slots, wrong=%d stale_reads=%d zeroed_on_free=%d/%d, host cost %.2f us/(init+launch) -> %s\n",
+           nslots, bad, stale, zeroed, nslots, per_init, ok ? "PASS" : "FAIL");
+
+    // 9. A set() issued after launch_init() but before the kernel starts wins.
+    pool.launch_fence(s);
+    protocol<<<p.multiProcessorCount * 8, 128, 0, s>>>(hc, 2000000, skipped);  // keep s busy
+    for(int i = 0; i < nslots; ++i) {
+        pool.launch_init(slots[i], pack(7, 0), pack(0, 1), true, s);
+        pool.set(slots[i].minSM, pack(i, 2 * i + 2));
+        read_slot<<<1, 1, 0, s>>>((uint64_t*)slots[i].agents.d, (uint64_t*)slots[i].minSM.d,
+                                  (uint64_t*)slots[i].fetched.d, &slot_vals[3 * i]);
+    }
+    CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+    bad = 0;
+    for(int i = 0; i < nslots; ++i) bad += slot_vals[3 * i + 1] != pack(i, 2 * i + 2);
+    ok = bad == 0;
+    fails += !ok;
+    printf("[9 late set wins] %d slots, wrong=%d -> %s\n", nslots, bad, ok ? "PASS" : "FAIL");
+    for(int i = 0; i < nslots; ++i) pool.launch_free(slots[i]);
+
+    // 10. Host cost of one batched read of n entries.
+    for(int nr : {1, 2, 4}) {
+        std::vector<GdrEntry> es(nr, v);
+        std::vector<uint64_t> outs(nr);
+        double tg = now_us();
+        for(int i = 0; i < n; ++i) pool.get_many(es.data(), outs.data(), nr);
+        tg = (now_us() - tg) / n;
+        printf("[10 get_many] n=%d %.2f us\n", nr, tg);
+    }
 
     printf("%s\n", fails ? "RESULT: FAIL" : "RESULT: PASS");
     return fails != 0;
