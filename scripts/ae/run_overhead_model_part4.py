@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+import morphx_env
 from process_control import run_process
 
 
@@ -42,12 +43,16 @@ SYSTEM_NAME_RE = re.compile("smsched", re.IGNORECASE)
 SMSCHED_CONDA_ENV_RE = re.compile(r"(?<=/envs/)smsched(?=/)", re.IGNORECASE)
 METHOD_LABELS = {"smsched": "MorphX"}
 SPLIT_NAME_RE = re.compile("split", re.IGNORECASE)
+# SM sweeps from the 108-SM A100; re-anchored at MORPHX_NUM_SMS on other GPUs.
 MODEL_SMS_POINTS = {
-    "16": (108, 72, 36, 4),
-    "128": (108, 72, 36, 4),
-    "512": (108, 96, 84, 72, 60, 48, 36, 24, 12, 8),
-    "8192": (108, 96, 84, 72, 60, 48, 36, 24, 12, 4),
-    "ggnn": (108, 96, 84, 72, 60, 48, 36, 24, 12),
+    series: morphx_env.sm_sweep(points)
+    for series, points in {
+        "16": (108, 72, 36, 4),
+        "128": (108, 72, 36, 4),
+        "512": (108, 96, 84, 72, 60, 48, 36, 24, 12, 8),
+        "8192": (108, 96, 84, 72, 60, 48, 36, 24, 12, 4),
+        "ggnn": (108, 96, 84, 72, 60, 48, 36, 24, 12),
+    }.items()
 }
 
 AVG_MS_RE = re.compile(r"\bavg_ms=([0-9.+\-eE]+)")
@@ -110,8 +115,7 @@ OVERHEAD_SPECS: dict[str, OverheadSpec] = {
 def parse_args() -> argparse.Namespace:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     default_output = REPO_ROOT / "ae-results" / "overhead-model-part4" / timestamp
-    conda_python = Path("/home/rtx/miniconda3/envs/smsched/bin/python")
-    default_python = os.environ.get("PYTHON") or str(conda_python if conda_python.exists() else Path(sys.executable))
+    default_python = morphx_env.default_python()
 
     parser = argparse.ArgumentParser(
         description="Run and summarize SOSP 2026 AE Figure 15/16 experiments.",
@@ -217,8 +221,7 @@ def common_env(args: argparse.Namespace, include_mpi_stub: bool = True) -> dict[
         if mpi_stub_dir is not None:
             runtime_dirs = tuple(directory for directory in runtime_dirs if directory != mpi_stub_dir)
     candidates = runtime_dirs or (
-        Path("/mnt/data/rtx/llvm-project/install/lib/x86_64-unknown-linux-gnu"),
-        Path("/mnt/data/rtx/llvm-project/build/lib/x86_64-unknown-linux-gnu"),
+        *morphx_env.llvm_runtime_lib_dirs(),
         python_lib_dir(args.python_bin),
         Path("/usr/mpi/gcc/openmpi-4.1.7rc1/lib"),
     )
@@ -271,8 +274,7 @@ def prepare_runtime_library_dirs(args: argparse.Namespace) -> list[Path]:
     dirs: list[Path] = []
     args.mpi_cxx_stub_dir = None
     for candidate in (
-        Path("/mnt/data/rtx/llvm-project/install/lib/x86_64-unknown-linux-gnu"),
-        Path("/mnt/data/rtx/llvm-project/build/lib/x86_64-unknown-linux-gnu"),
+        *morphx_env.llvm_runtime_lib_dirs(),
         python_lib_dir(args.python_bin),
         Path("/usr/mpi/gcc/openmpi-4.1.7rc1/lib"),
     ):
@@ -344,6 +346,7 @@ def build_child_env(
             for key in ("PATH", "HOME", "USER", "SHELL", "TERM", "CUDA_HOME", "CUDAToolkit_ROOT")
             if key in os.environ
         }
+        env.update(morphx_env.morphx_env_vars())
     else:
         env = os.environ.copy()
     for key in (
@@ -481,7 +484,7 @@ def overhead_command(args: argparse.Namespace, task: str, method: str, log_base:
                 "SMSCHED_PROFILE": "0" if task == "GGNN" else "1",
                 "SMSCHED_PROFILE_LOG": "0",
                 "SMSCHED_DEBUG": "0",
-                "SMSCHED_SPLIT_HINT": "108",
+                "SMSCHED_SPLIT_HINT": str(morphx_env.num_sms()),
             }
         )
         if task == "GGNN":
@@ -915,6 +918,9 @@ def analyze_model(args: argparse.Namespace) -> None:
             metadata_rows.append({"series": series, "kernel": "N/A", "blocks": "N/A", "occup": "N/A", "ci": "N/A", "waves": 0, "source": "N/A"})
             continue
         series_waves[series] = {sms: lat for sms, lat in selected.waves}
+        if not any(sms in series_waves[series] for sms in expected[series]):
+            # Off the A100 grid (e.g. another MORPHX_NUM_SMS): report the points the runtime profiled.
+            expected[series] = sorted(series_waves[series], reverse=True)
         metadata_rows.append(
             {
                 "series": series,

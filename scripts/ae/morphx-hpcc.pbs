@@ -1,0 +1,63 @@
+#!/bin/bash
+# MorphX AE job for the hpcc H200 free queue (PBS Pro). See docs/h100-port-plan.md section 8.
+#
+#   qsub -v MODE=probe scripts/ae/morphx-hpcc.pbs     # GPU, driver, GDRCopy, MPS and %smid checks
+#   qsub -v MODE=smoke scripts/ae/morphx-hpcc.pbs     # ./run.sh smoke
+#   J=$(qsub -v MODE=short scripts/ae/morphx-hpcc.pbs)
+#   qsub -W depend=afterany:$J -v MODE=resume scripts/ae/morphx-hpcc.pbs
+#
+# MODE is any ./run.sh mode (smoke, short, resume, analyse, ...) or "probe".
+# The free queue allows one running job per user and at most 6 h of walltime.
+#PBS -N morphx-ae
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+
+set -euo pipefail
+MODE="${MODE:-smoke}"
+REPO="${MORPHX_REPO:-${PBS_O_WORKDIR:-$HOME/MorphX}}"
+CONDA_ENV="${MORPHX_CONDA_ENV:-smsched}"
+
+module purge
+module load gnu/gcc-12.3 cuda/13.0 anaconda/2025
+if [[ "$MODE" != probe ]]; then
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate "$CONDA_ENV"
+fi
+
+cd "$REPO"
+source scripts/ae/env-h100.sh
+
+# PBS may hand out GPU UUIDs; the AE scripts pin experiments to index 0.
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then
+  export CUDA_VISIBLE_DEVICES=0
+fi
+
+echo "host=$(hostname) job=${PBS_JOBID:-none} mode=${MODE} repo=${REPO}"
+nvidia-smi --query-gpu=name,driver_version,memory.total,compute_mode --format=csv
+
+if [[ "$MODE" == probe ]]; then
+  echo "== GDRCopy"
+  ls -l /dev/gdrdrv 2>/dev/null || echo "gdrdrv: MISSING"
+  lsmod | grep -i gdrdrv || echo "gdrdrv module: not loaded"
+  echo "== MPS"
+  export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-${PBS_JOBID:-$$}" CUDA_MPS_LOG_DIRECTORY="/tmp/mps-log-${PBS_JOBID:-$$}"
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+  if nvidia-cuda-mps-control -d; then
+    echo "MPS: OK"
+    echo quit | nvidia-cuda-mps-control
+  else
+    echo "MPS: FAILED"
+  fi
+  rm -rf "$CUDA_MPS_PIPE_DIRECTORY"
+  echo "== %smid probe"
+  probe_bin="${TMPDIR:-/tmp}/smid_probe-${PBS_JOBID:-$$}"
+  nvcc -O2 -arch="sm_${MORPHX_CUDA_ARCH}" -o "$probe_bin" scripts/ae/smid_probe.cu
+  "$probe_bin" probe
+  exit 0
+fi
+
+log_tag="${PBS_JOBID:-$$}"
+./run.sh "$MODE" > "run-${log_tag}.log" 2> "run-${log_tag}.err"

@@ -31,8 +31,12 @@ RequestOutput: Any = None
 SamplingParams: Any = None
 TokensPrompt: Any = None
 
+# Machine-specific settings (see scripts/ae/morphx_env.py); defaults match the A100 AE machine.
+HF_CACHE = os.environ.get("MORPHX_HF_CACHE") or "/huggingface-cache/hub"
+_CUDA_ARCH = int(os.environ.get("MORPHX_CUDA_ARCH") or "80")
+
 # Match environment hints from run.py for consistency across scripts.
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{_CUDA_ARCH // 10}.{_CUDA_ARCH % 10}")
 os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
 os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 os.environ.setdefault("VLLM_USE_V1", "0")
@@ -57,11 +61,11 @@ def exit_after_flush_if_morphx_preloaded() -> None:
     os._exit(0)
 
 MODEL_PATHS = {
-    "llama-2-7b": "/huggingface-cache/hub/models--meta-llama--Llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590",
-    "llama-3-8b": "/huggingface-cache/hub/models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
-    "qwen3-4b": "/huggingface-cache/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f",
-    "qwen3-8b": "/huggingface-cache/hub/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2",
-    "gpt2-l": "/huggingface-cache/hub/models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519",
+    "llama-2-7b": f"{HF_CACHE}/models--meta-llama--Llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590",
+    "llama-3-8b": f"{HF_CACHE}/models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+    "qwen3-4b": f"{HF_CACHE}/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f",
+    "qwen3-8b": f"{HF_CACHE}/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2",
+    "gpt2-l": f"{HF_CACHE}/models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519",
 }
 
 
