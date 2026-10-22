@@ -30,11 +30,16 @@ import backend as llm_backend  # noqa: E402
 GROUPS = ("mycutlass (CUTLASS)", "FlashInfer", "sgl-kernel", "Triton", "cuBLAS/cuBLASLt", "PyTorch native", "other")
 
 
+def _is_cutlass2(name):
+    # libmycutlass kernels have internal linkage; CUPTI reports them mangled (_ZN7cutlassL6KernelI...)
+    return "cutlass::Kernel<" in name or name.startswith("_ZN7cutlass")
+
+
 def classify(op_name, kernel_name):
     op = op_name or ""
     k = kernel_name or ""
     lk = k.lower()
-    if k.startswith("void cutlass::Kernel") or "cutlass::Kernel<" in k:
+    if _is_cutlass2(k):
         return "mycutlass (CUTLASS)"
     if "at::native" in k or "at_cuda_detail" in k:
         return "PyTorch native"
@@ -136,7 +141,7 @@ def build_origin(name):
     lk = name.lower()
     if "nvjet" in lk or "cublas" in lk:
         return "cuBLAS/cuBLASLt (closed source)"
-    if "cutlass::Kernel<" in name:
+    if _is_cutlass2(name):
         return "CUTLASS 2.x from source (libmycutlass, pass-built)"
     if name.startswith("kernel_cutlass_kernel"):
         return "CuTe DSL (Python -> MLIR JIT)"
