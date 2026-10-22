@@ -5,7 +5,7 @@
 #   cd <repo> && qsub scripts/baselines/f_baselines.pbs
 #   qsub -v PARTS="fig15" ...   (parts: env fig15 fig11)
 # Needs nvbit-tutorial/tools/mem_trace/mem_trace.so, TGS/hijack/{high,low}-priority-lib,
-# `neutrino` in the env (scripts/baselines/neutrino/install_neutrino.sh) and
+# `neutrino` in the env (scripts/baselines/neutrino_setup/install_neutrino.sh) and
 # microbench/build-model/libmycutlass.so (pass-built) in this checkout.
 #PBS -N morphx-f-baselines
 #PBS -P fs_ccds_dmitrii.ustiugov

@@ -51,7 +51,7 @@ export MORPHX_TGS_SOCKET_DIR="${MORPHX_TGS_SOCKET_DIR:-${HOME}/morphx/tgs}"
 mkdir -p "${MORPHX_TGS_SOCKET_DIR}"
 # Fig 15 profiler baselines and build tools (docs/h100-port-plan.md section 8.1):
 # ncu ships in the toolkit; CMake >= 3.31 and patchelf (TGS build.sh) are pip
-# installs in ~/.local/bin; `neutrino` comes from scripts/baselines/neutrino/.
+# installs in ~/.local/bin; `neutrino` comes from scripts/baselines/neutrino_setup/.
 case ":${PATH}:" in
   *":${MORPHX_CUDA_ROOT}/bin:"*) ;;
   *) export PATH="${MORPHX_CUDA_ROOT}/bin:${PATH}" ;;
