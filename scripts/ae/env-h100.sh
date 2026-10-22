@@ -9,6 +9,10 @@
 # Unset variables fall back to the original A100 machine (scripts/ae/morphx_env.py).
 
 # Toolchain
+# hpcc's /usr/bin/cc is gcc 11; use the gnu/gcc-12.3 module's compilers for CMake.
+if command -v gcc >/dev/null && gcc -dumpversion | grep -q '^12'; then
+  export CC="${CC:-gcc}" CXX="${CXX:-g++}"
+fi
 export MORPHX_CUDA_ROOT="${MORPHX_CUDA_ROOT:-${CUDA_HOME:-/usr/local/cuda-13.0}}"
 export MORPHX_LLVM_ROOT="${MORPHX_LLVM_ROOT:-${HOME}/morphx/llvm}"
 # CUDA 13 ships CCCL (Thrust/CUB/libcudacxx) under include/cccl.
