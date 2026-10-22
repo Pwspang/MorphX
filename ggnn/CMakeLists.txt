@@ -32,14 +32,13 @@ if(Python_Development.Embed_FOUND)
     set(MORPHX_PYTHON_LINK "-L${Python_LIBRARY_DIRS} -lpython${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
 endif()
 
-set(MORPHX_LIBCXX_INCLUDE_FLAGS "-I${MORPHX_LLVM_ROOT}/include/c++/v1 -I${MORPHX_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1")
 string(REPLACE ";" " " MORPHX_CCCL_INCLUDE_FLAGS_STR "${MORPHX_CCCL_INCLUDE_FLAGS}")
 string(REPLACE ";" " " MORPHX_CLANG_CUDA_FLAGS_STR "${MORPHX_CLANG_CUDA_FLAGS}")
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -nostdinc++${MORPHX_PYTHON_INCLUDE_FLAGS} -I${MORPHX_CUDA_ROOT}/targets/x86_64-linux/include ${MORPHX_LIBCXX_INCLUDE_FLAGS} ${MORPHX_CCCL_INCLUDE_FLAGS_STR} -std=c++20 -O3 -fplugin=${MORPHX_PASS_SO} -fpass-plugin=${MORPHX_PASS_SO} -mllvm -enable-dump-ir -mllvm -dump-ir-dir=./ir ${MORPHX_CLANG_CUDA_FLAGS_STR} -include cuda_fp16.h")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++${MORPHX_PYTHON_INCLUDE_FLAGS} ${MORPHX_LIBCXX_INCLUDE_FLAGS} -D_VSTD=std -Wno-error=missing-template-arg-list-after-template-kw -Wno-invalid-specialization -include cuda_fp16.h")
-set(CMAKE_EXE_LINKER_FLAGS "-L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK} ${MORPHX_PYTHON_LINK}")
-set(CMAKE_SHARED_LINKER_FLAGS "-L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK} ${MORPHX_PYTHON_LINK}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${MORPHX_STDLIB_COMPILE_FLAGS}${MORPHX_PYTHON_INCLUDE_FLAGS} -I${MORPHX_CUDA_ROOT}/targets/x86_64-linux/include ${MORPHX_CCCL_INCLUDE_FLAGS_STR} -std=c++20 -O3 -fplugin=${MORPHX_PASS_SO} -fpass-plugin=${MORPHX_PASS_SO} -mllvm -enable-dump-ir -mllvm -dump-ir-dir=./ir ${MORPHX_CLANG_CUDA_FLAGS_STR} -include cuda_fp16.h")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MORPHX_STDLIB_COMPILE_FLAGS}${MORPHX_PYTHON_INCLUDE_FLAGS} ${MORPHX_STDLIB_CXX_FLAGS} -I${MORPHX_CUDA_ROOT}/include -include cuda_fp16.h")
+set(CMAKE_EXE_LINKER_FLAGS "-L${MORPHX_CUDA_ROOT}/lib64 ${MORPHX_STDLIB_LINK_FLAGS} -lcudart -lcuda ${MORPHX_GDR_LINK} ${MORPHX_PYTHON_LINK}")
+set(CMAKE_SHARED_LINKER_FLAGS "-L${MORPHX_CUDA_ROOT}/lib64 ${MORPHX_STDLIB_LINK_FLAGS} -lcudart -lcuda ${MORPHX_GDR_LINK} ${MORPHX_PYTHON_LINK}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)

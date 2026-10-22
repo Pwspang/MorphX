@@ -22,11 +22,9 @@ if(SMSCHED_ENABLE_PASS)
     get_filename_component(SMSCHED_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
     set(SMSCHED_PASS_SO "${SMSCHED_REPO_ROOT}/smsched-pass/build/libsmsched.so" CACHE FILEPATH "SMSched LLVM pass plugin")
     set(SMSCHED_CUDA_COMMON_FLAGS
-        -nostdinc++
+        ${MORPHX_STDLIB_COMPILE_FLAGS}
         -I${MORPHX_CUDA_ROOT}/include
         -I${MORPHX_CUDA_ROOT}/targets/x86_64-linux/include
-        -I${SMSCHED_LLVM_ROOT}/include/c++/v1
-        -I${SMSCHED_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1
         ${MORPHX_CCCL_INCLUDE_FLAGS}
         -std=c++17
         -O3
@@ -42,9 +40,9 @@ if(SMSCHED_ENABLE_PASS)
     )
     string(REPLACE ";" " " SMSCHED_CUDA_FLAGS_STR "${SMSCHED_CUDA_COMMON_FLAGS}")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${SMSCHED_CUDA_FLAGS_STR}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -I${SMSCHED_LLVM_ROOT}/include/c++/v1 -I${SMSCHED_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1 -D_VSTD=std -Wno-error=missing-template-arg-list-after-template-kw -Wno-invalid-specialization -include cuda_fp16.h")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 -stdlib=libc++ -lc++ -lc++abi -lcudart -lcuda ${MORPHX_GDR_LINK}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MORPHX_STDLIB_COMPILE_FLAGS} ${MORPHX_STDLIB_CXX_FLAGS} -I${MORPHX_CUDA_ROOT}/include -include cuda_fp16.h")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 ${MORPHX_STDLIB_LINK_FLAGS} -lcudart -lcuda ${MORPHX_GDR_LINK}")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L${MORPHX_CUDA_ROOT}/lib64 ${MORPHX_STDLIB_LINK_FLAGS} -lcudart -lcuda ${MORPHX_GDR_LINK}")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

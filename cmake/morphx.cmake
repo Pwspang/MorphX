@@ -68,18 +68,45 @@ else()
     message(FATAL_ERROR "Unknown MORPHX_SYNC_BACKEND: ${MORPHX_SYNC_BACKEND}")
 endif()
 
-# Flags shared by every clang CUDA compile that runs the MorphX pass.
-set(MORPHX_CLANG_CUDA_FLAGS
-    --cuda-path=${MORPHX_CUDA_ROOT}
-    --cuda-gpu-arch=sm_${MORPHX_CUDA_ARCH}
-    -D__NVCC__
-    -D__CUDACC_VER_MAJOR__=${MORPHX_CUDA_VERSION_MAJOR}
-    -D__CUDACC_VER_MINOR__=${MORPHX_CUDA_VERSION_MINOR}
-    -D__NV_NO_HOST_COMPILER_CHECK
-    -D_ALLOW_UNSUPPORTED_LIBCPP
-    -D_VSTD=std
-    -Wno-invalid-specialization
-    -D__CUDACC__
-)
+# The original (CUDA 12) pass builds compile against LLVM's libc++ and pretend
+# to be nvcc (-D__NVCC__ ...). CUDA 13's CCCL headers break under that
+# pretence, while clang's own CUDA mode works with libstdc++, so CUDA >= 13
+# defaults to the plain mode.
+if(MORPHX_CUDA_VERSION_MAJOR GREATER_EQUAL 13)
+    set(_morphx_libcxx_default OFF)
+else()
+    set(_morphx_libcxx_default ON)
+endif()
+morphx_option(MORPHX_CLANG_LIBCXX "${_morphx_libcxx_default}" BOOL "Build pass-enabled code with libc++ and the nvcc-compat defines (original CUDA 12 setup)")
+
+# Flags shared by every clang CUDA compile that runs the MorphX pass, plus the
+# standard-library flags for compiles (MORPHX_STDLIB_COMPILE_FLAGS, CUDA and C++),
+# C++-only extras (MORPHX_STDLIB_CXX_FLAGS) and links (MORPHX_STDLIB_LINK_FLAGS).
+if(MORPHX_CLANG_LIBCXX)
+    set(MORPHX_CLANG_CUDA_FLAGS
+        --cuda-path=${MORPHX_CUDA_ROOT}
+        --cuda-gpu-arch=sm_${MORPHX_CUDA_ARCH}
+        -D__NVCC__
+        -D__CUDACC_VER_MAJOR__=${MORPHX_CUDA_VERSION_MAJOR}
+        -D__CUDACC_VER_MINOR__=${MORPHX_CUDA_VERSION_MINOR}
+        -D__NV_NO_HOST_COMPILER_CHECK
+        -D_ALLOW_UNSUPPORTED_LIBCPP
+        -D_VSTD=std
+        -Wno-invalid-specialization
+        -D__CUDACC__
+    )
+    set(MORPHX_STDLIB_COMPILE_FLAGS "-nostdinc++ -I${MORPHX_LLVM_ROOT}/include/c++/v1 -I${MORPHX_LLVM_ROOT}/include/x86_64-unknown-linux-gnu/c++/v1")
+    set(MORPHX_STDLIB_CXX_FLAGS "-D_VSTD=std -Wno-error=missing-template-arg-list-after-template-kw -Wno-invalid-specialization")
+    set(MORPHX_STDLIB_LINK_FLAGS "-stdlib=libc++ -lc++ -lc++abi")
+else()
+    set(MORPHX_CLANG_CUDA_FLAGS
+        --cuda-path=${MORPHX_CUDA_ROOT}
+        --cuda-gpu-arch=sm_${MORPHX_CUDA_ARCH}
+        -Wno-unknown-cuda-version
+    )
+    set(MORPHX_STDLIB_COMPILE_FLAGS "")
+    set(MORPHX_STDLIB_CXX_FLAGS "")
+    set(MORPHX_STDLIB_LINK_FLAGS "")
+endif()
 
 message(STATUS "MorphX: CUDA ${MORPHX_CUDA_VERSION_MAJOR}.${MORPHX_CUDA_VERSION_MINOR} at ${MORPHX_CUDA_ROOT}, sm_${MORPHX_CUDA_ARCH}, sync backend ${MORPHX_SYNC_BACKEND}")
