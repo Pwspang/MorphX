@@ -1,0 +1,66 @@
+#!/bin/bash
+# Track F: validate the baselines on the hpcc H200 in one job.
+#   - Fig 15 GEMM + GEMV with the profiler baselines ncu / nvbit / neutrino
+#   - Fig 11(a) llm-1-mm-1 with the scheduler baselines tgs / orion / timeslice
+#   cd <repo> && qsub scripts/baselines/f_baselines.pbs
+#   qsub -v PARTS="fig15" ...   (parts: env fig15 fig11)
+# Needs nvbit-tutorial/tools/mem_trace/mem_trace.so, TGS/hijack/{high,low}-priority-lib,
+# `neutrino` in the env (scripts/baselines/neutrino/install_neutrino.sh) and
+# microbench/build-model/libmycutlass.so (pass-built) in this checkout.
+#PBS -N morphx-f-baselines
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"env fig15 fig11"}
+OUT=${OUT:-$HOME/morphx/runs/f-$PBS_JOBID}
+mkdir -p "$OUT"
+echo "== host=$(hostname) job=$PBS_JOBID out=$OUT"
+
+if [[ " $PARTS " == *" env "* ]]; then
+  echo "== tools"
+  command -v ncu neutrino patchelf
+  ncu --version | tail -1
+  grep -i "RmProfilingAdminOnly" /proc/driver/nvidia/params
+  ls -l nvbit-tutorial/tools/mem_trace/mem_trace.so TGS/hijack/high-priority-lib/libcuda.so.1
+fi
+
+if [[ " $PARTS " == *" fig15 "* ]]; then
+  echo "== Fig 15 GEMM/GEMV: base, ncu, nvbit, neutrino"
+  timeout 1200 python scripts/ae/run_overhead_model_part4.py --no-build --only-section overhead \
+    --only-task GEMM --only-task GEMV \
+    --only-method base --only-method ncu --only-method nvbit --only-method neutrino \
+    --output-dir "$OUT/fig15" --run-timeout 600 2>&1 | grep -E "DONE|FAILED|WARNING|ERROR|tables="
+  cat "$OUT/fig15/tables/Figure15.tsv"
+  for f in "$OUT"/fig15/logs/overhead/*/{ncu,nvbit,neutrino}.{log,err}; do
+    [[ -s "$f" ]] || continue
+    echo "-- $f"; grep -vE "^MEMTRACE|^0x" "$f" | tail -6
+  done
+fi
+
+if [[ " $PARTS " == *" fig11 "* ]]; then
+  echo "== Fig 11(a) llm-1-mm-1: tgs, orion, timeslice"
+  timeout 1500 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-1 \
+    --only-scheduler tgs --only-scheduler orion --only-scheduler timeslice \
+    --model llama-3-8b --duration "${FIG11_DURATION:-30}" --output-dir "$OUT/fig11" --run-timeout 600 2>&1 \
+    | grep -E "DONE|FAILED|WARNING|ERROR|preflight|table"
+  for f in "$OUT"/fig11/logs/colocate/llm-mm/llm-1-mm-1/*.log; do
+    echo "-- $f"; sed -n '/=== Results ===/,$p' "$f" | head -20
+  done
+  for f in "$OUT"/fig11/logs/colocate/llm-mm/llm-1-mm-1/*.err; do
+    [[ -s "$f" ]] || continue
+    echo "-- $f"; grep -iE "error|tgs|fatal|abort|traceback" "$f" | head -8
+  done
+  ls -l "$MORPHX_TGS_SOCKET_DIR"
+fi
+echo "== done"

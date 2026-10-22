@@ -590,6 +590,21 @@ cd ~/MorphX && git checkout h100-port
 qsub -v MODE=probe scripts/ae/morphx-hpcc.pbs
 ```
 
+### 8.1 Baselines on hpcc (Track F)
+
+Setup is all user-level (no admin requests). `scripts/ae/env-h100.sh` now puts
+`$MORPHX_CUDA_ROOT/bin` (ncu) and `~/.local/bin` (CMake 4.4, patchelf) on `PATH`.
+Validation job: `qsub scripts/baselines/f_baselines.pbs`.
+
+| Baseline | Used by | Setup | Status |
+|---|---|---|---|
+| **ncu** | Fig 15 | Nsight Compute 2025.3.0 from `cuda/13.0`. `RmProfilingAdminOnly=1` on the login node, but counter collection worked on the GPU node (Track J2 job 91384 profiled with "1 pass") | Works |
+| **NVBit** | Fig 15 | Vendored NVBit 1.7.6 (CUDA 13.0 headers per its release notes) + `tools/mem_trace` builds with nvcc 13.0 (`make -C nvbit-tutorial/tools/mem_trace`, also done by `run_all.py`). 1.7.7+ (CUDA 13.1 headers) and 1.8.x (CMake build) exist but aren't needed for CUDA 13.0 | Builds; GPU check in validation job |
+| **neutrino** | Fig 15 | The authors' `neutrino==0.1.0` is **Neutrino** (OSDI'25, github.com/open-neutrino/neutrino, commit `4a82cd2`); PyPI's `neutrino` is an unrelated Redis package. `scripts/baselines/neutrino/install_neutrino.sh` clones it, swaps in a CUDA 13 `parse.py` (same `_v2` macro fixes as `runtime/src/parse.py`), patches `build.py` for GPU-less login nodes and `$CUDA_HOME`, points the real driver at `/usr/lib64/libcuda.so.1` (the login node has driver 580.65.06, GPU nodes 580.126.20) and installs editable into `~/morphx/envs/sglang-stock` | Installed; GPU check in validation job |
+| **TGS** | Fig 10–12 | `pip install --user patchelf` (0.19.1), then `TGS/hijack/build.sh` builds `high/low-priority-lib` with gcc 12.3 / CUDA 13 headers. The libs are LD_PRELOADed into the LLM / background processes (`--use-tgs --use-multiprocess`); the real driver is found as `libcuda.so.<version from /proc/driver/nvidia/version>`. Rate-watcher sockets go to `$MORPHX_TGS_SOCKET_DIR`. The hijack doesn't export `cuLaunchKernelEx`, so attribute launches bypass TGS throttling | Builds; GPU check in validation job |
+| **orion** | Fig 10–12 | Nothing to build: `scripts/colocate/run.py --use-orion` only forces multithread mode with a high-priority LLM stream and low-priority background streams (`runtime/src/cuda-orion.cpp` is a separate experimental runtime variant not used by the AE) | Should work; GPU check in validation job |
+| **timeslice** | Fig 10–12 | Nothing to build: LLM and background work in separate processes without MPS, so the driver time-slices them (default compute mode, no root needed) | Should work; GPU check in validation job |
+
 ## 9. SGLang backend (primary LLM engine)
 
 **SGLang-first** (decision 2026-10-22, see top of this document). SGLang
