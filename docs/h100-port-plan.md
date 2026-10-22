@@ -29,7 +29,7 @@ set of files, so merges don't conflict.
 | **X. External requests** | Request Llama-2/Llama-3 access on HuggingFace; ask hpcc support about GDRCopy; optional: ask the authors for their vLLM fork (only useful as a reference for the prefill thread) | none | no | nothing, **start day 1** |
 | **A. Script config** | §1 paths/env vars in Python + shell, §2 `TORCH_CUDA_ARCH_LIST`, §3 SM-count lists and split hints, PBS template (§8) | `run.sh`, `scripts/ae/*.py,*.sh`, `scripts/colocate/`, `scripts/overhead/`, `scripts/test-pd-online.py`, `scripts/ae/env-h100.sh`, `scripts/ae/morphx-hpcc.pbs` | no | nothing |
 | **B. Build config** | §1 CMake paths, §2 sm_90, CUDA 13 version macros, CCCL from the toolkit | `microbench/CMakeLists.txt`, `ggnn/CMakeLists.txt`, `runtime/CMakeLists.txt`, `smsched-pass/CMakeLists.txt`, `TGS/hijack/` | compile-only (login node) | nothing |
-| **C. Runtime on CUDA 13** | §6.1 regenerate `unmodified.c` with `parse.py`, fix `cuGetProcAddress` hooks; §3 runtime SM counts (`base.cpp`, `stub_raw.cpp`); §5 option C `memcpy` backend (later) | `runtime/src/`, `include/common.h` | short GPU tests | nothing (hostmapped backend already done) |
+| **C. Runtime on CUDA 13** | §6.1 regenerate `unmodified.c` with `parse.py`, fix `cuGetProcAddress` hooks; §3 runtime SM counts (`base.cpp`, `stub_raw.cpp`); §5 option C `memcpy` backend (done, Track C2) | `runtime/src/`, `include/common.h` | short GPU tests | nothing (hostmapped backend already done) |
 | **D. LLVM + pass** | §6.2–6.3 build clang/libc++ with NVPTX for CUDA 13; build `smsched-pass` | `$HOME/morphx/llvm` on hpcc; `smsched-pass/` only if the pass needs a newer-LLVM fix | no (long CPU build) | nothing |
 | **E. Models and data** | §6.8 download models + ShareGPT into `MORPHX_HF_CACHE` | data dir on hpcc | no | X (Llama access) |
 | **F. Baselines** | §6.7 NVBit `mem_trace` for sm_90, TGS socket path, `neutrino`, `nanoflow` env | `nvbit-tutorial/tools/`, `TGS/` (coordinate with B) | short GPU tests | nothing |
@@ -246,8 +246,13 @@ Checklist:
 - [x] `MORPHX_SYNC_BACKEND=gdr|hostmapped` CMake option (also read from the env var) in
       `runtime/`, `microbench/`, `ggnn/`; `-lgdrapi` is only linked for `gdr`
 - [x] Probe job for mapped-memory atomics and latency: `scripts/ae/sync_backend_test.cu`
-- [ ] `memcpy` backend (option C) if the overhead below is too high
+- [x] `memcpy` backend (option C): `MORPHX_SYNC_BACKEND=memcpy` → `-DMORPHX_SYNC_BACKEND_MEMCPY`;
+      default in `scripts/ae/env-h100.sh` (results below)
+- [x] `launch_fence(stream)` before every patched launch in `cuda.cpp` (incl. reclaim) and
+      `cuda-llm.cpp`; no-op for `gdr`/`hostmapped`. Other runtime variants compile but are
+      not fenced (not used by the AE)
 - [ ] Rerun the Part 3 (Fig 15) overhead smoke with each backend and compare
+- [ ] Optional: batch the agent thread's reads (one D2H per loop instead of one per kernel)
 
 ### `hostmapped` results on the hpcc H200 (job 91113, 2026-10-22)
 
@@ -268,6 +273,39 @@ about 210k blocks/s. Kernels with many short blocks (GEMM tiles, attention)
 will slow down a lot, so **don't use `hostmapped` for performance numbers**.
 For those, implement option C (atomics stay in device memory) or get GDRCopy
 installed.
+
+### `memcpy` backend design and results (H200, jobs 91340–91360, 2026-10-22)
+
+Pool in device memory (`cudaMalloc`), so the per-block protocol is plain device
+atomics. The CPU side uses a private non-blocking, highest-priority control
+stream:
+
+| Operation | How | Host cost |
+|---|---|---|
+| `set(entry, v)` (launch-time init, `writeSM`, reclaim) | 8-byte `cuMemcpyHtoDAsync` from a pinned ring slot; enqueued in host order, so the last writer wins as with GDRCopy | 2.2 µs |
+| `get(entry)` (agent thread, profiler polling) | 8-byte `cuMemcpyDtoHAsync` into a pinned slot, then sync of the control stream only | 7.5–8 µs |
+| `launch_fence(stream)` before a patched launch | event recorded on the control stream + `cuStreamWaitEvent` on the launch stream (no host sync); `MORPHX_MEMCPY_LAUNCH_SYNC=1` syncs on the host instead | 2 µs (14 µs with host sync) |
+
+Copies only, no memsets: a memset may run as a kernel and couldn't start while
+persistent agents fill every SM. `scripts/ae/copy_probe.cu` confirms 8-byte
+D2H/H2D copies finish in ~10 µs with every SM busy.
+
+| Test | `hostmapped` | `memcpy` |
+|---|---|---|
+| `sync_backend_test`: counters, live progress, host→running kernel, maxSM read, launch ordering | all PASS | all PASS |
+| Host → running kernel → host round trip | 1.9 µs | 9.5 µs |
+| Per-block protocol cost vs device memory (16 896 blocks) | +4.9 µs/block (83 ms vs 0.1 ms) | **+0.00 µs/block** |
+| `runtime/test/run_hook_test.sh` (cuda + cuda-llm, LAZY/EAGER) | PASS | PASS |
+| `runtime/test/run_pass_test.sh` (pass-built kernel, `fix_SM` range on profiling launch) | PASS | PASS |
+| Fig 16 bench, CUTLASS GEMM M=16, N=K=65536 (no runtime: 2.63–2.65 ms) | 5.4–6.2 ms | **2.61–2.67 ms** (also with `SMSCHED_PROFILE=0` / launch sync) |
+| Fig 16 part-4 runner, all 4 GEMM series (job 91360) | rc 0, CUTLASS 6.08 / 3.70 / 14.8 / 154 ms | rc 0, CUTLASS **2.65 / 2.46 / 9.68 / 137 ms** (cuBLAS 2.12 / 2.16 / 5.26 / 86.3 ms) |
+| SGLang Qwen3-4B fp16 + mycutlass, 8 req, in 512 / out 32 (no runtime: prefill 74.2 ms, decode 5.29 ms/step, TTFT 96.6 ms, TBT 19.1 ms) | prefill 1095 ms, decode 228 ms/step, TTFT 857 ms, TBT 251 ms | prefill **77.4 ms**, decode **6.10 ms/step** (+15%), TTFT 34.1 ms, TBT 21.0 ms |
+| SGLang greedy tokens vs torch under the runtime | 192/192 | **192/192** identical |
+
+When running the part-4 runner with a hook library other than
+`runtime/build/libcuda.so`, set `NEUTRINO_HOOK_DRIVER` to the same library in
+`--smsched-model-env`; otherwise `libpreload.so` loads the other build too
+and the process segfaults at exit.
 
 ## 6. Toolchain and software stack on the H100 host
 
