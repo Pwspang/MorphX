@@ -136,6 +136,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--request-type", default=DEFAULT_REQUEST_TYPE)
     parser.add_argument(
+        "--rps-scale",
+        type=float,
+        default=float(os.environ.get("MORPHX_PD_RPS_SCALE", "1")),
+        help=(
+            "Multiply every row's request rate (rows keep their A100 config names for "
+            "selectors; output configs show the rate actually used). The A100 rows leave "
+            "a faster GPU lightly loaded, e.g. use 3 on an H200. Default: MORPHX_PD_RPS_SCALE or 1."
+        ),
+    )
+    parser.add_argument(
         "--smsched-env",
         default=os.environ.get("SMSCHED"),
         help=(
@@ -300,7 +310,7 @@ def figure_scope_for_rows(rows: Sequence[WorkloadRow]) -> str:
     return "Figures13-14"
 
 
-def parse_workload_rows(table: str, configs: Sequence[str]) -> list[WorkloadRow]:
+def parse_workload_rows(table: str, configs: Sequence[str], rps_scale: float = 1.0) -> list[WorkloadRow]:
     rows: list[WorkloadRow] = []
     for order, config in enumerate(configs, start=1):
         match = CONFIG_PATTERN.match(config)
@@ -309,7 +319,7 @@ def parse_workload_rows(table: str, configs: Sequence[str]) -> list[WorkloadRow]
         input_length = int(match.group(1))
         output_length = int(match.group(2))
         rps_text = match.group(3)
-        rps = float(rps_text)
+        rps = float(rps_text) * rps_scale
         # Config names keep the split tuned on the 108-SM A100; the hint actually
         # used is scaled to MORPHX_NUM_SMS (identity on the original machine).
         split_hint = morphx_env.scale_split_hint(match.group(4))
@@ -336,7 +346,7 @@ def load_selected_rows(args: argparse.Namespace) -> list[WorkloadRow]:
     selected_tables = args.only_table or list(WORKLOAD_CONFIGS)
     rows: list[WorkloadRow] = []
     for table in selected_tables:
-        rows.extend(parse_workload_rows(table, WORKLOAD_CONFIGS[table]))
+        rows.extend(parse_workload_rows(table, WORKLOAD_CONFIGS[table], args.rps_scale))
     if args.only_config:
         selected_configs = tuple(args.only_config)
         rows = [

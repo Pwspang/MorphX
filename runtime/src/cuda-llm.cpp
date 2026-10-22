@@ -168,6 +168,7 @@ struct KernelInfo {
     const char* name;
     int occup;
     int gridSize;
+    dim3 logicalGrid;
 
     LaunchSlot slot;  // owns d_agents, fetched|finished, minSM|maxSM
     GdrEntry d_agents;
@@ -197,6 +198,7 @@ enum KernelType {
 // Defaults are the A100 values; MORPHX_CI_THRESHOLD / MORPHX_CI_SATURATE retune them.
 float ci_threshold = 0.9f;
 float ci_saturate = 0.75f;
+int ci_mode_occ = 0; // MORPHX_CI_MODE=occ, see generateProfileResult
 
 KernelType getKernelType(float CI) {
     if(CI >= ci_threshold) return COMPUTE_INTENSIVE;
@@ -341,6 +343,7 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
         exit(EXIT_FAILURE);
     }
     std::vector<std::pair<int, float>> profileResult;
+    std::vector<int> profileBlocks; // blocks per wave of each profileResult entry
     for(int l = 0, r; l < profileWaves.size(); l = r) {
         float avg = 0;
         for(r = l; r < profileWaves.size() && profileWaves[r] == profileWaves[l]; ++r) {
@@ -348,27 +351,53 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
         }
         avg /= (r - l);
         profileResult.push_back({getSMFromWave(profileWaves[l], info->occup), avg});
+        profileBlocks.push_back(profileWaves[l]);
     }
     float tm = profileResult[0].second;
     float t0 = profileResult.back().second;
     gWaveTime[info->name].store(tm / 1000.0);
+    // legacy (A100 default): last wave vs the first wave scaled up to all SMs.
+    float legacyTm = tm;
     if(profileResult[0].first != getNrSM()) {
-        tm = tm / profileResult[0].first * getNrSM();
+        legacyTm = tm / profileResult[0].first * getNrSM();
     }
-    float CI = t0 / tm;
+    float legacyCI = t0 / legacyTm;
+    // occ: per-wave time with fewer SMs vs with more SMs, both waves at full
+    // occupancy (blocks == SMs * occup) and excluding the kernel's last wave (its
+    // tail: the GPU drains, so it runs faster than a steady-state wave).
+    // Compute-bound -> ~1, bandwidth-bound -> < 1. Only kernels with at least two
+    // such waves keep the whole GPU busy long enough to be worth confining to
+    // [0, split); smaller grids (e.g. decode GEMMs, one partial wave) get CI 0.
+    // On H200 the legacy formula fails both ways: its SM-count scaling marks any
+    // grid under one wave as memory-bound regardless of how it scales, and the
+    // fast tail wave pulls multi-wave prefill GEMMs down to CI ~0.4.
+    int fullFirst = -1, fullLast = -1;
+    size_t nSteady = profileResult.size() > 1 ? profileResult.size() - 1 : profileResult.size();
+    for(size_t i = 0; i < nSteady; ++i) {
+        if(profileBlocks[i] == profileResult[i].first * info->occup) {
+            if(fullFirst < 0) fullFirst = i;
+            fullLast = i;
+        }
+    }
+    float occCI = 0;
+    if(fullFirst >= 0 && fullLast > fullFirst) {
+        occCI = profileResult[fullLast].second / profileResult[fullFirst].second;
+    }
+    float CI = ci_mode_occ ? occCI : legacyCI;
     float rawCI = CI;
     if(CI >= ci_saturate) CI = 1;
     gCI[info->name].store(CI);
     if(profile_log) {
         std::string waves;
-        for(auto &w : profileResult) {
-            char buf[48];
-            snprintf(buf, sizeof(buf), "%s%d:%.1f", waves.empty() ? "" : ",", w.first, w.second / 1000.0);
+        for(size_t i = 0; i < profileResult.size(); ++i) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s%d/%d:%.1f", waves.empty() ? "" : ",", profileResult[i].first,
+                profileBlocks[i], profileResult[i].second / 1000.0);
             waves += buf;
         }
-        fprintf(stderr, "[MorphX-profile] name=%.120s grid=%d occup=%d waves=%s tm=%.1fus t0=%.1fus ci_raw=%.3f ci=%.3f ci_kernel=%d\n",
-            info->name, info->gridSize, info->occup, waves.c_str(), tm / 1000.0, t0 / 1000.0, rawCI, CI,
-            CI >= ci_threshold);
+        fprintf(stderr, "[MorphX-profile] name=%.120s stream=%p grid=%dx%dx%d occup=%d waves=%s ci_legacy=%.3f ci_occ=%.3f ci_raw=%.3f ci=%.3f ci_kernel=%d\n",
+            info->name, (void*)info->stream, info->logicalGrid.x, info->logicalGrid.y, info->logicalGrid.z, info->occup,
+            waves.c_str(), legacyCI, occCI, rawCI, CI, CI >= ci_threshold);
     }
     // printf("[smsched] kernel %s: CI: %lf, WaveTime: %lfus\n", info->name, CI, tm / 1000.0);
     // for(int i = 0; i < profileResult.size(); ++i) {
@@ -788,6 +817,7 @@ static void ld_init(void) {
     profile_log = getenv_int("SMSCHED_PROFILE_LOG", 0);
     if(const char *v = std::getenv("MORPHX_CI_THRESHOLD")) ci_threshold = std::strtof(v, nullptr);
     if(const char *v = std::getenv("MORPHX_CI_SATURATE")) ci_saturate = std::strtof(v, nullptr);
+    if(const char *v = std::getenv("MORPHX_CI_MODE")) ci_mode_occ = strcmp(v, "occ") == 0;
     // 0 = default: 60 on a 108-SM A100, scaled to the SM count in getNrSM()
     split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
     llm_trick_mode = getenv_int("SMSCHED_LLM_TRICK_MODE", 0);
@@ -1047,6 +1077,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
 
     launchInfo->gridSize = gridSize;
+    launchInfo->logicalGrid = dim3(gridDimX, gridDimY, gridDimZ);
     // Written once, right before the launch, by launch_init().
     launchInfo->slot = gGdrPool->launch_alloc();
     launchInfo->d_agents = launchInfo->slot.agents;
