@@ -32,6 +32,8 @@ uv pip install "$SRC"
 # kernels 0.17.2 breaks the transformers 5.6 import ("Either a revision or a
 # version must be specified"); 0.13.0 matches ~/sglang-codec/.venv.
 uv pip install "kernels==0.13.0"
+# run_all.py builds the pass-built ggnn module with `python -m pip install -e`.
+uv pip install pip nanobind "py-build-cmake~=0.3.3" typing_extensions
 python - <<'PY'
 import importlib.metadata as m
 for p in ["sglang", "torch", "flashinfer-python", "flashinfer-cubin", "sglang-kernel", "transformers", "triton", "kernels"]:
