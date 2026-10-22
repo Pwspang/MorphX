@@ -101,7 +101,10 @@ static int open_clientfd(CUdevice device) {
     uuid_str[i] = uuid_str[i] >= 10 ? uuid_str[i] - 10 + 'a' : uuid_str[i] + '0';
   uuid_str[32] = 0;
 
-  sprintf(SOCKET_PATH, "/home/rtx/gpu/sm-sched/TGS/gsharing/rate_%s.sock", uuid_str);
+  if (tgs_socket_path(SOCKET_PATH, sizeof(SOCKET_PATH), uuid_str) != 0) {
+    close(clientfd);
+    return -1;
+  }
   if (access(SOCKET_PATH, 0) != 0)
     return -1;
 

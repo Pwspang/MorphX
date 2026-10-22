@@ -2,6 +2,16 @@ cmake_minimum_required(VERSION 3.5)
 project(hijack C CXX)
 
 add_definitions(-D_GNU_SOURCE)
+
+# Directory for the TGS rate-watcher Unix sockets; $MORPHX_TGS_SOCKET_DIR at
+# run time overrides it.
+if(DEFINED ENV{MORPHX_TGS_SOCKET_DIR})
+    set(MORPHX_TGS_SOCKET_DIR_DEFAULT "$ENV{MORPHX_TGS_SOCKET_DIR}")
+else()
+    set(MORPHX_TGS_SOCKET_DIR_DEFAULT "/home/rtx/gpu/sm-sched/TGS/gsharing")
+endif()
+set(MORPHX_TGS_SOCKET_DIR "${MORPHX_TGS_SOCKET_DIR_DEFAULT}" CACHE PATH "Directory for TGS rate-watcher sockets")
+add_definitions(-DMORPHX_TGS_SOCKET_DIR="${MORPHX_TGS_SOCKET_DIR}")
 add_compile_options(-Wall -Wshadow -Werror -Wno-format)
 
 include_directories(${CMAKE_SOURCE_DIR})

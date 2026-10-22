@@ -37,7 +37,7 @@ extern "C" {
 
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2 * !!(condition)]))
 
-#define CAS(ptr, old, new) __sync_bool_compare_and_swap_8((ptr), (old), (new))
+#define CAS(ptr, old, new) __sync_bool_compare_and_swap((ptr), (old), (new))
 #define UNUSED __attribute__((unused))
 
 #define MILLISEC (1000UL * 1000UL)
@@ -92,6 +92,27 @@ typedef enum {
  * Load library and initialize some data
  */
 void load_necessary_data();
+
+#ifndef MORPHX_TGS_SOCKET_DIR
+#define MORPHX_TGS_SOCKET_DIR "/home/rtx/gpu/sm-sched/TGS/gsharing"
+#endif
+
+/**
+ * Build the rate-watcher socket path for a GPU UUID. The directory comes from
+ * $MORPHX_TGS_SOCKET_DIR, falling back to the compile-time default.
+ * Returns -1 if the path does not fit (Unix socket paths are <= 107 chars).
+ */
+static inline int tgs_socket_path(char *buf, size_t size, const char *uuid_str) {
+  const char *dir = getenv("MORPHX_TGS_SOCKET_DIR");
+  if (dir == NULL || dir[0] == '\0')
+    dir = MORPHX_TGS_SOCKET_DIR;
+  int n = snprintf(buf, size, "%s/rate_%s.sock", dir, uuid_str);
+  if (n < 0 || (size_t)n >= size) {
+    fprintf(stderr, "TGS socket path too long: %s/rate_%s.sock\n", dir, uuid_str);
+    return -1;
+  }
+  return 0;
+}
 
 #ifdef __cplusplus
 }

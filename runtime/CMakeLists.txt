@@ -1,25 +1,33 @@
-project(smsched-runtime)
-set(CMAKE_C_COMPILER "/usr/bin/gcc-12")
-set(CMAKE_CXX_COMPILER "/usr/bin/g++-12")
 cmake_minimum_required(VERSION 3.22)
-find_package(CUDA 12.2 REQUIRED)
 
-# Scheduler control-word backend: gdr (GDRCopy, default) or hostmapped (pinned
-# host memory, for machines without the gdrdrv kernel module).
-if(DEFINED ENV{MORPHX_SYNC_BACKEND})
-    set(MORPHX_SYNC_BACKEND_DEFAULT "$ENV{MORPHX_SYNC_BACKEND}")
-else()
-    set(MORPHX_SYNC_BACKEND_DEFAULT "gdr")
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/morphx.cmake)
+
+# Prefer gcc-12 when present (original evaluation machine); CC/CXX or
+# -DCMAKE_<LANG>_COMPILER override it, otherwise the default compiler is used.
+if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC} AND EXISTS "/usr/bin/gcc-12")
+    set(CMAKE_C_COMPILER "/usr/bin/gcc-12")
 endif()
-set(MORPHX_SYNC_BACKEND "${MORPHX_SYNC_BACKEND_DEFAULT}" CACHE STRING "Scheduler control-word backend: gdr or hostmapped")
-set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped)
-if(MORPHX_SYNC_BACKEND STREQUAL "hostmapped")
-    add_compile_definitions(MORPHX_SYNC_BACKEND_HOSTMAPPED)
-    set(MORPHX_GDR_LINK "")
-elseif(MORPHX_SYNC_BACKEND STREQUAL "gdr")
-    set(MORPHX_GDR_LINK "-lgdrapi")
-else()
-    message(FATAL_ERROR "Unknown MORPHX_SYNC_BACKEND: ${MORPHX_SYNC_BACKEND}")
+if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX} AND EXISTS "/usr/bin/g++-12")
+    set(CMAKE_CXX_COMPILER "/usr/bin/g++-12")
+endif()
+
+project(smsched-runtime)
+
+set(CUDAToolkit_ROOT "${MORPHX_CUDA_ROOT}" CACHE PATH "CUDA Toolkit root directory")
+find_package(CUDAToolkit 12.2 REQUIRED)
+
+# The fake libcuda.so links against the real driver library. Prefer the
+# installed driver, fall back to the toolkit stub (same SONAME libcuda.so.1).
+find_library(MORPHX_REAL_LIBCUDA
+    NAMES cuda
+    HINTS /usr/lib/x86_64-linux-gnu /usr/lib64
+    NO_DEFAULT_PATH
+)
+if(NOT MORPHX_REAL_LIBCUDA)
+    find_library(MORPHX_REAL_LIBCUDA NAMES cuda HINTS ${CUDAToolkit_LIBRARY_DIR}/stubs)
+endif()
+if(NOT MORPHX_REAL_LIBCUDA)
+    message(FATAL_ERROR "libcuda.so not found; set MORPHX_REAL_LIBCUDA")
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -31,12 +39,12 @@ set(SOURCE src/stub.cpp)
 add_library(stub SHARED)
 target_sources(stub PRIVATE ${SOURCE})
 target_include_directories(stub PRIVATE
-    ${CUDA_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ../include
     ../3rdparty/
 )
 target_link_directories(stub PRIVATE
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+    ${CUDAToolkit_LIBRARY_DIR}
 )
 target_link_libraries(stub
     PRIVATE
@@ -48,12 +56,12 @@ set_property(TARGET stub PROPERTY POSITION_INDEPENDENT_CODE ON)
 add_library(stub_raw SHARED)
 target_sources(stub_raw PRIVATE src/stub_raw.cpp)
 target_include_directories(stub_raw PRIVATE
-    ${CUDA_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ../include
     ../3rdparty/
 )
 target_link_directories(stub_raw PRIVATE
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+    ${CUDAToolkit_LIBRARY_DIR}
 )
 target_link_libraries(stub_raw
     PRIVATE
@@ -67,11 +75,11 @@ target_sources(api PRIVATE
     src/api.cpp
 )
 target_include_directories(api PRIVATE
-    ${CUDA_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ../include
 )
 target_link_directories(api PRIVATE
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+    ${CUDAToolkit_LIBRARY_DIR}
 )
 target_link_libraries(api
     PRIVATE
@@ -84,11 +92,11 @@ set_property(TARGET api PROPERTY POSITION_INDEPENDENT_CODE ON)
 add_library(base SHARED)
 target_sources(base PRIVATE src/base.cpp)
 target_include_directories(base PRIVATE
-    ${CUDA_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ../include
 )
 target_link_directories(base PRIVATE
-    ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+    ${CUDAToolkit_LIBRARY_DIR}
 )
 target_link_libraries(base
     PRIVATE
@@ -119,20 +127,20 @@ else()
 endif()
 add_library(cuda SHARED ${CUDA_SOURCE})
 set_target_properties(cuda PROPERTIES OUTPUT_NAME "cuda" PREFIX "lib")
-target_include_directories(cuda PRIVATE /usr/local/cuda-12.4/include ../include)
-target_link_directories(cuda PRIVATE /usr/local/cuda-12.4/lib64)
+target_include_directories(cuda PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ../include)
+target_link_directories(cuda PRIVATE ${CUDAToolkit_LIBRARY_DIR})
 target_compile_options(cuda PRIVATE -O3 -g -fPIC)
-target_link_libraries(cuda PRIVATE cudart dl stdc++ /usr/lib/x86_64-linux-gnu/libcuda.so)
+target_link_libraries(cuda PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA})
 
 # Narrow LD_PRELOAD shim for workloads where preloading the full fake libcuda
 # changes too many driver symbols. It reuses the scheduler implementation but
 # only exports the interception points needed by cudart/cuGetProcAddress.
 add_library(cuda_hook SHARED ${CUDA_SOURCE})
 set_target_properties(cuda_hook PROPERTIES OUTPUT_NAME "cuda_hook" PREFIX "lib" NO_SONAME TRUE)
-target_include_directories(cuda_hook PRIVATE /usr/local/cuda-12.4/include ../include)
-target_link_directories(cuda_hook PRIVATE /usr/local/cuda-12.4/lib64)
+target_include_directories(cuda_hook PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ../include)
+target_link_directories(cuda_hook PRIVATE ${CUDAToolkit_LIBRARY_DIR})
 target_compile_options(cuda_hook PRIVATE -O3 -g -fPIC)
-target_link_libraries(cuda_hook PRIVATE cudart dl stdc++ /usr/lib/x86_64-linux-gnu/libcuda.so)
+target_link_libraries(cuda_hook PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA})
 target_link_options(cuda_hook PRIVATE
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_hook_exports.map"
     "-Wl,-soname,libcuda.so"
