@@ -169,7 +169,8 @@ struct KernelInfo {
     int occup;
     int gridSize;
 
-    void* d_agents;
+    LaunchSlot slot;  // owns d_agents, fetched|finished, minSM|maxSM
+    GdrEntry d_agents;
     GdrEntry fetched;
     GdrEntry finished;
     GdrEntry minSM;
@@ -212,6 +213,7 @@ std::unordered_map<CUstream, StreamInfo*> streamInfoMap;
 StreamInfo *streamInfos[MAX_CONCURRENT_STREAMS];
 std::atomic<int> nActiveStreams{0};
 std::mutex launchMutex;
+int getenv_int(const char* varname, int default_value);
 
 std::thread agent;
 std::atomic<bool> gAgentRunning{true};
@@ -355,15 +357,8 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
 
 }
 
-void bind_thread_to_cpu(int cpu_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);
-
-    pthread_t thread = pthread_self();
-    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) {
-        perror("pthread_setaffinity_np failed");
-    }
+void bind_thread_to_cpu(int k) {
+    pinThreadToAllowedCpu(k);
 }
 std::atomic<int> gCpu;
 
@@ -528,8 +523,15 @@ void agentThread() {
     int cnt = 0;
     cudaStream_t tStream;
     CUDA_CHECK(cudaStreamCreate(&tStream));
+    // Read every stream's fetched|finished with one get_many (one control-stream
+    // sync with the memcpy backend) instead of one get() per stream.
+    bool batchReads = getenv_int("MORPHX_AGENT_BATCH", 1) != 0;
+    GdrEntry reads[MAX_CONCURRENT_STREAMS];
+    uint64_t values[MAX_CONCURRENT_STREAMS];
+    int readStream[MAX_CONCURRENT_STREAMS];
     while(gAgentRunning.load(std::memory_order_relaxed)) {
         int nStreams = nActiveStreams.load();
+        int nReads = 0;
         // actives.clear();
         // pendings.clear();
         for(int i = 0; i < nStreams; i++) {
@@ -546,7 +548,15 @@ void agentThread() {
             if(kernels[i] == nullptr) {
                 continue;
             }
-            uint64_t tmp = gGdrPool->get(kernels[i]->fetched);
+            readStream[nReads] = i;
+            reads[nReads++] = kernels[i]->fetched;
+        }
+        if(batchReads && nReads > 0) {
+            gGdrPool->get_many(reads, values, nReads);
+        }
+        for(int r = 0; r < nReads; r++) {
+            int i = readStream[r];
+            uint64_t tmp = batchReads ? values[r] : gGdrPool->get(kernels[i]->fetched);
             int fetched = ((int*)&tmp)[0];
             int finished = ((int*)&tmp)[1];
             if(cnt == 0) {
@@ -558,9 +568,7 @@ void agentThread() {
             }
             assert(fetched >= finished);
             if(finished >= kernels[i]->gridSize) {
-                gGdrPool->gdr_free(kernels[i]->fetched);
-                gGdrPool->gdr_free(kernels[i]->minSM);
-                CUDA_CHECK(cudaFreeAsync(kernels[i]->d_agents, kernels[i]->stream));
+                gGdrPool->launch_free(kernels[i]->slot);
                 delete kernels[i];
                 kernels[i] = nullptr;
                 continue;
@@ -1010,22 +1018,22 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
 
     launchInfo->gridSize = gridSize;
-    launchInfo->fetched = gGdrPool->gdr_malloc();
+    // Written once, right before the launch, by launch_init().
+    launchInfo->slot = gGdrPool->launch_alloc();
+    launchInfo->d_agents = launchInfo->slot.agents;
+    launchInfo->fetched = launchInfo->slot.fetched;
     launchInfo->finished = launchInfo->fetched.half();
-    launchInfo->minSM = gGdrPool->gdr_malloc();
+    launchInfo->minSM = launchInfo->slot.minSM;
     launchInfo->maxSM = launchInfo->minSM.half();
-    gGdrPool->set(launchInfo->fetched, 0);
     int fixMin = -1, fixMax = -1;
     if(gFixSM.count(hStream)) {
         auto p = gFixSM[hStream];
         fixMin = p.first; fixMax = p.second;
     }
     int agents = launchInfo->occup * nrSM; // NOT min(occup * nrSM, gridSize)!!!!
-    CUDA_CHECK(cudaMallocAsync(&launchInfo->d_agents, sizeof(int), hStream));
-    CUDA_CHECK(cudaMemcpyAsync(launchInfo->d_agents, &agents, sizeof(int), cudaMemcpyHostToDevice, hStream));
     dim3 gridDim(gridDimX, gridDimY, gridDimZ);
     nargs[numArgs - 6] = &gridDim;
-    nargs[numArgs - 5] = &launchInfo->d_agents;
+    nargs[numArgs - 5] = &launchInfo->d_agents.d;
     nargs[numArgs - 4] = &launchInfo->fetched.d;
     nargs[numArgs - 3] = &launchInfo->finished.d;
     nargs[numArgs - 2] = &launchInfo->minSM.d;
@@ -1036,17 +1044,19 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     // fflush(stdout);
     std::thread* profile = nullptr;
     std::vector<int> profileWaves;
-    if(with_profile && !gCI.count(launchInfo->name)) {
+    bool doProfile = with_profile && !gCI.count(launchInfo->name);
+    if(doProfile) {
         generateProfileWaves(nrSM, launchInfo, profileWaves, fixMin, fixMax);
         launchInfo->h_minSM = 0;
         launchInfo->h_maxSM = getSMFromWave(profileWaves[0], launchInfo->occup);
-        gGdrPool->set(launchInfo->minSM, pack4(0, launchInfo->h_maxSM));
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-        profile = new std::thread(profileThread, launchInfo, std::ref(profileWaves));
     } else {
         launchInfo->h_minSM = 0;
         launchInfo->h_maxSM = nrSM;
-        gGdrPool->set(launchInfo->minSM, pack4(0, nrSM));
+    }
+    gGdrPool->launch_init(launchInfo->slot, pack4(agents, 0), pack4(launchInfo->h_minSM, launchInfo->h_maxSM), true, hStream);
+    if(doProfile) {
+        profile = new std::thread(profileThread, launchInfo, std::ref(profileWaves));
     }
     CUresult res = CUDA_SUCCESS;
     // if(1
@@ -1057,13 +1067,15 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     {
         // printf("[smsched] kernel launched: %s, func: %p, grid: (%d, %d, %d), block: (%d, %d, %d), sharedMemBytes: %u, stream: %p, numArgs: %d, occup: %d, agents: %d\n",
         //     launchInfo->name, (void*)f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, numArgs, launchInfo->occup, agents);
-        gGdrPool->launch_fence(hStream);
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
     }
 
     if(profile) {
         profile->join();
         delete profile;
+        gGdrPool->launch_free(launchInfo->slot);
+        delete launchInfo;
+        launchInfo = nullptr;
     } else {
         streamInfo->pending->push(launchInfo);
         if(usePostLaunchSpecialMode() && hasPattern(launchInfo->name, "redLoadIteratorMixedINS1S_1")) {

@@ -251,8 +251,13 @@ Checklist:
 - [x] `launch_fence(stream)` before every patched launch in `cuda.cpp` (incl. reclaim) and
       `cuda-llm.cpp`; no-op for `gdr`/`hostmapped`. Other runtime variants compile but are
       not fenced (not used by the AE)
-- [ ] Rerun the Part 3 (Fig 15) overhead smoke with each backend and compare
-- [ ] Optional: batch the agent thread's reads (one D2H per loop instead of one per kernel)
+- [x] Rerun the Part 3 (Fig 15) overhead smoke: `memcpy` before/after Track C3 (below);
+      `hostmapped` not rerun (orders of magnitude slower, see above)
+- [x] Batch the agent thread's reads (one `get_many` per loop instead of one `get` per kernel)
+- [x] Track C3: one-copy launch init, launch-path caches, scheduler-thread pinning inside
+      the job's cpuset, opt-in `MORPHX_AGENTS=grid` (below)
+- [ ] Optional: pre-initialized launch slots (no copy and no fence on the launch path; see
+      "Remaining overhead" below)
 
 ### `hostmapped` results on the hpcc H200 (job 91113, 2026-10-22)
 
@@ -306,6 +311,81 @@ When running the part-4 runner with a hook library other than
 `runtime/build/libcuda.so`, set `NEUTRINO_HOOK_DRIVER` to the same library in
 `--smsched-model-env`; otherwise `libpreload.so` loads the other build too
 and the process segfaults at exit.
+
+### Runtime overhead with `memcpy` (Track C3, H200 jobs 91424–91475, 2026-10-22)
+
+What changed (`include/common.h`, `runtime/src/cuda.cpp`, `runtime/src/cuda-llm.cpp`):
+
+| Change | Before (C2) | After (C3) |
+|---|---|---|
+| Launch-time control words | 3 separate pool entries, 3 `set()` copies + `launch_fence()` | one 32-byte `LaunchSlot` (agents, minSM\|maxSM, fetched\|finished) written by **one** 24-byte copy (`launch_init`). `MORPHX_MEMCPY_INIT=control` (default): on the control stream + event wait; `=stream`: on the launch stream itself, no event and no lock |
+| Copy source | pinned ring slot | pinned **host mirror** of the pool; every `set()` updates the mirror first, so an init copy that runs late still carries the newest `minSM`/`maxSM` (a `writeSM` issued before the kernel starts wins in both modes) |
+| Reused slot, `stream` mode | — | fetched\|finished zeroed on free; a block is reused only after that write is known to have landed, so reads never see the previous launch's counters |
+| Agent-thread reads | one D2H + sync per active kernel per loop | one `get_many` per loop (n=1: 8.1 µs, n=2: 10.8 µs, n=4: 15.2 µs vs 8.1 µs each) |
+| Per-launch driver queries | parameter sizes, occupancy, `MAX_DYNAMIC_SHARED_SIZE` attribute every launch | cached per patched function (`MORPHX_LAUNCH_CACHE=0` restores) |
+| Scheduler-thread pinning | CPU 0, 1, …: fails under PBS (`pthread_setaffinity_np failed`), thread runs unpinned | last CPU of the process's allowed set (`MORPHX_AGENT_CPU=<n>` / `-1`) |
+| `cuda-llm.cpp` agents word | `cudaMallocAsync` + pageable `cudaMemcpyAsync` per launch | part of the `LaunchSlot` (also under `gdr`) |
+| Profiled launch in `cuda-llm.cpp` | `KernelInfo` and its entries leaked | freed after the profile thread joins |
+| `MORPHX_AGENTS=grid` (opt-in, `cuda.cpp`) | always `occup × nrSM` agents | `max(gridSize, nrSM)` agents for small grids, only while one stream is active and the kernel gets the whole GPU; such kernels are never shrunk later (fewer agents don't cover every SM range by pigeonhole, which is why the original launches `occup × nrSM`). Co-located launches are unchanged |
+
+`MORPHX_LAUNCH_STATS=1` prints host time before the real launch and the agent
+thread's batched-read time at exit. In SGLang decode a patched launch spends
+**6.6 µs** in the runtime before `cuLaunchKernel`.
+
+Tests (all on the H200, control and stream init, with and without
+`MORPHX_AGENTS=grid`): `sync_backend_test` (new: 8 `launch_init` on a busy stream
+gives every launch exactly its own words, freed slots are zeroed in stream mode;
+9 a late `set()` wins; 10 `get_many` cost) PASS;
+`run_hook_test.sh` 5/5 PASS; `run_pass_test.sh` 4/4 PASS (profiling launch with
+`fix_SM(0,66)` stays on SMs 0–65); SGLang greedy tokens 192/192 identical.
+
+Results (before = C2 runtime at `220b0cf`; Fig 15 / SGLang numbers from the
+same job 91475, two runs each):
+
+| Benchmark | no runtime | before (C2) | after (C3) | after + `MORPHX_AGENTS=grid` |
+|---|---|---|---|---|
+| Launch test, 64-block kernel (`runtime/test/launch_overhead_test.cu`): GPU time alone / launch+sync latency / host µs per launch in a burst | 6.1 / 8.3 / 2.3 µs | 26.6 / 28.0 / 19.4 µs† | 17.7–20.9 / 21.8–24.1 / 10.1–11.6 µs | 16.2 / 22.1 / 10.5 µs |
+| Launch test, 1056-block kernel (~50 µs) | 53 / 56 / 24 µs | 89 / 83 / 31 µs† | 76–77 / 75–82 / 32 µs | 74 / 76 / 31 µs |
+| Fig 16 bench GEMM M=16, N=K=65536 (CUTLASS) | 2.627 ms | 2.660 ms | 2.627 ms (stream: 2.667) | — |
+| Fig 15 GEMM (MorphX / base) | 1.000 | 1.044, 1.048 | 1.047, 1.051 | 1.038, 1.011 |
+| Fig 15 GEMV | 1.000 | 1.759, 1.644 | 1.598, 1.529 | **1.443, 1.432** |
+| Fig 15 LLM (Qwen3-8B, in 4096 / out 3) | 1.000 | 1.104, 1.043 | 1.040, 1.050 | 1.038, 1.068 |
+| Fig 15 DNN (cuDNN, not patched) | 1.000 | 0.981, 0.993 | 1.000, 0.990 | 0.998, 1.001 |
+| SGLang Qwen3-4B + mycutlass: decode GPU time per step | 5.36, 5.28 ms | 8.52*, 6.10 ms | 6.02, 6.29 ms | **5.59, 5.64 ms** |
+| SGLang: TBT mean / TTFT mean | 17.9–18.1 / 32.4–32.5 ms | 20.1–22.4 / 35.1–42.2 ms | 19.0–19.3 / 35.1–36.6 ms | 19.1–19.5 / 33.9–34.4 ms |
+| Fig 11(a) `llm-1-mm-1`, 60 s: LLM mean latency (stream: 4209 ms, TTFT 30.1) | — | 4311 ms (+2.4%), TTFT 33.4 | 4107 ms (−2.4%), TTFT 32.9 | 4002 ms (−4.9%), TTFT 32.2 |
+
+\* one run with an outlier; the other 6.10 ms. † job 91424, means; the other
+launch-test numbers are medians (jobs 91440, 91449). Fig 11 single runs vary by
+~10% between jobs (stream latency was 3782 ms in job 91429), so read that row
+as "no longer worse than stream", not as a measured gain. Fig 15 LLM varies by
+±3% run to run.
+
+The SM split does happen in co-location (job 91429, 30 s of `llm-1-mm-1` with
+`SMSCHED_DEBUG`): while the mm GEMM (compute-intensive) runs, `schedule_1`
+moves the LLM's GEMMs to SMs `[93,132)` and the CI GEMM gets `[0,93)`. At this
+point the mm side is busy ~2% of the time, so only 23 of 16 877 patched
+launches were split.
+
+Remaining overhead:
+- **GPU side, small grids:** a patched kernel launches `occup × nrSM` agents and
+  every agent does an atomic on `agents` and on `fetched` (same two words). In
+  SGLang decode that is +0.8 ms GPU per step (5.3 → 6.1 ms); `MORPHX_AGENTS=grid`
+  cuts it to +0.3 ms but only applies while one stream is active.
+- **Launch latency on an idle stream:** the kernel can't start before its
+  control words land (control copy + event, or the in-stream copy): ~10 µs.
+  This is what keeps GEMV at ~1.45–1.6× and the 64-block test kernel at ~18 µs
+  vs 6 µs. Hidden when the stream is already busy (SGLang decode, Fig 16).
+  Removing it needs pre-initialized slots that the launch path takes without a
+  copy or fence; a slot could only be re-initialized after every agent of its
+  previous launch has started (`agents == 0`) plus a delay, because late agents
+  still touch `fetched` (the existing FIFO pool relies on its ~1M-launch reuse
+  distance for the same reason).
+- **Host side:** ~6.6 µs per patched launch before the real launch (stream
+  registration lookup, cached queries, argument copies for reclaim, slot init),
+  vs ~2 µs for a plain launch.
+- `MORPHX_MEMCPY_INIT=stream` vs `control`: no consistent difference in any
+  benchmark; `control` stays the default.
 
 ## 6. Toolchain and software stack on the H100 host
 

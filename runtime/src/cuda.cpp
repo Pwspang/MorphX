@@ -176,6 +176,7 @@ struct KernelInfo {
     unsigned int sharedMemBytes;
     dim3 logicalGrid;
 
+    LaunchSlot slot;  // owns d_agents, fetched|finished, minSM|maxSM
     GdrEntry d_agents;
     GdrEntry fetched;
     GdrEntry finished;
@@ -189,8 +190,7 @@ struct KernelInfo {
     int isReclaimed;
 
     std::vector<void*> kernelArgs;
-    std::vector<GdrEntry> reclaimAgents;
-    std::vector<GdrEntry> reclaimMinSMs;
+    std::vector<LaunchSlot> reclaimSlots;
 };
 
 struct StreamInfo {
@@ -239,6 +239,37 @@ int only_whitelist;
 int register_bypass_streams;
 int reclaim_enabled;
 std::vector<std::string> targetKernelPatterns;
+int getenv_int(const char* varname, int default_value);
+
+// Driver queries a patched launch used to repeat every time (parameter sizes,
+// occupancy, the dynamic shared memory attribute). They only depend on the
+// function, block size and dynamic shared memory, so they are cached.
+// MORPHX_LAUNCH_CACHE=0 restores the per-launch queries.
+struct PkFuncCache {
+    std::vector<size_t> argSizes;
+    unsigned int maxDynSmem = 0;  // largest MAX_DYNAMIC_SHARED_SIZE_BYTES set so far
+    std::unordered_map<uint64_t, int> occupancy;  // blockSize << 32 | smem -> blocks per SM
+};
+std::mutex gPkCacheMutex;
+std::unordered_map<CUfunction, PkFuncCache> gPkCache;
+int launch_cache = 1;
+// MORPHX_AGENTS=grid launches max(gridSize, nrSM) persistent agents instead
+// of occup * nrSM for small grids, but only while a single stream is active
+// and the kernel gets the whole GPU. Every agent does an atomic on agents and
+// on fetched (the same two words), so a small grid with occup * nrSM agents
+// spends most of its GPU time in those atomics (decode GEMMs, GEMV).
+// occup * nrSM agents also guarantee, by pigeonhole, that agents sit on every
+// SM range a later writeSM() may shrink the kernel to; fewer agents don't, so
+// a capped kernel is marked scheduled and never shrunk. Co-located (multi-stream)
+// launches keep the original agent count. Opt-in.
+int cap_agents = 0;
+
+// MORPHX_LAUNCH_STATS=1: at exit, report the host time a patched (non-profiling)
+// launch spends in the runtime before the real cuLaunchKernel, and the agent
+// thread's batched reads.
+int launch_stats = 0;
+std::atomic<uint64_t> gStatLaunches{0}, gStatLaunchNs{0};
+std::atomic<uint64_t> gStatAgentReads{0}, gStatAgentReadNs{0};
 
 int gNrSM;
 inline int getNrSM() {
@@ -363,15 +394,8 @@ void generateProfileResult(KernelInfo *info, std::vector<std::pair<int, float>> 
     }
 }
 
-void bind_thread_to_cpu(int cpu_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);   
-
-    pthread_t thread = pthread_self();
-    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) {
-        perror("pthread_setaffinity_np failed");
-    }
+void bind_thread_to_cpu(int k) {
+    pinThreadToAllowedCpu(k);
 }
 std::atomic<int> gCpu;
 std::atomic<int> gDebugPrints;
@@ -425,21 +449,16 @@ void freeKernelInfo(KernelInfo *info) {
     if(info == nullptr) {
         return;
     }
-    if(!info->reclaimAgents.empty() && gReclaimStream != nullptr) {
+    if(!info->reclaimSlots.empty() && gReclaimStream != nullptr) {
         CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(gReclaimStream)));
     }
     for(void *arg : info->kernelArgs) {
         free(arg);
     }
-    for(GdrEntry &entry : info->reclaimAgents) {
-        gGdrPool->gdr_free(entry);
+    for(LaunchSlot &slot : info->reclaimSlots) {
+        gGdrPool->launch_free(slot);
     }
-    for(GdrEntry &entry : info->reclaimMinSMs) {
-        gGdrPool->gdr_free(entry);
-    }
-    gGdrPool->gdr_free(info->fetched);
-    gGdrPool->gdr_free(info->minSM);
-    gGdrPool->gdr_free(info->d_agents);
+    gGdrPool->launch_free(info->slot);
     delete info;
 }
 
@@ -479,17 +498,15 @@ bool launchReclaim(KernelInfo *info, int minSM, int maxSM, int nrSM) {
         return false;
     }
 
-    GdrEntry agentsEntry = gGdrPool->gdr_malloc();
-    GdrEntry minEntry = gGdrPool->gdr_malloc();
-    GdrEntry maxEntry = minEntry.half();
+    LaunchSlot slot = gGdrPool->launch_alloc();
+    GdrEntry maxEntry = slot.minSM.half();
     int agents = info->occup * (maxSM - minSM);
-    gGdrPool->set(agentsEntry, pack4(agents, 0));
-    gGdrPool->set(minEntry, pack4(0, nrSM));
 
     void **args = new void*[info->numArgs];
-    fillKernelArgs(info, agentsEntry, minEntry, maxEntry, args);
+    fillKernelArgs(info, slot.agents, slot.minSM, maxEntry, args);
+    // The reclaim launch shares info's fetched|finished, so leave them alone.
+    gGdrPool->launch_init(slot, pack4(agents, 0), pack4(0, nrSM), false, gReclaimStream);
     std::shared_lock<std::shared_mutex> readLock(launchMutex);
-    gGdrPool->launch_fence(gReclaimStream);
     CUresult res = real_cuLaunchKernel(
         info->func,
         agents, 1, 1,
@@ -500,13 +517,12 @@ bool launchReclaim(KernelInfo *info, int minSM, int maxSM, int nrSM) {
         nullptr);
     delete[] args;
     if(res != CUDA_SUCCESS) {
-        gGdrPool->gdr_free(agentsEntry);
-        gGdrPool->gdr_free(minEntry);
+        CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(gReclaimStream)));
+        gGdrPool->launch_free(slot);
         return false;
     }
 
-    info->reclaimAgents.push_back(agentsEntry);
-    info->reclaimMinSMs.push_back(minEntry);
+    info->reclaimSlots.push_back(slot);
     info->isReclaimed = 1;
     if(shouldDebugPrint()) {
         fprintf(stderr, "[MorphX-debug] reclaim func=%s range=[%d,%d) stream=%p reclaim_stream=%p\n",
@@ -769,8 +785,15 @@ void agentThread() {
     int cnt = 0;
     cudaStream_t tStream;
     CUDA_CHECK(cudaStreamCreate(&tStream));
+    // Read every stream's fetched|finished with one get_many (one control-stream
+    // sync with the memcpy backend) instead of one get() per stream.
+    bool batchReads = getenv_int("MORPHX_AGENT_BATCH", 1) != 0;
+    GdrEntry reads[MAX_CONCURRENT_STREAMS];
+    uint64_t values[MAX_CONCURRENT_STREAMS];
+    int readStream[MAX_CONCURRENT_STREAMS];
     while(gAgentRunning.load(std::memory_order_relaxed)) {
         int nStreams = nActiveStreams.load();
+        int nReads = 0;
         // actives.clear();
         // pendings.clear();
         for(int i = 0; i < nStreams; i++) {
@@ -787,7 +810,20 @@ void agentThread() {
             if(kernels[i] == nullptr) {
                 continue;
             }
-            uint64_t tmp = gGdrPool->get(kernels[i]->fetched);
+            readStream[nReads] = i;
+            reads[nReads++] = kernels[i]->fetched;
+        }
+        if(batchReads && nReads > 0) {
+            auto t0 = hrc::now();
+            gGdrPool->get_many(reads, values, nReads);
+            if(launch_stats) {
+                gStatAgentReads.fetch_add(1, std::memory_order_relaxed);
+                gStatAgentReadNs.fetch_add(getNano(hrc::now() - t0), std::memory_order_relaxed);
+            }
+        }
+        for(int r = 0; r < nReads; r++) {
+            int i = readStream[r];
+            uint64_t tmp = batchReads ? values[r] : gGdrPool->get(kernels[i]->fetched);
             int fetched = ((int*)&tmp)[0];
             int finished = ((int*)&tmp)[1];
             if(cnt == 0) {
@@ -839,6 +875,12 @@ static void runtimeShutdown() {
     gAgentRunning.store(false, std::memory_order_relaxed);
     if(agent.joinable()) {
         agent.join();
+    }
+    if(launch_stats) {
+        uint64_t n = gStatLaunches.load(), reads = gStatAgentReads.load();
+        fprintf(stderr, "[MorphX-stats] patched_launches=%lu host_us_before_launch=%.2f agent_batched_reads=%lu us_per_read=%.2f\n",
+            (unsigned long)n, n ? gStatLaunchNs.load() / 1000.0 / n : 0.0,
+            (unsigned long)reads, reads ? gStatAgentReadNs.load() / 1000.0 / reads : 0.0);
     }
 }
 
@@ -915,6 +957,9 @@ static void ld_init(void) {
         return;
     }
     with_profile = getenv_int("SMSCHED_PROFILE", 1);
+    launch_cache = getenv_int("MORPHX_LAUNCH_CACHE", 1);
+    cap_agents = getenv("MORPHX_AGENTS") && strcmp(getenv("MORPHX_AGENTS"), "grid") == 0;
+    launch_stats = getenv_int("MORPHX_LAUNCH_STATS", 0);
     profile_log = getenv_int("SMSCHED_PROFILE_LOG", 0);
     // 0 = default: 76 on a 108-SM A100, scaled to the SM count in getNrSM()
     split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
@@ -1098,6 +1143,42 @@ private:
     std::atomic<unsigned int> owner_ticket_;
 };
 
+// Parameter sizes and occupancy of a patched function; see PkFuncCache.
+const std::vector<size_t>& queryPkLaunch(CUfunction f, int blockSize, unsigned int sharedMemBytes, int *occup) {
+    static thread_local std::vector<size_t> uncached;
+    if(!launch_cache) {
+        CU_CHECK(real_cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sharedMemBytes));
+        CU_CHECK(real_cuOccupancyMaxActiveBlocksPerMultiprocessor(occup, f, blockSize, sharedMemBytes));
+        uncached.clear();
+        size_t offset, size;
+        for(int i = 0; real_cuFuncGetParamInfo(f, i, &offset, &size) == CUDA_SUCCESS; i++) {
+            uncached.push_back(size);
+        }
+        return uncached;
+    }
+    std::lock_guard<std::mutex> lock(gPkCacheMutex);
+    PkFuncCache &cache = gPkCache[f];
+    if(cache.argSizes.empty()) {
+        size_t offset, size;
+        for(int i = 0; real_cuFuncGetParamInfo(f, i, &offset, &size) == CUDA_SUCCESS; i++) {
+            cache.argSizes.push_back(size);
+        }
+    }
+    if(sharedMemBytes > cache.maxDynSmem) {
+        CU_CHECK(real_cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sharedMemBytes));
+        cache.maxDynSmem = sharedMemBytes;
+    }
+    uint64_t key = ((uint64_t)blockSize << 32) | sharedMemBytes;
+    auto it = cache.occupancy.find(key);
+    if(it == cache.occupancy.end()) {
+        int blocks = 0;
+        CU_CHECK(real_cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, f, blockSize, sharedMemBytes));
+        it = cache.occupancy.emplace(key, blocks).first;
+    }
+    *occup = it->second;
+    return cache.argSizes;
+}
+
 /**
  * Execution Control, cuLaunchXXX and cuFuncXXX
  * @see https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html
@@ -1179,10 +1260,12 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         // printf("[smsched] using patched kernel %s\n", newFuncName.c_str());
         f = newF;
     }
+    auto tLaunch = hrc::now();
     StreamInfo *streamInfo = checkStream(hStream);
     sharedMemBytes = std::max(sharedMemBytes, 4u);
-    CU_CHECK(real_cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, sharedMemBytes));
     int blockSize = blockDimX * blockDimY * blockDimZ;
+    int occup = 0;
+    const std::vector<size_t> &argSizes = queryPkLaunch(f, blockSize, sharedMemBytes, &occup);
     KernelInfo *launchInfo = new KernelInfo;
     launchInfo->func = f;
     launchInfo->stream = hStream;
@@ -1194,15 +1277,8 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     launchInfo->blockDimZ = blockDimZ;
     launchInfo->sharedMemBytes = sharedMemBytes;
     launchInfo->logicalGrid = dim3(gridDimX, gridDimY, gridDimZ);
-    CU_CHECK(real_cuOccupancyMaxActiveBlocksPerMultiprocessor(&launchInfo->occup, f, blockSize, sharedMemBytes));
+    launchInfo->occup = occup;
     assert(launchInfo->occup > 0);
-    std::vector<size_t> argSizes;
-    int i = 0;
-    size_t offset, size;
-    while(real_cuFuncGetParamInfo(f, i, &offset, &size) == CUDA_SUCCESS) {
-        argSizes.push_back(size);
-        i++;
-    } 
     int numArgs = argSizes.size();
     assert(numArgs >= 6);
     launchInfo->numArgs = numArgs;
@@ -1216,19 +1292,19 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
 
     launchInfo->gridSize = gridSize;
-    launchInfo->d_agents = gGdrPool->gdr_malloc();
-    launchInfo->fetched = gGdrPool->gdr_malloc();
+    // Written once, right before the launch, by launch_init().
+    launchInfo->slot = gGdrPool->launch_alloc();
+    launchInfo->d_agents = launchInfo->slot.agents;
+    launchInfo->fetched = launchInfo->slot.fetched;
     launchInfo->finished = launchInfo->fetched.half();
-    launchInfo->minSM = gGdrPool->gdr_malloc();
+    launchInfo->minSM = launchInfo->slot.minSM;
     launchInfo->maxSM = launchInfo->minSM.half();
-    gGdrPool->set(launchInfo->fetched, 0);
     int fixMin = -1, fixMax = -1;
     if(gFixSM.count(hStream)) {
         auto p = gFixSM[hStream];
         fixMin = p.first; fixMax = p.second;
     } 
     int agents = launchInfo->occup * nrSM; // NOT min(occup * nrSM, gridSize)!!!!
-    gGdrPool->set(launchInfo->d_agents, pack4(agents, 0));
     // CUDA_CHECK(cudaMallocAsync(&launchInfo->d_agents, sizeof(int), hStream));
     // CUDA_CHECK(cudaMemcpyAsync(launchInfo->d_agents, &agents, sizeof(int), cudaMemcpyHostToDevice, hStream));
     void **nargs = new void*[numArgs];
@@ -1259,14 +1335,13 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         generateProfileWaves(nrSM, launchInfo, profileWaves, fixMin, fixMax);
         launchInfo->h_minSM = 0;
         launchInfo->h_maxSM = getSMFromWave(profileWaves[0], launchInfo->occup);
-        gGdrPool->set(launchInfo->minSM, pack4(0, launchInfo->h_maxSM));
         if(debugThisLaunch) {
             fprintf(stderr, "[MorphX-debug] profile func=%s range=[%d,%d) waves=%zu inWhiteList=%d\n",
                 launchInfo->name, launchInfo->h_minSM, launchInfo->h_maxSM, profileWaves.size(), inWhiteList);
         }
         CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+        gGdrPool->launch_init(launchInfo->slot, pack4(agents, 0), pack4(0, launchInfo->h_maxSM), true, hStream);
         profile = new std::thread(profileThread, launchInfo, std::ref(profileWaves));
-        gGdrPool->launch_fence(hStream);
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
         profile->join();
         delete profile;
@@ -1281,11 +1356,12 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         //     writeSM(launchInfo, 54, nrSM);
         //     launchInfo->isScheduled = 1;
         // }
+        launchInfo->h_minSM = 0;
         if(inWhiteList && nActiveStreams.load() >= 2) {
-            writeSM(launchInfo, 0, split_hint);
+            launchInfo->h_maxSM = split_hint;
             launchInfo->isScheduled = 1;
         } else {
-            writeSM(launchInfo, 0, nrSM);
+            launchInfo->h_maxSM = nrSM;
         }
         if(debugThisLaunch) {
             fprintf(stderr, "[MorphX-debug] assign func=%s range=[%d,%d) inWhiteList=%d nActive=%d isScheduled=%d\n",
@@ -1294,7 +1370,15 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         // printf("[smsched] kernel launched: %.40s, func: %p, grid: (%d, %d, %d), block: (%d, %d, %d), sharedMemBytes: %u, stream: %p, numArgs: %d, occup: %d, agents: %d\n", 
         //     launchInfo->name, (void*)f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, numArgs, launchInfo->occup, agents);
         // if(!inWhiteList)
-        gGdrPool->launch_fence(hStream);
+        if(cap_agents && nActiveStreams.load() <= 1 && launchInfo->h_maxSM == nrSM && agents > std::max(gridSize, nrSM)) {
+            agents = std::max(gridSize, nrSM);
+            launchInfo->isScheduled = 1;  // never shrink: fewer agents don't cover every SM range
+        }
+        gGdrPool->launch_init(launchInfo->slot, pack4(agents, 0), pack4(launchInfo->h_minSM, launchInfo->h_maxSM), true, hStream);
+        if(launch_stats) {
+            gStatLaunches.fetch_add(1, std::memory_order_relaxed);
+            gStatLaunchNs.fetch_add(getNano(hrc::now() - tLaunch), std::memory_order_relaxed);
+        }
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
         streamInfo->pending->push(launchInfo);
         // if(strstr(launchInfo->name, "blocked_floyd_phase")) {
