@@ -58,8 +58,12 @@ if [[ " $PARTS " == *" tgsprobe "* ]]; then
   echo "== TGS probe: torch matmul (cuBLAS) under the high-priority hijack"
   probe='import torch; a = torch.randn(256, 256, device="cuda"); print("matmul ok", float((a @ a).sum()))'
   python -c "$probe"
-  LOGGER_LEVEL=5 LD_PRELOAD=$(ls TGS/hijack/high-priority-lib/{libcontroller.so,libcuda.so,libcuda.so.1,libnvidia-ml.so,libnvidia-ml.so.1} | paste -sd:) \
-    timeout 120 python -c "$probe" 2>&1 | grep -vE "^\[mod\]" | tail -15
+  for prio in high low; do
+    echo "-- $prio priority"
+    CUBLAS_LOGINFO_DBG=1 CUBLAS_LOGDEST_DBG=stderr LOGGER_LEVEL=5 \
+      LD_PRELOAD=$(ls TGS/hijack/$prio-priority-lib/{libcontroller.so,libcuda.so,libcuda.so.1,libnvidia-ml.so,libnvidia-ml.so.1} | paste -sd:) \
+      timeout 120 python -c "$probe" 2>&1 | grep -vE "^\[mod\]" | tail -25
+  done
 fi
 
 if [[ " $PARTS " == *" fig11 "* ]]; then
