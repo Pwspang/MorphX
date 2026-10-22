@@ -960,6 +960,8 @@ typedef enum {
   CUDA_ENTRY_ENUM(cuLibraryGetModule),
   CUDA_ENTRY_ENUM(cuGetProcAddress_v2),
   CUDA_ENTRY_ENUM(cuGetProcAddress),
+  CUDA_ENTRY_ENUM(cuLaunchKernelEx),
+  CUDA_ENTRY_ENUM(cuLaunchKernelEx_ptsz),
 
   CUDA_ENTRY_END
 } cuda_entry_enum_t;

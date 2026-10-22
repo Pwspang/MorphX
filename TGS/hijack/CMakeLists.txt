@@ -33,7 +33,8 @@ add_library(cuda-control-high-priority SHARED
         include/nvml-helper.h
         src/cuda_originals.c
         src/nvml_entry.c
-        src/loader.c)
+        src/loader.c
+        src/proc_address.c)
 
 target_link_libraries(cuda-control-high-priority ${STATIC_C_LIBRARIES})
 
@@ -48,7 +49,8 @@ add_library(cuda-control-low-priority SHARED
         include/nvml-helper.h
         src/cuda_originals.c
         src/nvml_entry.c
-        src/loader.c)
+        src/loader.c
+        src/proc_address.c)
 
 target_link_libraries(cuda-control-low-priority ${STATIC_C_LIBRARIES})
 

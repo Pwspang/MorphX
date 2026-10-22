@@ -472,7 +472,9 @@ entry_t cuda_library_entry[] = {
   {.name = "cuLibraryGetKernel"},
   {.name = "cuLibraryGetModule"},
   {.name = "cuGetProcAddress_v2"},
-  {.name = "cuGetProcAddress"}
+  {.name = "cuGetProcAddress"},
+  {.name = "cuLaunchKernelEx"},
+  {.name = "cuLaunchKernelEx_ptsz"}
 };
 
 entry_t nvml_library_entry[] = {
