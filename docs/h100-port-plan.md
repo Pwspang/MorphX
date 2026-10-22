@@ -822,6 +822,92 @@ hint needs re-tuning (or rows with more load), on top of the runtime changes
 above. All J3 numbers use the runtime from before Track C3 (`runtime/` as of
 6a2746d, memcpy backend); C3 (ae2f76e) cut the per-launch cost, so the MorphX
 rows should be re-measured on it.
+
+#### Track J4: H200 load rows and CI recalibration (runtime 086d130 + J4, jobs 91551–91737, 2026-10-22)
+
+Decision taken: heavier load + recalibrated CI, keeping the paper's automatic
+split; an app-side stream hint only as a fallback.
+
+**How CI works** (`cuda-llm.cpp` `generateProfileResult`). The first launch of a
+kernel runs as profile waves of shrinking SM counts. `CI = t0 / tm`: `t0` = the
+last wave's time, `tm` = the first wave's time, scaled by `nrSM / SMs(first
+wave)` when the first wave doesn't cover the GPU. `CI >= 0.75` saturates to 1;
+`isCI` = `CI >= 0.9`. CI kernels are limited to `[0, split)` at launch, and
+`schedule_2` moves the other streams' kernels to `[split, nrSM)` while one runs.
+
+**Why H200 prefill GEMMs come out at CI ~0.4** (profile logs, Qwen3-8B, mycutlass):
+- Prefill GEMMs (grid 768 / 594, occupancy 2, ~2.3–2.9 waves) have per-wave
+  times like 104 / 73 / 82 / 74 / **47** µs at 132 / 99 / 66 / 33 / 21 SMs: flat
+  except the last wave, which is the kernel's tail (the GPU drains, so it runs
+  faster). `t0` is that tail, so CI = 0.40–0.45. Steady-state waves give 0.70.
+- Decode GEMMs (grid 64–96, one partial wave + an 8-SM tail) get CI 0.13–0.63
+  only because of the `nrSM / SMs` scaling; their own scaling is nearly flat
+  (e.g. 88 SMs 76 µs vs 8 SMs 62 µs): on H200 a decode GEMM's speed is limited
+  per SM, not by total DRAM bandwidth (4.8 TB/s / 132 SMs is more than one SM
+  pulls), so it slows down when it loses SMs. That undercuts the premise that
+  decode runs fine on the leftover SMs.
+- So on H200 the legacy CI doesn't separate prefill from decode.
+
+**Recalibration (opt-in, A100 defaults unchanged)** in `cuda-llm.cpp`:
+- `MORPHX_CI_MODE=occ`: CI = time of the last vs the first *full-occupancy,
+  non-tail* profile wave; kernels with fewer than two such waves (anything
+  that doesn't keep the GPU busy for two waves, e.g. decode GEMMs) get CI 0.
+- `MORPHX_CI_THRESHOLD` (default 0.9) and `MORPHX_CI_SATURATE` (default 0.75).
+- `SMSCHED_PROFILE_LOG=1` prints every profiled kernel (stream, grid, waves as
+  SMs/blocks:µs, `ci_legacy`, `ci_occ`, final CI).
+- With `occ` + threshold/saturate 0.6, the 768-grid prefill GEMM classifies as
+  CI (0.705 → 1) and every decode GEMM as 0; the 594-grid one varies 0.51–0.74
+  between runs (profile noise from 8 µs control-word reads). Threshold 0.5
+  catches both.
+
+**H200 load rows.** `run_pd_colocate_part2.py --rps-scale` (or
+`MORPHX_PD_RPS_SCALE`) multiplies every row's rate; configs keep their A100
+names for selectors, output configs show the rate used (`--only-config` with a
+scaled rate needs the output name, e.g. `Figure13:in-2048-out-256-rps-9`).
+Baseline TTFT on in-2048-out-256 (Qwen3-8B): 0.07 s at rps 3–6, 0.09 s at 9, 3.7
+s at 12, 6.4 s at 15. The knee sits at 9–12, i.e. **scale 3** maps the A100 knee
+(rps 3–4) onto the H200. `scripts/sglang/j4_pd.pbs` runs these sweeps.
+
+**Results** (latency per output token, avg / p99 in s; TTFT avg in s; 60 s runs):
+
+| Variant (in-2048-out-256) | rps 9 avg | rps 9 p99 | rps 9 TTFT | rps 12 avg | rps 12 p99 | rps 12 TTFT |
+|---|---|---|---|---|---|---|
+| baseline | 0.053 | 0.061 | 0.09 | 0.072 | 0.093 | 3.66 |
+| stream | 0.047–0.048 | 0.059–0.061 | 0.09–0.63 | 0.070–0.071 | 0.090–0.091 | 3.1–8.4 |
+| chunked | 0.058–0.067 | 0.077 | 0.10–0.52 | 0.082–0.090 | 0.110 | 4.0–8.1 |
+| MorphX, legacy CI (no split happens) | 0.060 | 0.069 | 0.17 | 0.079 | 0.103 | 3.99 |
+| MorphX, occ CI 0.6, split 66 | 0.092 | 0.105 | 2.72 | 0.102 | 0.135 | 5.13 |
+| MorphX, occ CI 0.6, split 80 | 0.081 | 0.098 | 1.83 | 0.093 | 0.128 | 4.82 |
+| MorphX, occ CI 0.6, split 93 | 0.075 | 0.084 | 1.38 | 0.089 | 0.116 | 4.66 |
+| MorphX, occ CI 0.6, split 108 | 0.067 | 0.078 | 0.55 | 0.084 | 0.110 | 4.38 |
+| MorphX, occ CI 0.5, no launch-time limit (`SMSCHED_LLM_TRICK_MODE=16`), split 66 | 0.059 | 0.068 | 0.15 | 0.079 | 0.102 | 4.02 |
+| same, split 93 | 0.062 | 0.069 | 0.22 | 0.081 | 0.105 | 4.51 |
+| A100 reference, rps 3 / 4 (MorphX / stream / chunked) | 0.049 / 0.054 / 0.065 | 0.066 / 0.074 / 0.089 | | 0.118 / 0.128 / 0.139 | 0.173 / 0.191 / 0.197 | |
+
+Stream and chunked were measured twice (jobs 91551/91575/91723); single runs vary
+up to ~10%.
+
+**Conclusion.** The recalibrated CI makes the split happen (prefill GEMMs
+confined to `[0, split)`, visible as the TTFT rise), but on the H200 it doesn't
+beat stream at any split: both phases' GEMMs scale with SM count, so the split is
+zero-sum, and confining prefill on every launch raises TTFT. MorphX without a
+split is itself ~25% (rps 9) / ~12% (rps 12) behind stream: that's the runtime
+overhead with the memcpy backend (§5) plus profiling, and it's larger than any
+interference MorphX could remove here. MorphX does tie or beat chunked prefill at
+rps 12. An app-side stream hint (fallback) would give the same partition as the
+forced split (J3: decode TBT 40 ms vs 25 ms stream), so it wasn't implemented.
+
+What would change the picture: GDRCopy or pre-initialised slots (§5) to remove
+the per-launch overhead; Hopper-native pass-built GEMMs (CUTLASS 3 / WGMMA)
+instead of Sm80-style mycutlass, which would make prefill more compute-bound and
+decode more bandwidth-bound; and real Llama-3-8B weights.
+
+Defaults: `env-h100.sh` now sets `MORPHX_PD_RPS_SCALE=3` but not
+`MORPHX_CI_MODE`, so Fig 13–14 MorphX rows on H200 run without a split. For a run
+that exercises the paper's mechanism, add `MORPHX_CI_MODE=occ
+MORPHX_CI_THRESHOLD=0.6 MORPHX_CI_SATURATE=0.6` to the MorphX env
+(`--smsched-env`) and split 108 (`--override-split-hint 108`), the least harmful
+split measured.
 6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
        (`logs/<timestamp>-sglang/`).
 

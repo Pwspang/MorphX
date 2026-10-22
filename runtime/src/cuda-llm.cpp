@@ -168,6 +168,7 @@ struct KernelInfo {
     const char* name;
     int occup;
     int gridSize;
+    dim3 logicalGrid;
 
     LaunchSlot slot;  // owns d_agents, fetched|finished, minSM|maxSM
     GdrEntry d_agents;
@@ -193,8 +194,14 @@ enum KernelType {
     COMPUTE_INTENSIVE = 1
 };
 
+// Kernel classification from the profile's CI (t0 / tm, see generateProfileResult).
+// Defaults are the A100 values; MORPHX_CI_THRESHOLD / MORPHX_CI_SATURATE retune them.
+float ci_threshold = 0.9f;
+float ci_saturate = 0.75f;
+int ci_mode_occ = 0; // MORPHX_CI_MODE=occ, see generateProfileResult
+
 KernelType getKernelType(float CI) {
-    if(CI >= 0.9) return COMPUTE_INTENSIVE;
+    if(CI >= ci_threshold) return COMPUTE_INTENSIVE;
     return MEMORY_INTENSIVE;
 }
 
@@ -222,6 +229,9 @@ std::unordered_map<CUfunction, CUmodule> gFuncModuleMap;
 std::unordered_map<CUkernel, bool> gKernelSet;
 
 int with_profile;
+int profile_log;
+std::atomic<long> gCILimitedLaunches{0};  // CI kernels limited to [0, split) at launch
+std::atomic<long> gSplitMoves{0};         // co-runners moved to [split, nrSM) by schedule_2
 int split_hint;
 int llm_trick_mode;
 int llm_trace_limit;
@@ -333,6 +343,7 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
         exit(EXIT_FAILURE);
     }
     std::vector<std::pair<int, float>> profileResult;
+    std::vector<int> profileBlocks; // blocks per wave of each profileResult entry
     for(int l = 0, r; l < profileWaves.size(); l = r) {
         float avg = 0;
         for(r = l; r < profileWaves.size() && profileWaves[r] == profileWaves[l]; ++r) {
@@ -340,16 +351,54 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
         }
         avg /= (r - l);
         profileResult.push_back({getSMFromWave(profileWaves[l], info->occup), avg});
+        profileBlocks.push_back(profileWaves[l]);
     }
     float tm = profileResult[0].second;
     float t0 = profileResult.back().second;
     gWaveTime[info->name].store(tm / 1000.0);
+    // legacy (A100 default): last wave vs the first wave scaled up to all SMs.
+    float legacyTm = tm;
     if(profileResult[0].first != getNrSM()) {
-        tm = tm / profileResult[0].first * getNrSM();
+        legacyTm = tm / profileResult[0].first * getNrSM();
     }
-    float CI = t0 / tm;
-    if(CI >= 0.75) CI = 1;
+    float legacyCI = t0 / legacyTm;
+    // occ: per-wave time with fewer SMs vs with more SMs, both waves at full
+    // occupancy (blocks == SMs * occup) and excluding the kernel's last wave (its
+    // tail: the GPU drains, so it runs faster than a steady-state wave).
+    // Compute-bound -> ~1, bandwidth-bound -> < 1. Only kernels with at least two
+    // such waves keep the whole GPU busy long enough to be worth confining to
+    // [0, split); smaller grids (e.g. decode GEMMs, one partial wave) get CI 0.
+    // On H200 the legacy formula fails both ways: its SM-count scaling marks any
+    // grid under one wave as memory-bound regardless of how it scales, and the
+    // fast tail wave pulls multi-wave prefill GEMMs down to CI ~0.4.
+    int fullFirst = -1, fullLast = -1;
+    size_t nSteady = profileResult.size() > 1 ? profileResult.size() - 1 : profileResult.size();
+    for(size_t i = 0; i < nSteady; ++i) {
+        if(profileBlocks[i] == profileResult[i].first * info->occup) {
+            if(fullFirst < 0) fullFirst = i;
+            fullLast = i;
+        }
+    }
+    float occCI = 0;
+    if(fullFirst >= 0 && fullLast > fullFirst) {
+        occCI = profileResult[fullLast].second / profileResult[fullFirst].second;
+    }
+    float CI = ci_mode_occ ? occCI : legacyCI;
+    float rawCI = CI;
+    if(CI >= ci_saturate) CI = 1;
     gCI[info->name].store(CI);
+    if(profile_log) {
+        std::string waves;
+        for(size_t i = 0; i < profileResult.size(); ++i) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s%d/%d:%.1f", waves.empty() ? "" : ",", profileResult[i].first,
+                profileBlocks[i], profileResult[i].second / 1000.0);
+            waves += buf;
+        }
+        fprintf(stderr, "[MorphX-profile] name=%.120s stream=%p grid=%dx%dx%d occup=%d waves=%s ci_legacy=%.3f ci_occ=%.3f ci_raw=%.3f ci=%.3f ci_kernel=%d\n",
+            info->name, (void*)info->stream, info->logicalGrid.x, info->logicalGrid.y, info->logicalGrid.z, info->occup,
+            waves.c_str(), legacyCI, occCI, rawCI, CI, CI >= ci_threshold);
+    }
     // printf("[smsched] kernel %s: CI: %lf, WaveTime: %lfus\n", info->name, CI, tm / 1000.0);
     // for(int i = 0; i < profileResult.size(); ++i) {
     //     printf("[smsched] AvgWave %d: %d, %lfus\n", i, profileResult[i].first, profileResult[i].second / 1000.0);
@@ -405,7 +454,7 @@ void profileThread(KernelInfo *launchInfo, std::vector<int> &profileWaves) {
 
 bool isCI(KernelInfo *info) {
     float CI = gCI[info->name].load();
-    if(CI >= 0.9) return true;
+    if(CI >= ci_threshold) return true;
     return false;
 }
 
@@ -501,10 +550,12 @@ void schedule_2(KernelInfo *kernels[], KernelInfo *nexts[], int nStreams, int nr
                 if(j != i && kernels[j] && !kernels[j]->isScheduled) {
                     writeSM(kernels[j], split_hint, nrSM);
                     kernels[j]->isScheduled = 1;
+                    gSplitMoves.fetch_add(1, std::memory_order_relaxed);
                 }
                 if(j != i && nexts[j] && !nexts[j]->isScheduled) {
                     writeSM(nexts[j], split_hint, nrSM);
                     nexts[j]->isScheduled = 1;
+                    gSplitMoves.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -605,6 +656,10 @@ bool isInitialized = false;
 // Ensure the background agent thread is properly joined before process exit
 static void runtimeShutdown() {
     if(!isInitialized) return;
+    if(profile_log) {
+        fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d ci_limited_launches=%ld split_moves=%ld\n",
+            ci_threshold, ci_saturate, split_hint, gCILimitedLaunches.load(), gSplitMoves.load());
+    }
     gAgentRunning.store(false, std::memory_order_relaxed);
     if(agent.joinable()) {
         agent.join();
@@ -759,6 +814,10 @@ static void ld_init(void) {
         return;
     }
     with_profile = getenv_int("SMSCHED_PROFILE", 1);
+    profile_log = getenv_int("SMSCHED_PROFILE_LOG", 0);
+    if(const char *v = std::getenv("MORPHX_CI_THRESHOLD")) ci_threshold = std::strtof(v, nullptr);
+    if(const char *v = std::getenv("MORPHX_CI_SATURATE")) ci_saturate = std::strtof(v, nullptr);
+    if(const char *v = std::getenv("MORPHX_CI_MODE")) ci_mode_occ = strcmp(v, "occ") == 0;
     // 0 = default: 60 on a 108-SM A100, scaled to the SM count in getNrSM()
     split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
     llm_trick_mode = getenv_int("SMSCHED_LLM_TRICK_MODE", 0);
@@ -1018,6 +1077,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
 
     launchInfo->gridSize = gridSize;
+    launchInfo->logicalGrid = dim3(gridDimX, gridDimY, gridDimZ);
     // Written once, right before the launch, by launch_init().
     launchInfo->slot = gGdrPool->launch_alloc();
     launchInfo->d_agents = launchInfo->slot.agents;
@@ -1090,6 +1150,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
             // printf("[smsched] Adjusting CI kernel in stream %p\n", launchInfo->stream);
             writeSM(launchInfo, 0, split_hint);
             launchInfo->isScheduled = 1;
+            gCILimitedLaunches.fetch_add(1, std::memory_order_relaxed);
         }
         // if(strstr(launchInfo->name, "redLoadIteratorMixedINS1S_1")) {
         //     writeSM(launchInfo, 0, split_hint);

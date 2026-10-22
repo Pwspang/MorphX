@@ -1,0 +1,81 @@
+#!/bin/bash
+# Track J4 on hpcc: H200 load rows and CI recalibration for Fig 13-14.
+#   cd <repo> && qsub -v PARTS="sweep profile" scripts/sglang/j4_pd.pbs
+# Parts:
+#   sweep    run_pd_colocate_part2.py on CONFIGS x VARIANTS at RPS_SCALE
+#   profile  one MorphX run with SMSCHED_PROFILE_LOG=1 (per-kernel CI dump)
+# Env knobs: RPS_SCALE, CONFIGS (space-separated --only-config selectors),
+# VARIANTS, DURATION, SPLIT (override split hint), CI_ENV (extra MorphX env,
+# e.g. "MORPHX_CI_THRESHOLD=0.35 MORPHX_CI_SATURATE=0.35"), TAG.
+# Needs runtime/build (USE_CUDA_LLM=ON, memcpy) in this checkout and a pass-built
+# libmycutlass.so (MYCUTLASS_LIB_DIR, default ~/MorphX/microbench/build-model).
+#PBS -N morphx-j4-pd
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:30:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/MorphX/microbench/build-model}
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"sweep"}
+TAG=${TAG:-run}
+OUT=${OUT:-$HOME/morphx/runs/j4-$PBS_JOBID-$TAG}
+RPS_SCALE=${RPS_SCALE:-3}
+CONFIGS=${CONFIGS:-"Figure13:in-2048-out-256-rps-*"}
+VARIANTS=${VARIANTS:-"baseline stream chunked smsched"}
+DURATION=${DURATION:-60}
+mkdir -p "$OUT"
+echo "== host=$(hostname) job=$PBS_JOBID tag=$TAG scale=$RPS_SCALE configs=$CONFIGS variants=$VARIANTS split=${SPLIT:-row} ci_env=${CI_ENV:-default} out=$OUT"
+HOOK="NEUTRINO_HOOK_DRIVER=$PWD/runtime/build/libcuda.so LD_PRELOAD=$PWD/runtime/build/libcuda.so:$PWD/runtime/build/libpreload.so SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 ${CI_ENV:-}"
+
+run_sweep() { # <out subdir> <variants> [split]
+  local dir="$OUT/$1" ARGS=(--rps-scale "$RPS_SCALE" --model llama-3-8b --duration "$DURATION" --smsched-env "$HOOK"
+        --output-dir "$OUT/$1" --run-timeout 900 --no-update-latest-link)
+  for c in $CONFIGS; do ARGS+=(--only-config "$c"); done
+  for v in $2; do ARGS+=(--only-variant "$v"); done
+  [[ -n "${3:-}" ]] && ARGS+=(--override-split-hint "$3")
+  echo "== sweep $1: variants=$2 split=${3:-row}"
+  timeout 5000 python scripts/ae/run_pd_colocate_part2.py "${ARGS[@]}" 2>&1 | grep -E "DONE|FAILED|WARNING|ERROR"
+  for t in "$dir"/tables/*.tsv; do echo "-- $t"; cut -f1-18 "$t"; done
+  for f in "$dir"/logs/pd-online/*/*/*.err; do
+    [[ -s "$f" ]] && grep -qE "Traceback|Error" "$f" && { echo "-- $f"; grep -vE "^\[20|Warning|warn" "$f" | tail -5; }
+    grep -h "\[MorphX-profile\] summary" "$f" 2>/dev/null | sed "s|^|   $(basename $(dirname $f)): |"
+  done
+}
+
+if [[ " $PARTS " == *" sweep "* ]]; then
+  if [[ -n "${SPLITS:-}" ]]; then
+    # References once, then MorphX at each split.
+    REF_VARIANTS=$(echo " $VARIANTS " | sed 's/ smsched / /')
+    [[ -n "${REF_VARIANTS// /}" ]] && run_sweep sweep-ref "$REF_VARIANTS"
+    for s in $SPLITS; do run_sweep "sweep-split$s" smsched "$s"; done
+  else
+    run_sweep sweep "$VARIANTS" "${SPLIT:-}"
+  fi
+fi
+
+if [[ " $PARTS " == *" profile "* ]]; then
+  PROFILE_RPS=${PROFILE_RPS:-9}
+  PROFILE_IN=${PROFILE_IN:-2048}
+  PROFILE_OUT=${PROFILE_OUT:-256}
+  echo "== profile: MorphX at in-$PROFILE_IN-out-$PROFILE_OUT rps $PROFILE_RPS, split ${SPLIT:-93}, ${DURATION}s"
+  mkdir -p "$OUT/profile"
+  python - <<EOF
+import json; json.dump({"time": $DURATION, "model": "llama-3-8b", "type": "poisson", "rps": $PROFILE_RPS, "input_length": $PROFILE_IN, "output_length": $PROFILE_OUT}, open("$OUT/profile/cfg.json", "w"))
+EOF
+  env $HOOK SMSCHED_PROFILE_LOG=1 SMSCHED_SPLIT_HINT=${SPLIT:-93} VLLM_PREFILL_THREAD=1 timeout 900 \
+    python scripts/test-pd-online.py "$OUT/profile/cfg.json" > "$OUT/profile/run.log" 2> "$OUT/profile/run.err"
+  echo "rc=$?"; grep "^\[final\]" "$OUT/profile/run.log"
+  grep -E "\[MorphX-profile\] summary" "$OUT/profile/run.err"
+  echo "-- per-kernel profiles"
+  grep -E "\[MorphX-profile\] name=" "$OUT/profile/run.err" | sed -E 's/name=([^ ]{0,70})[^ ]*/name=\1/' | cut -c1-400
+fi
+echo "== done"
