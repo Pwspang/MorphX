@@ -26,9 +26,10 @@ fi
 export MORPHX_CUDA_ARCH="${MORPHX_CUDA_ARCH:-90}"
 export MORPHX_NUM_SMS="${MORPHX_NUM_SMS:-132}"  # H100 PCIe: 114
 
-# No GDRCopy on hpcc: keep scheduler control words in pinned host memory
-# (functionally correct, slower per block; see docs/h100-port-plan.md section 5).
-export MORPHX_SYNC_BACKEND="${MORPHX_SYNC_BACKEND:-hostmapped}"
+# No GDRCopy on hpcc: keep scheduler control words in device memory and move
+# them with async copies (see docs/h100-port-plan.md section 5). hostmapped also
+# works but adds ~5 us per thread block.
+export MORPHX_SYNC_BACKEND="${MORPHX_SYNC_BACKEND:-memcpy}"
 
 # Data and baselines
 export MORPHX_HF_CACHE="${MORPHX_HF_CACHE:-${HOME}/morphx/hf/hub}"

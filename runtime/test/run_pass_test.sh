@@ -19,9 +19,15 @@ for lib in /usr/lib64/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so; do
     if [[ -e "$lib" ]]; then REAL_LIBCUDA="$lib"; break; fi
 done
 [[ -n "$REAL_LIBCUDA" ]] || { echo "libcuda.so not found" >&2; exit 1; }
-g++ -std=c++20 -O3 -g -fPIC -shared -DMORPHX_SYNC_BACKEND_HOSTMAPPED \
+case "${MORPHX_SYNC_BACKEND:-hostmapped}" in
+    hostmapped) SYNC_DEF=-DMORPHX_SYNC_BACKEND_HOSTMAPPED; GDR_LIB= ;;
+    memcpy) SYNC_DEF=-DMORPHX_SYNC_BACKEND_MEMCPY; GDR_LIB= ;;
+    gdr) SYNC_DEF=; GDR_LIB=-lgdrapi ;;
+    *) echo "unknown MORPHX_SYNC_BACKEND" >&2; exit 1 ;;
+esac
+g++ -std=c++20 -O3 -g -fPIC -shared $SYNC_DEF \
     -I"$CUDA_HOME/include" -I"$REPO/include" "$REPO/runtime/src/cuda.cpp" -o "$OUT/libcuda.so" \
-    -L"$CUDA_HOME/lib64" -lcudart -ldl "$REAL_LIBCUDA"
+    -L"$CUDA_HOME/lib64" -lcudart -ldl $GDR_LIB "$REAL_LIBCUDA"
 gcc -O3 -g -fPIC -shared "$REPO/runtime/src/preload.c" -o "$OUT/libpreload.so" -ldl
 "$LLVM/bin/clang++" --cuda-path="$CUDA_HOME" --cuda-gpu-arch=sm_90 -O3 \
     -fpass-plugin="$PASS" "$REPO/runtime/test/pass_smid_test.cu" -o "$OUT/pass_smid_test" \

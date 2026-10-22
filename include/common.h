@@ -5,10 +5,15 @@
 #include <vector>
 #include <atomic>
 #include <cstring>
-// MORPHX_SYNC_BACKEND_HOSTMAPPED: keep the scheduler control words in pinned,
-// device-mapped host memory instead of GDRCopy-mapped device memory. Use it on
-// machines without the gdrdrv kernel module (no libgdrapi dependency).
-#ifndef MORPHX_SYNC_BACKEND_HOSTMAPPED
+#include <mutex>
+// Scheduler control words (GdrPool) live in one of three places:
+// - default (gdr): device memory mapped to the CPU with GDRCopy.
+// - MORPHX_SYNC_BACKEND_HOSTMAPPED: pinned, device-mapped host memory. No
+//   gdrdrv needed, but every per-block atomic crosses PCIe.
+// - MORPHX_SYNC_BACKEND_MEMCPY: device memory; the CPU reads and writes it with
+//   small async copies on a private control stream. No gdrdrv needed and the
+//   per-block protocol stays in device memory.
+#if !defined(MORPHX_SYNC_BACKEND_HOSTMAPPED) && !defined(MORPHX_SYNC_BACKEND_MEMCPY)
 #include <gdrapi.h>
 #else
 #define GPU_PAGE_SHIFT 16
@@ -65,7 +70,7 @@ struct GdrEntry {
     }
 };
 
-#ifndef MORPHX_SYNC_BACKEND_HOSTMAPPED
+#if !defined(MORPHX_SYNC_BACKEND_HOSTMAPPED) && !defined(MORPHX_SYNC_BACKEND_MEMCPY)
 class GdrPool {
 private:
     CUdeviceptr d_pool;
@@ -152,6 +157,9 @@ public:
         return ret;
     }
 
+    // Host writes are visible immediately; nothing to order before a launch.
+    inline void launch_fence(CUstream) {}
+
     ~GdrPool() {
         if(gdr_unmap(g, g_mh, (void*)h_pool, GDR_POOL_SIZE) != 0) {
             std::cerr << "Failed to unmap input GPU buffer";
@@ -172,7 +180,7 @@ public:
         }
     }
 };
-#else
+#elif defined(MORPHX_SYNC_BACKEND_HOSTMAPPED)
 class GdrPool {
 private:
     uintptr_t h_pool;
@@ -236,8 +244,161 @@ public:
         return *(volatile uint64_t*)entry.h;
     }
 
+    // Host writes are visible immediately; nothing to order before a launch.
+    inline void launch_fence(CUstream) {}
+
     ~GdrPool() {
         CHECK_CUDA_ERROR(cudaFreeHost((void*)h_pool));
+        while(!buffer.empty()) {
+            GdrEntry entry;
+            buffer.pop(entry);
+        }
+    }
+};
+#else
+// Device-memory pool driven by async copies on a private, non-blocking control
+// stream. All host writes are enqueued there in host order (last writer wins,
+// as with GDRCopy); reads copy device -> pinned slot and sync only that stream.
+// Writes that must land before a kernel starts are followed by launch_fence(),
+// which makes the launch stream wait on the control stream without a host sync
+// (MORPHX_MEMCPY_LAUNCH_SYNC=1 syncs on the host instead).
+// Only copies are used, never memset: a memset may run as a kernel, which could
+// not start while persistent agents occupy every SM.
+class GdrPool {
+private:
+    static constexpr size_t kSlots = 1 << 14;
+    CUdeviceptr d_pool;
+    uintptr_t h_pool;        // host-side shadow, only for entry index arithmetic
+    uint64_t *write_slots;   // pinned sources of in-flight H2D copies
+    uint64_t *read_slots;    // pinned targets of D2H copies
+    char *buffer_scratch;    // pinned, for get_buffer/set_buffer
+    size_t write_next = 0, read_next = 0;
+    CUcontext ctx = nullptr;
+    CUstream stream = nullptr;
+    CUevent fence_event = nullptr;
+    bool launch_sync = false;
+    std::mutex mu;
+    boost::lockfree::queue<GdrEntry> buffer{GDR_POOL_SIZE / GDR_ENTRY_SIZE};
+
+    inline void bind_context() {
+        CUcontext cur = nullptr;
+        cuCtxGetCurrent(&cur);
+        if(cur == nullptr) {
+            CHECK_CU_ERROR(cuCtxSetCurrent(ctx));
+        }
+    }
+    // Caller holds mu. A write slot is reused only after a full lap, and the
+    // stream is drained at the start of every lap.
+    inline void enqueue_write(CUdeviceptr dst, uint64_t value) {
+        if(write_next % kSlots == 0 && write_next != 0) {
+            CHECK_CU_ERROR(cuStreamSynchronize(stream));
+        }
+        uint64_t *src = &write_slots[write_next++ % kSlots];
+        *src = value;
+        CHECK_CU_ERROR(cuMemcpyHtoDAsync(dst, src, sizeof(uint64_t), stream));
+    }
+public:
+    GdrPool() {
+        void *d = nullptr;
+        CHECK_CUDA_ERROR(cudaMalloc(&d, GDR_POOL_SIZE));
+        CHECK_CUDA_ERROR(cudaMemset(d, 0, GDR_POOL_SIZE));
+        CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+        d_pool = (CUdeviceptr)d;
+        h_pool = (uintptr_t)malloc(GDR_POOL_SIZE);
+        CHECK_CUDA_ERROR(cudaHostAlloc((void**)&write_slots, kSlots * sizeof(uint64_t), cudaHostAllocPortable));
+        CHECK_CUDA_ERROR(cudaHostAlloc((void**)&read_slots, kSlots * sizeof(uint64_t), cudaHostAllocPortable));
+        CHECK_CUDA_ERROR(cudaHostAlloc((void**)&buffer_scratch, GDR_BUFFER_SIZE, cudaHostAllocPortable));
+        CHECK_CU_ERROR(cuCtxGetCurrent(&ctx));
+        int least = 0, greatest = 0;
+        CHECK_CU_ERROR(cuCtxGetStreamPriorityRange(&least, &greatest));
+        CHECK_CU_ERROR(cuStreamCreateWithPriority(&stream, CU_STREAM_NON_BLOCKING, greatest));
+        CHECK_CU_ERROR(cuEventCreate(&fence_event, CU_EVENT_DISABLE_TIMING));
+        const char *sync = getenv("MORPHX_MEMCPY_LAUNCH_SYNC");
+        launch_sync = sync && atoi(sync);
+        for(size_t i = 0; i < GDR_POOL_SIZE; i += GDR_ENTRY_SIZE) {
+            GdrEntry entry({d_pool + i, h_pool + i});
+            if(!buffer.push(entry)) {
+                std::cerr << "GDR pool initialization failed\n";
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    inline GdrEntry gdr_malloc() {
+        GdrEntry entry;
+        if(!buffer.pop(entry)) {
+            std::cerr << "GDR pool is empty\n";
+            exit(EXIT_FAILURE);
+        }
+        return entry;
+    }
+    inline void gdr_free(GdrEntry entry) {
+        if(!buffer.push(entry)) {
+            std::cerr << "GDR pool push failed\n";
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    inline void get_buffer(int bufferId, void *h_buffer) {
+        std::lock_guard<std::mutex> lock(mu);
+        bind_context();
+        CHECK_CU_ERROR(cuMemcpyDtoHAsync(buffer_scratch, d_pool + bufferId * GDR_BUFFER_SIZE, GDR_BUFFER_SIZE, stream));
+        CHECK_CU_ERROR(cuStreamSynchronize(stream));
+        memcpy(h_buffer, buffer_scratch, GDR_BUFFER_SIZE);
+    }
+    inline void set_buffer(int bufferId, void *h_buffer) {
+        std::lock_guard<std::mutex> lock(mu);
+        bind_context();
+        memcpy(buffer_scratch, h_buffer, GDR_BUFFER_SIZE);
+        CHECK_CU_ERROR(cuMemcpyHtoDAsync(d_pool + bufferId * GDR_BUFFER_SIZE, buffer_scratch, GDR_BUFFER_SIZE, stream));
+        CHECK_CU_ERROR(cuStreamSynchronize(stream));
+    }
+
+    inline int get_index(GdrEntry &entry) {
+        return ((entry.h - h_pool) % GDR_BUFFER_SIZE) / sizeof(int);
+    }
+    inline int get_bufferId(GdrEntry &entry) {
+        return (entry.h - h_pool) / GDR_BUFFER_SIZE;
+    }
+
+    // Asynchronous: lands on the device in host order after earlier writes.
+    inline void set(GdrEntry &entry, uint64_t value) {
+        std::lock_guard<std::mutex> lock(mu);
+        bind_context();
+        enqueue_write(entry.d, value);
+    }
+    // Sees every write issued before it; the lock is dropped while waiting.
+    inline uint64_t get(GdrEntry &entry) {
+        uint64_t *dst;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            bind_context();
+            dst = &read_slots[read_next++ % kSlots];
+            CHECK_CU_ERROR(cuMemcpyDtoHAsync(dst, entry.d, sizeof(uint64_t), stream));
+        }
+        CHECK_CU_ERROR(cuStreamSynchronize(stream));
+        return *(volatile uint64_t*)dst;
+    }
+    // Make work later enqueued on launchStream wait for all writes issued so far.
+    inline void launch_fence(CUstream launchStream) {
+        std::lock_guard<std::mutex> lock(mu);
+        bind_context();
+        if(launch_sync) {
+            CHECK_CU_ERROR(cuStreamSynchronize(stream));
+            return;
+        }
+        CHECK_CU_ERROR(cuEventRecord(fence_event, stream));
+        CHECK_CU_ERROR(cuStreamWaitEvent(launchStream, fence_event, 0));
+    }
+
+    ~GdrPool() {
+        cuStreamSynchronize(stream);
+        cuEventDestroy(fence_event);
+        cuStreamDestroy(stream);
+        cudaFreeHost(write_slots);
+        cudaFreeHost(read_slots);
+        cudaFreeHost(buffer_scratch);
+        cudaFree((void*)d_pool);
+        free((void*)h_pool);
         while(!buffer.empty()) {
             GdrEntry entry;
             buffer.pop(entry);

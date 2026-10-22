@@ -59,12 +59,16 @@ else()
     set(MORPHX_CCCL_INCLUDE_FLAGS "")
 endif()
 
-# Scheduler control-word backend: gdr (GDRCopy, default) or hostmapped (pinned
-# host memory, for machines without the gdrdrv kernel module).
-morphx_option(MORPHX_SYNC_BACKEND "gdr" STRING "Scheduler control-word backend: gdr or hostmapped")
-set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped)
+# Scheduler control-word backend: gdr (GDRCopy, default), hostmapped (pinned
+# host memory) or memcpy (device memory + async copies). The last two work
+# without the gdrdrv kernel module; see include/common.h.
+morphx_option(MORPHX_SYNC_BACKEND "gdr" STRING "Scheduler control-word backend: gdr, hostmapped or memcpy")
+set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped memcpy)
 if(MORPHX_SYNC_BACKEND STREQUAL "hostmapped")
     add_compile_definitions(MORPHX_SYNC_BACKEND_HOSTMAPPED)
+    set(MORPHX_GDR_LINK "")
+elseif(MORPHX_SYNC_BACKEND STREQUAL "memcpy")
+    add_compile_definitions(MORPHX_SYNC_BACKEND_MEMCPY)
     set(MORPHX_GDR_LINK "")
 elseif(MORPHX_SYNC_BACKEND STREQUAL "gdr")
     set(MORPHX_GDR_LINK "-lgdrapi")
