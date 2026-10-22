@@ -49,20 +49,26 @@ def run(args):
     # Varied prompts so a scheduling bug can't hide behind identical requests.
     gen = torch.Generator().manual_seed(1234)
     prompts = [torch.randint(10, vocab - 10, (args.input_len,), generator=gen).tolist() for _ in range(args.num_requests)]
+    order = list(range(len(prompts)))
+    if args.reverse:
+        order.reverse()
+    # isolated: one request at a time (decode batch size 1), the batching-free reference
+    groups = [[i] for i in order] if args.isolated else [order]
     t0 = time.time()
+    tokens, steps, blocked = {}, 0, 0
     with torch.cuda.stream(stream):
-        for i, ids in enumerate(prompts):
-            runner.add_request(f"r{i}", ids, max_tokens=args.output_len, min_tokens=args.output_len)
-        tokens, steps, blocked = {}, 0, 0
-        while runner.has_unfinished_requests():
-            outs = runner.step()
-            steps += 1
-            if not outs:
-                outs = runner.get_prefill_result(isBlock=True)
-                blocked += 1
-            for ro in outs:
-                if ro.finished:
-                    tokens[ro.request_id] = list(ro.outputs[0].token_ids)
+        for group in groups:
+            for i in group:
+                runner.add_request(f"r{i}", prompts[i], max_tokens=args.output_len, min_tokens=args.output_len)
+            while runner.has_unfinished_requests():
+                outs = runner.step()
+                steps += 1
+                if not outs:
+                    outs = runner.get_prefill_result(isBlock=True)
+                    blocked += 1
+                for ro in outs:
+                    if ro.finished:
+                        tokens[ro.request_id] = list(ro.outputs[0].token_ids)
         runner.shutdown()
     wall = time.time() - t0
     free_after = runner.model_runner.token_to_kv_pool_allocator.available_size()
@@ -71,8 +77,9 @@ def run(args):
           f"kv_free {free_before}->{free_after} reserved={runner.reserved_tokens}", flush=True)
     ok = len(tokens) == args.num_requests and free_after == free_before and runner.reserved_tokens == 0
     ok = ok and all(len(t) == args.output_len for t in tokens.values())
+    label = args.mode + ("-isolated" if args.isolated else "") + ("-reverse" if args.reverse else "")
     with open(args.out, "w") as f:
-        json.dump({"mode": args.mode, "tokens": tokens, "wall": wall}, f)
+        json.dump({"mode": label, "tokens": tokens, "wall": wall}, f)
     print(f"[{args.mode}] bookkeeping {'OK' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 
@@ -109,6 +116,8 @@ def main():
     p.add_argument("--output-len", type=int, default=32)
     p.add_argument("--chunk-budget", type=int, default=600)
     p.add_argument("--warmup", action="store_true")
+    p.add_argument("--reverse", action="store_true", help="submit the requests in reverse order")
+    p.add_argument("--isolated", action="store_true", help="run the requests one at a time")
     p.add_argument("--compare", nargs="+")
     args = p.parse_args()
     if args.compare:

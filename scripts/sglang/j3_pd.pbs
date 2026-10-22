@@ -36,7 +36,14 @@ if [[ " $PARTS " == *" check "* ]]; then
     timeout 600 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode $mode --warmup --out "$OUT/check-$mode.json" 2>&1 \
       | grep -E "^\[|Error|error|Traceback" | grep -v "^\[20" | tail -5
   done
-  python scripts/sglang/check_pd_modes.py --compare "$OUT/check-serial.json" "$OUT/check-thread.json" "$OUT/check-chunked.json"
+  # Batching-free reference and a different batch composition of the same mode, to
+  # tell scheduling bugs apart from fp16 batch-shape numerics.
+  timeout 600 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode serial --isolated --warmup \
+    --out "$OUT/check-isolated.json" 2>&1 | grep -E "^\[(serial|thread|chunked)" | tail -2
+  timeout 600 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode serial --reverse --warmup \
+    --out "$OUT/check-serial-reverse.json" 2>&1 | grep -E "^\[(serial|thread|chunked)" | tail -2
+  python scripts/sglang/check_pd_modes.py --compare "$OUT/check-serial.json" "$OUT/check-thread.json" "$OUT/check-chunked.json" "$OUT/check-serial-reverse.json"
+  python scripts/sglang/check_pd_modes.py --compare "$OUT/check-isolated.json" "$OUT/check-serial.json" "$OUT/check-thread.json" "$OUT/check-chunked.json" "$OUT/check-serial-reverse.json"
   echo "== check thread under the MorphX runtime (cuda-llm, split 93)"
   env $HOOK SMSCHED_SPLIT_HINT=93 timeout 900 python scripts/sglang/check_pd_modes.py --model "$MODEL" --mode thread --warmup \
     --out "$OUT/check-thread-morphx.json" 2>&1 | grep -E "^\[|Error|error|Traceback" | grep -v "^\[20" | tail -5
@@ -75,5 +82,7 @@ EOF
   echo "-- writeSM ranges per stream x CI"
   grep -oE "\[J3-dbg\] writeSM stream=0x[0-9a-f]+ range=\[[0-9]+,[0-9]+\) ci=[01]" "$OUT/debug/run.err" | sort | uniq -c | sort -rn | head -20
   grep -E "\[J3-dbg\] writeSM" "$OUT/debug/run.err" | head -5
+  echo "-- per-kernel profiles (CI >= 0.9 -> prefill-style SM limit)"
+  grep -E "\[J3-dbg\] profile" "$OUT/debug/run.err" | cut -c1-330
 fi
 echo "== done"
