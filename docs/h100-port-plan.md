@@ -1,8 +1,17 @@
 # MorphX H100 Port Plan
 
 Goal: run the MorphX artifact (`./run.sh`) on an NVIDIA H100 instead of the
-original A100 (sm_80, 108 SMs) evaluation machine, then add SGLang as a second
-LLM backend (section 9).
+original A100 (sm_80, 108 SMs) evaluation machine, **with SGLang as the LLM
+engine** instead of the authors' unpublished vLLM fork (section 9).
+
+**Decision (2026-10-22): SGLang-first.** The authors' modified vLLM
+(`0.1.dev24+g232ce74.d20251027`, built from `/home/rtx/gpu/vllm`) is not
+public: commit `232ce74` is not in upstream vLLM, and `VLLM_PREFILL_THREAD`
+appears only in MorphX's own scripts. Its PD prefill thread has to be
+re-implemented whichever engine we use. SGLang (PyTorch 2.9.1 + CUDA 13.0,
+FlashInfer 0.6.8) also avoids forcing PyTorch 2.6 / old vLLM onto CUDA 13.
+Go/no-go: the SGLang spike (§9 step 1). Fallback: stock vLLM with the V0
+engine + CUDA 12.8 + our own prefill thread (§6.5).
 
 Branch: `h100-port` on `Pwspang/MorphX`.
 
@@ -17,42 +26,42 @@ set of files, so merges don't conflict.
 
 | Track | Work (sections) | Owns these files | Needs a GPU? | Blocked by |
 |---|---|---|---|---|
-| **X. External requests** | Ask the authors for the vLLM fork (commit `232ce74` + diff); ask hpcc support about GDRCopy; request Llama-2/Llama-3 access on HuggingFace | none | no | nothing, **start day 1** |
+| **X. External requests** | Request Llama-2/Llama-3 access on HuggingFace; ask hpcc support about GDRCopy; optional: ask the authors for their vLLM fork (only useful as a reference for the prefill thread) | none | no | nothing, **start day 1** |
 | **A. Script config** | §1 paths/env vars in Python + shell, §2 `TORCH_CUDA_ARCH_LIST`, §3 SM-count lists and split hints, PBS template (§8) | `run.sh`, `scripts/ae/*.py,*.sh`, `scripts/colocate/`, `scripts/overhead/`, `scripts/test-pd-online.py`, `scripts/ae/env-h100.sh`, `scripts/ae/morphx-hpcc.pbs` | no | nothing |
 | **B. Build config** | §1 CMake paths, §2 sm_90, CUDA 13 version macros, CCCL from the toolkit | `microbench/CMakeLists.txt`, `ggnn/CMakeLists.txt`, `runtime/CMakeLists.txt`, `smsched-pass/CMakeLists.txt`, `TGS/hijack/` | compile-only (login node) | nothing |
 | **C. Runtime on CUDA 13** | §6.1 regenerate `unmodified.c` with `parse.py`, fix `cuGetProcAddress` hooks; §3 runtime SM counts (`base.cpp`, `stub_raw.cpp`); §5 option C `memcpy` backend (later) | `runtime/src/`, `include/common.h` | short GPU tests | nothing (hostmapped backend already done) |
 | **D. LLVM + pass** | §6.2–6.3 build clang/libc++ with NVPTX for CUDA 13; build `smsched-pass` | `$HOME/morphx/llvm` on hpcc; `smsched-pass/` only if the pass needs a newer-LLVM fix | no (long CPU build) | nothing |
 | **E. Models and data** | §6.8 download models + ShareGPT into `MORPHX_HF_CACHE` | data dir on hpcc | no | X (Llama access) |
 | **F. Baselines** | §6.7 NVBit `mem_trace` for sm_90, TGS socket path, `neutrino`, `nanoflow` env | `nvbit-tutorial/tools/`, `TGS/` (coordinate with B) | short GPU tests | nothing |
-| **G. Python stack (vLLM)** | §6.5 PyTorch + FlashInfer + vLLM fork with the pass, sm_90, CUDA 13 | conda env `smsched` on hpcc | build: no; check: short GPU | D; X (vLLM fork) |
-| **H. SGLang spike** | §9 step 1: `sgl-kernel` + FlashInfer with the pass, one request through `ModelRunner` | separate conda env `smsched-sglang` | short GPU | D (does **not** need G) |
-| **I. Integration and runs** | §7 bring-up order, §8 jobs D–F, split-hint re-tuning, full run | none (merges A–C) | yes, long | A, B, C, D, then G for Fig 10–15 |
+| **G. Python stack (SGLang)** | §9 step 1: PyTorch 2.9.1 + FlashInfer 0.6.8 + `sgl-kernel` built with clang + the pass for sm_90 on CUDA 13 | conda env `smsched` on hpcc | build: no; check: short GPU | D |
+| **H. SGLang spike (go/no-go)** | §9 step 1: one request through `ModelRunner` in-process with the runtime preloaded; measure the share of GPU time in pass-built kernels and whether split hints restrict SMs | `scripts/sglang/` (new) | short GPU | G (a first look is possible with stock wheels before G finishes) |
+| **J. SGLang drivers** | §9 steps 2–6: `LLMBackend` interface, Fig 15 → Fig 10–12 → Fig 13–14 (prefill thread), per-backend kernel patterns | `scripts/colocate/`, `scripts/overhead/`, `scripts/test-pd-online.py`, `scripts/sglang/`, `runtime/src/cuda-llm.cpp` patterns | short GPU per step | H = go; driver code (`LLMBackend`, `ModelRunner` loop) can start before |
+| **I. Integration and runs** | §7 bring-up order, §8 jobs D–F, split-hint re-tuning, full run | none (merges A–C, J) | yes, long | A, B, C, D, then G + J for Fig 10–15 |
 
 ### Dependency graph
 
 ```text
-  X (external) ───────────────┬──────────────┐
-                              │              │
-  A (script config) ─────┐    ▼              ▼
-  B (build config) ──────┤   E (models)     G (PyTorch/vLLM) ──┐
-  C (runtime CUDA 13) ───┤                   ▲                 │
-  D (LLVM + pass) ───────┼───────────────────┘                 │
-                         │                                     ▼
-                         ├──► I1: Fig 16 (Part 4) ──► I2: Fig 15 ──► I3: Fig 10–14 ──► full run
-  F (baselines) ─────────┘                                     ▲
-                                                               │
-  D ──► H (SGLang spike) ──► §9 steps 2–6 (after I3) ──────────┘ (optional)
+  X (external) ──► E (models)
+  A (script config) ─────┐
+  B (build config) ──────┤
+  C (runtime CUDA 13) ───┤
+  D (LLVM + pass) ───────┼──► I1: Fig 16 (Part 4)
+  F (baselines) ─────────┘
+  D ──► G (PyTorch/FlashInfer/sgl-kernel + pass) ──► H (spike: GO / NO-GO)
+                                                       │GO            │NO-GO
+                                                       ▼              ▼
+  J0 (LLMBackend, ModelRunner loop; no GPU) ──► J: Fig 15 ──► Fig 10–12 ──► Fig 13–14 ──► full run
+                                                              fallback: stock vLLM V0 + CUDA 12.8 (§6.5)
 ```
 
-- **Day 1, all at once:** X, A, B, C, D, F. None of them depend on each other.
+- **Day 1, all at once:** X, A, B, C, D, F (A, B, C done and merged).
 - **First milestone (I1, Fig 16):** needs A + B + C + D only, not the Python
   stack, so it can be reached while G is still building.
-- **Critical path:** D (LLVM) → G (PyTorch 2.6 / vLLM fork on CUDA 13; also
-  waits for X to get the fork) → I3. Most of the calendar time is here, so
-  start D and X first. If G stalls on CUDA 13, its fallback (CUDA 12.8 from
-  conda, §6) doesn't change any other track.
-- **H runs alongside G.** Both only need D. H's result helps decide whether
-  to continue with vLLM or switch to SGLang-first (§9).
+- **Critical path:** D (LLVM) → G (pass-built PyTorch/FlashInfer/sgl-kernel)
+  → H (go/no-go) → J (Fig 10–12, then the prefill thread for Fig 13–14).
+- **J0 runs alongside G:** the `LLMBackend` interface and the in-process
+  `ModelRunner` batching loop can be written and tested with stock SGLang
+  wheels (no pass, no MorphX control) before G is done.
 
 ### Sharing hpcc
 
@@ -62,15 +71,15 @@ CPU work somewhere else:
 
 | Work | Queue | Limits | Notes |
 |---|---|---|---|
-| LLVM, PyTorch, vLLM, FlashInfer, `sgl-kernel` builds (D, G, H) | `gpu_datamover` | 4 CPUs, no GPU, ≤ 120 h, **2 concurrent jobs** per user | Slow but doesn't block the GPU queue; D and G (or D and H) can build at the same time. If it's too slow, use a 6 h `gpu_free` job with `ncpus=48` (blocks GPU tests meanwhile); use `ccache` so a build cut off at the time limit picks up where it stopped. Access to this queue not yet tested |
-| Model and dataset downloads (E) | `gpu_datamover` | as above | Shares the 2-job limit with builds; run it while only one build is active |
+| LLVM, PyTorch, FlashInfer, `sgl-kernel` builds (D, G) | `gpu_free`, `ncpus=48`, build on node-local `/tmp` | ≤ 6 h, blocks GPU tests meanwhile | **`gpu_datamover` is not usable from this account** (jobs held after 21 failed starts, exit −10). Use `ccache` so a build cut off at the time limit picks up where it stopped |
+| Model and dataset downloads (E) | login node, `nohup` | network-bound | Done this way for the non-gated models |
 | Compile-only checks (B, C) | login node | short, light jobs only | Like the `unmodified.c` check already done |
 | GPU tests (C, F, G, H) and runs (I) | `gpu_free` | 1 GPU job at a time, ≤ 6 h | Chain jobs with `qsub -W depend=afterany:...`; combine small tests from several tracks into one job |
 
 ### Merging
 
-- Each track works on `h100-port/<track>` (e.g. `h100-port/a-script-config`)
-  and opens a PR into `h100-port`.
+- Each track works on `h100-port-<track>` (e.g. `h100-port-a-script-config`;
+  git can't create `h100-port/...` while `h100-port` exists) and merges into `h100-port`.
 - Merge order: A, B, C as soon as they're ready (they only add config and
   defaults to the A100 values, so nothing else breaks); D/G/H produce
   environments, not code, so they write their build steps into
@@ -297,9 +306,17 @@ reports CUDA 13.0, so 13.1 is not supported by that driver yet).
 3. [ ] Build `smsched-pass` against it:
        `cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR=$MORPHX_LLVM_ROOT/lib/cmake/llvm`.
 4. [ ] Build `runtime/` (both the `cuda.cpp` and `cuda-llm.cpp` variants).
-5. [ ] Create the `smsched` conda env (Python 3.10 to match `ggnn/CMakeLists.txt`).
-       Rebuild **PyTorch, vLLM, FlashInfer** from source with
-       `TORCH_CUDA_ARCH_LIST=9.0`, compiled with the patched clang and pass.
+5. [ ] Create the `smsched` conda env and rebuild the Python stack from source
+       with `TORCH_CUDA_ARCH_LIST=9.0`, compiled with the patched clang and pass.
+       **Primary (SGLang-first, §9):** PyTorch 2.9.1, FlashInfer 0.6.8.post1
+       (AOT, no `flashinfer_cubin`), `sgl-kernel` and SGLang matching
+       `~/sglang-main`, on CUDA 13.0. Python 3.12 matches the cluster's
+       `python/3.12.13`; GGNN finds Python from the active env (Track B).
+       **Fallback if the SGLang spike says no-go:** stock vLLM with the V0
+       engine (the scripts force `VLLM_USE_V1=0` and drive `LLMEngine.step()`;
+       roughly the 0.8.x series, which pairs with PyTorch 2.6) on a CUDA 12.8
+       toolkit from conda, plus our own prefill thread for Fig 13–14. The
+       notes below describe the original vLLM stack and apply to that fallback.
        - **Biggest risk with CUDA 13:** the original env uses
          `torch==2.6.0a0`, `flashinfer-python==0.2.2.post1` and a **forked vLLM**
          (`0.1.dev24+g232ce74`, built from `/home/rtx/gpu/vllm`). PyTorch 2.6
@@ -308,8 +325,8 @@ reports CUDA 13.0, so 13.1 is not supported by that driver yet).
          (a) upgrade to PyTorch ≥ 2.9 + matching vLLM/FlashInfer and re-apply
          the MorphX vLLM changes (e.g. `VLLM_PREFILL_THREAD`), or
          (b) backport CUDA 13 build fixes to torch 2.6.
-       - **The forked vLLM source is not in this repo.** Ask the authors for
-         the fork (commit `232ce74` + local diff) before starting this step.
+       - **The forked vLLM source is not public** (commit `232ce74` is not in
+         upstream vLLM). This is why the plan moved to SGLang-first.
        - Fallback if CUDA 13 blocks the stack: driver 580 also runs CUDA 12.x
          toolkits (e.g. `conda install -c nvidia cuda-toolkit=12.8`), keeping
          the original versions.
@@ -363,7 +380,7 @@ tested there unchanged, so use it for bring-up before the H100 runs.
 
 - **CUDA version.** We target the cluster's `cuda/13.0` module (driver
   580.126.20 = CUDA 13.0; don't use `cuda/13.1`). See section 6 for the CUDA 13
-  porting items, especially the PyTorch 2.6 / forked-vLLM problem.
+  porting items. The SGLang stack (§9) targets CUDA 13 natively.
 - **GDRCopy.** Confirmed missing on the compute node. Use the
   `hostmapped`/`memcpy` backend from section 5, or ask HPC support to install it.
 - **MPS.** Confirmed working (job 91099): a user-level daemon with
@@ -384,7 +401,7 @@ Run them in order; each one must pass before the next.
 | A. `probe` ✅ | 0:30 | `nvidia-smi`, driver/CUDA version, `ls /dev/gdrdrv`, `lsmod \| grep gdrdrv`, try a user-level MPS daemon, run the `%smid` probe (section 4) | **Done, job 91099 on `hpc-gaas-g25`:** H200, 132 SMs, driver 580.126.20 / CUDA 13.0, nvcc 13.0.48; gdrdrv missing; MPS works; smid 0..131 with no gaps |
 | A2. `probe-hostmapped` ✅ | 0:20 | `scripts/ae/sync_backend_test.cu` (section 5) | **Done, job 91113:** all correctness checks pass; +4.7 µs/block serialized overhead |
 | B. `build-llvm` | 6:00 (`ncpus=48`) | Build LLVM/clang + libc++ with NVPTX into `$HOME/morphx/llvm` | `clang++ --cuda-gpu-arch=sm_90` compiles a test `.cu` |
-| C. `build-stack` | 6:00, chained with `resume` | Build PyTorch, vLLM, FlashInfer with the pass for `TORCH_CUDA_ARCH_LIST=9.0` | `import torch, vllm, flashinfer` works; a tiny model generates text |
+| C. `build-stack` | 6:00, chained with `resume` | Build PyTorch 2.9.1, FlashInfer 0.6.8 (AOT) and `sgl-kernel` with the pass for `TORCH_CUDA_ARCH_LIST=9.0` (§9 step 1) | `import torch, flashinfer, sglang` works; Qwen3-4B generates text through `ModelRunner` |
 | D. `smoke-part4` | 1:00 | Build pass + runtime + microbench; Part 4 only (Fig 16) | Fig 16 table produced |
 | E. `smoke` | 2:00 | `./run.sh smoke` | All four parts' smoke points finish with `status=ok` |
 | F. `short` | 6:00 ×N | `./run.sh short`, then `./run.sh resume` in chained jobs | Fig 10/12(a), 13(a), 15, 16 produced |
@@ -455,20 +472,23 @@ cd ~/MorphX && git checkout h100-port
 qsub -v MODE=probe scripts/ae/morphx-hpcc.pbs
 ```
 
-## 9. SGLang backend (phase 2, after the vLLM port works)
+## 9. SGLang backend (primary LLM engine)
 
-Order agreed: finish the H100 port on the original vLLM stack first, to get a
-baseline that matches the paper. Then add SGLang as a **second backend**
-selected with `MORPHX_LLM_BACKEND=vllm|sglang`. Keep vLLM as the default.
-Estimated extra effort: **3–6 weeks**.
+**SGLang-first** (decision 2026-10-22, see top of this document). SGLang
+replaces the authors' vLLM fork as the LLM engine. The vLLM code paths stay in
+the scripts (selected with `MORPHX_LLM_BACKEND=vllm|sglang`, default `sglang`
+on the H100/H200 setup) so the fallback in §6.5 remains possible.
+Target versions: as in `~/sglang-main` on hpcc: PyTorch 2.9.1 (CUDA 13.0
+wheels), FlashInfer 0.6.8.post1, matching `sgl-kernel`.
+Estimated effort: **3–6 weeks** after the spike.
 
 ### Why it isn't a drop-in swap
 
 | # | Issue | Where in the repo | What has to change |
 |---|---|---|---|
 | 1 | **Process model.** The MorphX runtime splits SMs between the CUDA streams of *one process*. The co-location driver runs vLLM in-process (`LLMEngine`, eager) in one thread and GGNN/GEMM in another. SGLang's `Engine` always runs the model in a separate scheduler subprocess, so the LLM and the co-located task would end up in different processes | `scripts/colocate/run.py:300-312`, thread workers in the same file | Drive SGLang's `ModelRunner` directly in-process (as `bench_one_batch` does) with a small batching loop, **or** run the co-located task inside the scheduler process. Prefer `ModelRunner` |
-| 2 | **PD co-location depends on the vLLM fork.** Fig 13–14 use `VLLM_PREFILL_THREAD`: prefill and decode on separate streams in one process. SGLang's PD disaggregation is multi-process/multi-GPU | `scripts/ae/run_pd_colocate_part2.py:639-650`, `scripts/test-pd-online.py` | Add a prefill thread with its own CUDA stream to the SGLang scheduler (or to the `ModelRunner` loop from #1). Needs the vLLM fork's diff as a reference (not in this repo, see section 6) |
-| 3 | **Kernels must be built with the MorphX pass.** Only pass-built kernels can be resized. SGLang uses `sgl-kernel` (CUTLASS 3.x / FA3, built with nvcc), many **Triton** kernels and JIT kernels (DeepGEMM). The LLVM pass does not touch Triton or JIT kernels, so those run without MorphX control | build stack (section 6) | Build `sgl-kernel` with clang + the pass for sm_90; use `--attention-backend flashinfer` (reuses the pass-built FlashInfer); use dense models so GEMMs go through PyTorch like in vLLM; disable Triton/DeepGEMM paths where SGLang allows it; list which kernels are left unpatched |
+| 2 | **PD co-location depends on the vLLM fork.** Fig 13–14 use `VLLM_PREFILL_THREAD`: prefill and decode on separate streams in one process. SGLang's PD disaggregation is multi-process/multi-GPU | `scripts/ae/run_pd_colocate_part2.py:639-650`, `scripts/test-pd-online.py` | Add a prefill thread with its own CUDA stream to the `ModelRunner` loop from #1 (separate prefill and decode batches, shared KV cache pool, one lock around the KV allocator). The fork's source is not public, so this is designed from scratch |
+| 3 | **Kernels must be built with the MorphX pass.** Only pass-built kernels can be resized. SGLang uses `sgl-kernel` (CUTLASS 3.x / FA3, built with nvcc), many **Triton** kernels and JIT kernels (DeepGEMM). FlashInfer 0.6 ships **precompiled cubins** (`flashinfer_cubin`) and **JIT-compiles** the rest at run time. The LLVM pass touches none of these, so they'd run without MorphX control | build stack (section 6) | Build `sgl-kernel` with clang + the pass for sm_90; build FlashInfer **AOT** with clang + the pass (no `flashinfer_cubin`, JIT disabled), or point its JIT compiler at clang + the pass; use `--attention-backend flashinfer`; use dense models so GEMMs go through PyTorch like in vLLM; disable Triton/DeepGEMM paths where SGLang allows it; list which kernels are left unpatched |
 | 4 | **Runtime matches kernels by name.** `cuda-llm.cpp` decides how to split SMs from vLLM/FlashInfer kernel names (`BatchPrefillWithPagedKVCacheKernel`, `BatchDecode…`, `cutlassL6Kernel`, mangled CUTLASS names) | `runtime/src/cuda-llm.cpp:643-655, 1021-1031` | Profile SGLang with `SMSCHED_DEBUG=1` / nsys, then move the patterns into a per-backend list (e.g. `SMSCHED_TARGET_PATTERNS` default per backend) instead of hardcoded strings |
 | 5 | **CUDA graphs.** SGLang captures decode in CUDA graphs by default. Graph replay skips `cuLaunchKernel` interception | engine launch args | Always pass `--disable-cuda-graph` (the equivalent of vLLM's `enforce_eager=True`); also disable the overlap scheduler at first |
 | 6 | **Experiment drivers use the vLLM API.** `EngineArgs`/`LLMEngine.step()`, `SamplingParams`, `TokensPrompt`, `RequestOutput` metrics (`time_in_queue`, TTFT/TBT) | `scripts/colocate/run.py` (1255 lines), `scripts/test-pd-online.py`, `scripts/overhead/single_request.py` | Put a thin `LLMBackend` interface in front (`init`, `add_request`, `step`, `collect_metrics`), with `vllm` and `sglang` implementations; keep the Poisson arrival and timing code shared |
@@ -486,12 +506,21 @@ Estimated extra effort: **3–6 weeks**.
 
 ### Steps
 
-1. [ ] **Spike on hpcc (about 1 day):** build `sgl-kernel` + FlashInfer with
-       clang + the pass for sm_90 on CUDA 13.0; run one request through
+1. [ ] **Spike on hpcc = go/no-go (about 1–2 days once LLVM is built):**
+       build PyTorch 2.9.1, FlashInfer 0.6.8 (AOT) and `sgl-kernel` with
+       clang + the pass for sm_90 on CUDA 13.0; load Qwen3-4B through
        `ModelRunner` in-process with the MorphX runtime preloaded
        (`MORPHX_SYNC_BACKEND=hostmapped`, `--disable-cuda-graph`,
-       `--attention-backend flashinfer`). Record which kernels are
-       intercepted and patched, and which aren't (Triton/JIT/cuBLAS).
+       `--attention-backend flashinfer`).
+       - Measure: share of GPU time (nsys) in pass-built (`_pk`) kernels vs
+         Triton / JIT / cuBLAS / precompiled kernels, per prefill and decode step.
+       - Check: with `SMSCHED_SPLIT_HINT` set, patched kernels only run on
+         the allowed SMs (`smid_probe`-style check via `SMSCHED_DEBUG`).
+       - **GO** if the main GEMM and attention kernels are controlled (rule of
+         thumb: ≥ 70% of GPU time in controlled kernels). **NO-GO** → stock
+         vLLM fallback (§6.5).
+       - Early look before the pass-built stack exists: stock SGLang wheels +
+         runtime hook to list kernel names and the time split.
 2. [ ] Add the `LLMBackend` interface; port `single_request.py` → Fig 15 with SGLang.
 3. [ ] Profile kernel names, make the `cuda-llm.cpp` patterns configurable per backend.
 4. [ ] In-process co-location driver on `ModelRunner` → Fig 10–12 with SGLang.
@@ -502,9 +531,8 @@ Estimated extra effort: **3–6 weeks**.
 ### Expected outcome
 
 - A recent SGLang release supports CUDA 13 and Hopper. This avoids
-  forward-porting PyTorch 2.6 and the old vLLM fork, which is the biggest
-  risk in section 6. If getting the vLLM fork turns out to be blocked, consider
-  going SGLang-first instead.
+  forward-porting PyTorch 2.6 and the old vLLM fork, which was the biggest
+  risk in section 6.
 - SGLang results are **not directly comparable** to the paper's vLLM numbers.
   Compare MorphX against the baselines (stream / MPS / chunked prefill) within
   SGLang.
