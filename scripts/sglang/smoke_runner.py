@@ -27,13 +27,20 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backend as llm_backend  # noqa: E402
 
-GROUPS = ("FlashInfer", "sgl-kernel", "Triton", "cuBLAS/cuBLASLt", "PyTorch native", "other")
+GROUPS = ("mycutlass (CUTLASS)", "FlashInfer", "sgl-kernel", "Triton", "cuBLAS/cuBLASLt", "PyTorch native", "other")
+
+
+def _is_cutlass2(name):
+    # libmycutlass kernels have internal linkage; CUPTI reports them mangled (_ZN7cutlassL6KernelI...)
+    return "cutlass::Kernel<" in name or name.startswith("_ZN7cutlass")
 
 
 def classify(op_name, kernel_name):
     op = op_name or ""
     k = kernel_name or ""
     lk = k.lower()
+    if _is_cutlass2(k):
+        return "mycutlass (CUTLASS)"
     if "at::native" in k or "at_cuda_detail" in k:
         return "PyTorch native"
     # sgl-kernel torch ops, plus sglang's own jit_kernel (tvm-ffi, nvcc at run time; anonymous namespace)
@@ -134,6 +141,8 @@ def build_origin(name):
     lk = name.lower()
     if "nvjet" in lk or "cublas" in lk:
         return "cuBLAS/cuBLASLt (closed source)"
+    if _is_cutlass2(name):
+        return "CUTLASS 2.x from source (libmycutlass, pass-built)"
     if name.startswith("kernel_cutlass_kernel"):
         return "CuTe DSL (Python -> MLIR JIT)"
     if "(" not in name and "::" not in name and not name.startswith("void"):
@@ -199,6 +208,8 @@ def main():
     ap.add_argument("--census-batch", type=int, default=8)
     ap.add_argument("--census-decode-steps", type=int, default=16)
     ap.add_argument("--census-out", default="")
+    ap.add_argument("--gemm", default=os.environ.get("MORPHX_LLM_GEMM", "torch"), choices=("torch", "mycutlass"))
+    ap.add_argument("--dtype", default="auto", help="model dtype (mycutlass needs float16; use float16 for torch too to compare)")
     ap.add_argument("--in-thread", action="store_true", help="run everything in a non-main thread (as colocate/run.py does)")
     args = ap.parse_args()
 
@@ -227,9 +238,12 @@ def _main(args):
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.mem_fraction,
         stream=stream,
+        gemm=args.gemm,
+        dtype=args.dtype,
     )
     runner = engine.runner
-    print(f"[smoke] engine ready in {time.time() - t0:.1f}s; kv_capacity={runner.kv_capacity} tokens", flush=True)
+    print(f"[smoke] engine ready in {time.time() - t0:.1f}s; kv_capacity={runner.kv_capacity} tokens "
+          f"gemm={runner.gemm} dtype={runner.model_config.dtype}", flush=True)
 
     # warmup: one request end to end
     engine.add_request("warmup", engine_backend.make_prompt([1] * args.input_len), engine_backend.make_sampling_params(8, 8))
@@ -339,6 +353,10 @@ def _main(args):
         print(f"[census] written to {args.census_out}", flush=True)
     else:
         print("\n".join(lines))
+    if runner.gemm == "mycutlass":
+        import mycutlass_gemm
+
+        print(f"[smoke] mycutlass GEMM calls/fallbacks: {mycutlass_gemm.stats()}", flush=True)
     print("SMOKE: " + ("PASS" if ok and stream_ok else "FAIL"), flush=True)
     return 0 if ok and stream_ok else 1
 
