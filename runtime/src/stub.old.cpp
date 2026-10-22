@@ -917,12 +917,12 @@ void register_name_with_arg_num(char *name, int arg_num) {
     // func_arg_num[std::string(name)] = arg_num;
 }
 
-void fix_SM(cudaStream_t stream, int minSM, int maxSM) {
+extern "C" void fix_SM(cudaStream_t stream, int minSM, int maxSM) {
     gFixSM[stream] = std::make_pair(minSM, maxSM);
     printf("fix SM for stream %p: %d %d\n", stream, minSM, maxSM);
 }
 
-void suggest_SM(cudaStream_t stream, int minSM, int maxSM) {
+extern "C" void suggest_SM(cudaStream_t stream, int minSM, int maxSM) {
     gSuggestSM[stream] = std::make_pair(minSM, maxSM);
     printf("suggest SM for stream %p: %d %d\n", stream, minSM, maxSM);
 }

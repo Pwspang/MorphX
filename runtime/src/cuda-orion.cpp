@@ -617,12 +617,12 @@ void runtimeInit() {
     isInitialized = true;
 }
 
-void fix_SM(CUstream stream, int minSM, int maxSM) {
+extern "C" void fix_SM(CUstream stream, int minSM, int maxSM) {
     gFixSM[stream] = std::make_pair(minSM, maxSM);
     printf("fix SM for stream %p: %d %d\n", stream, minSM, maxSM);
 }
 
-void suggest_SM(CUstream stream, int minSM, int maxSM) {
+extern "C" void suggest_SM(CUstream stream, int minSM, int maxSM) {
     gSuggestSM[stream] = std::make_pair(minSM, maxSM);
     printf("suggest SM for stream %p: %d %d\n", stream, minSM, maxSM);
 }
