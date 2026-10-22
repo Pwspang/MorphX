@@ -193,8 +193,13 @@ enum KernelType {
     COMPUTE_INTENSIVE = 1
 };
 
+// Kernel classification from the profile's CI (t0 / tm, see generateProfileResult).
+// Defaults are the A100 values; MORPHX_CI_THRESHOLD / MORPHX_CI_SATURATE retune them.
+float ci_threshold = 0.9f;
+float ci_saturate = 0.75f;
+
 KernelType getKernelType(float CI) {
-    if(CI >= 0.9) return COMPUTE_INTENSIVE;
+    if(CI >= ci_threshold) return COMPUTE_INTENSIVE;
     return MEMORY_INTENSIVE;
 }
 
@@ -222,6 +227,9 @@ std::unordered_map<CUfunction, CUmodule> gFuncModuleMap;
 std::unordered_map<CUkernel, bool> gKernelSet;
 
 int with_profile;
+int profile_log;
+std::atomic<long> gCILimitedLaunches{0};  // CI kernels limited to [0, split) at launch
+std::atomic<long> gSplitMoves{0};         // co-runners moved to [split, nrSM) by schedule_2
 int split_hint;
 int llm_trick_mode;
 int llm_trace_limit;
@@ -348,8 +356,20 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
         tm = tm / profileResult[0].first * getNrSM();
     }
     float CI = t0 / tm;
-    if(CI >= 0.75) CI = 1;
+    float rawCI = CI;
+    if(CI >= ci_saturate) CI = 1;
     gCI[info->name].store(CI);
+    if(profile_log) {
+        std::string waves;
+        for(auto &w : profileResult) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%s%d:%.1f", waves.empty() ? "" : ",", w.first, w.second / 1000.0);
+            waves += buf;
+        }
+        fprintf(stderr, "[MorphX-profile] name=%.120s grid=%d occup=%d waves=%s tm=%.1fus t0=%.1fus ci_raw=%.3f ci=%.3f ci_kernel=%d\n",
+            info->name, info->gridSize, info->occup, waves.c_str(), tm / 1000.0, t0 / 1000.0, rawCI, CI,
+            CI >= ci_threshold);
+    }
     // printf("[smsched] kernel %s: CI: %lf, WaveTime: %lfus\n", info->name, CI, tm / 1000.0);
     // for(int i = 0; i < profileResult.size(); ++i) {
     //     printf("[smsched] AvgWave %d: %d, %lfus\n", i, profileResult[i].first, profileResult[i].second / 1000.0);
@@ -405,7 +425,7 @@ void profileThread(KernelInfo *launchInfo, std::vector<int> &profileWaves) {
 
 bool isCI(KernelInfo *info) {
     float CI = gCI[info->name].load();
-    if(CI >= 0.9) return true;
+    if(CI >= ci_threshold) return true;
     return false;
 }
 
@@ -501,10 +521,12 @@ void schedule_2(KernelInfo *kernels[], KernelInfo *nexts[], int nStreams, int nr
                 if(j != i && kernels[j] && !kernels[j]->isScheduled) {
                     writeSM(kernels[j], split_hint, nrSM);
                     kernels[j]->isScheduled = 1;
+                    gSplitMoves.fetch_add(1, std::memory_order_relaxed);
                 }
                 if(j != i && nexts[j] && !nexts[j]->isScheduled) {
                     writeSM(nexts[j], split_hint, nrSM);
                     nexts[j]->isScheduled = 1;
+                    gSplitMoves.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -605,6 +627,10 @@ bool isInitialized = false;
 // Ensure the background agent thread is properly joined before process exit
 static void runtimeShutdown() {
     if(!isInitialized) return;
+    if(profile_log) {
+        fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d ci_limited_launches=%ld split_moves=%ld\n",
+            ci_threshold, ci_saturate, split_hint, gCILimitedLaunches.load(), gSplitMoves.load());
+    }
     gAgentRunning.store(false, std::memory_order_relaxed);
     if(agent.joinable()) {
         agent.join();
@@ -759,6 +785,9 @@ static void ld_init(void) {
         return;
     }
     with_profile = getenv_int("SMSCHED_PROFILE", 1);
+    profile_log = getenv_int("SMSCHED_PROFILE_LOG", 0);
+    if(const char *v = std::getenv("MORPHX_CI_THRESHOLD")) ci_threshold = std::strtof(v, nullptr);
+    if(const char *v = std::getenv("MORPHX_CI_SATURATE")) ci_saturate = std::strtof(v, nullptr);
     // 0 = default: 60 on a 108-SM A100, scaled to the SM count in getNrSM()
     split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
     llm_trick_mode = getenv_int("SMSCHED_LLM_TRICK_MODE", 0);
@@ -1090,6 +1119,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
             // printf("[smsched] Adjusting CI kernel in stream %p\n", launchInfo->stream);
             writeSM(launchInfo, 0, split_hint);
             launchInfo->isScheduled = 1;
+            gCILimitedLaunches.fetch_add(1, std::memory_order_relaxed);
         }
         // if(strstr(launchInfo->name, "redLoadIteratorMixedINS1S_1")) {
         //     writeSM(launchInfo, 0, split_hint);
