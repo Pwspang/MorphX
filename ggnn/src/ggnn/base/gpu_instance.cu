@@ -69,11 +69,13 @@ namespace ggnn {
 namespace {
 
 // Releases the Python GIL while waiting on CUDA events to avoid blocking other Python threads.
+// GGNN's own build/query worker threads never hold the GIL; releasing it there is a fatal
+// error on Python 3.12, so only release when this thread actually holds it.
 struct ScopedPythonGILRelease {
 #if GGNN_HAS_PYTHON
   ScopedPythonGILRelease()
   {
-    if (Py_IsInitialized())
+    if (Py_IsInitialized() && PyGILState_Check())
       state_ = PyEval_SaveThread();
   }
 

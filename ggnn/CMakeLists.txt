@@ -61,6 +61,12 @@ endif()
 # This is a workaround for using e.g. libunwind-18-dev on Ubuntu 24.04.
 find_path (Unwind_INCLUDE_DIR NAMES unwind.h libunwind.h PATH_SUFFIXES libunwind DOC "unwind include directory")
 
+# The vendored glog/gflags declare cmake_minimum_required < 3.5, which CMake 4
+# rejects; let them configure with 3.5 policies.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 include(FetchContent)
 set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 set(GFLAGS_USE_TARGET_NAMESPACE ON)
