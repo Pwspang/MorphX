@@ -918,8 +918,9 @@ def analyze_model(args: argparse.Namespace) -> None:
             metadata_rows.append({"series": series, "kernel": "N/A", "blocks": "N/A", "occup": "N/A", "ci": "N/A", "waves": 0, "source": "N/A"})
             continue
         series_waves[series] = {sms: lat for sms, lat in selected.waves}
-        if not any(sms in series_waves[series] for sms in expected[series]):
-            # Off the A100 grid (e.g. another MORPHX_NUM_SMS): report the points the runtime profiled.
+        if not all(sms in series_waves[series] for sms in expected[series]):
+            # Off the expected grid (another SM count or occupancy changes the
+            # runtime's profile waves): report the points the runtime profiled.
             expected[series] = sorted(series_waves[series], reverse=True)
         metadata_rows.append(
             {
