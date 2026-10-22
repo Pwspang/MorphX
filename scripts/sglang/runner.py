@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import sys
 import time
 from collections import deque
 from typing import Deque, Dict, List, Optional
@@ -48,6 +50,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # mycutlass_gemm
 
 
 @dataclasses.dataclass
@@ -107,8 +111,21 @@ class SglangRunner:
         attention_backend: str = "flashinfer",
         dtype: str = "auto",
         log_level: str = "error",
+        gemm: Optional[str] = None,
         **server_kwargs,
     ):
+        # Dense linear layers: "torch" (cuBLASLt) or "mycutlass" (pass-buildable CUTLASS, fp16 only)
+        self.gemm = (gemm or os.environ.get("MORPHX_LLM_GEMM", "torch")).strip().lower()
+        if self.gemm not in ("torch", "mycutlass"):
+            raise ValueError(f"MORPHX_LLM_GEMM={self.gemm!r}; expected torch or mycutlass")
+        if self.gemm == "mycutlass":
+            import mycutlass_gemm
+
+            mycutlass_gemm.install()
+            if dtype == "auto":
+                dtype = "float16"
+            if dtype != "float16":
+                raise ValueError("MORPHX_LLM_GEMM=mycutlass needs dtype float16")
         self.max_model_len = int(max_model_len)
         self.max_num_seqs = int(max_num_seqs)
         self.max_num_batched_tokens = int(max_num_batched_tokens or max_model_len)
@@ -150,6 +167,9 @@ class SglangRunner:
                 nccl_port=port_args.nccl_port,
                 server_args=self.server_args,
             )
+        if self.gemm == "mycutlass":
+            with torch.cuda.stream(self.stream):
+                self.num_prepared_weights = mycutlass_gemm.prepare(self.model_runner.model)
         self.stream.synchronize()
 
         self.tokenizer = get_tokenizer(

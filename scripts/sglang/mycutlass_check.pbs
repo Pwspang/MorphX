@@ -1,0 +1,47 @@
+#!/bin/bash
+# MORPHX_LLM_GEMM=mycutlass on hpcc: correctness, census + perf vs torch, and
+# the same under the MorphX runtime hook (hostmapped backend).
+#   cd <repo> && qsub scripts/sglang/mycutlass_check.pbs
+# Needs a pass-built libmycutlass.so in $MYCUTLASS_LIB_DIR and the hook libs in
+# $HOOK_DIR (libcuda.so + libpreload.so, see runtime/test/run_pass_test.sh).
+#PBS -N morphx-j1-mycutlass
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+cd "$PBS_O_WORKDIR"
+export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/morphx/build/mycutlass}
+HOOK_DIR=${HOOK_DIR:-$HOME/morphx/build/hook}
+MODEL=${MODEL:-$HOME/morphx/hf/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f}
+SMOKE="python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16"
+echo "== host=$(hostname) job=$PBS_JOBID"
+
+echo "== 1. correctness (no runtime)"
+python scripts/sglang/check_mycutlass.py --model "$MODEL" 2>&1 | grep -E "^\[(check|layer|e2e)\]|Error|error" | grep -vE "^\[layer\] model"
+
+echo "== 2. torch fp16 (no runtime)"
+$SMOKE --gemm torch --census-out docs/sglang-kernel-census.torch-fp16.raw.md 2>&1 | grep -E "^\[(smoke|poisson|stream|census)\]|SMOKE|Error"
+
+echo "== 3. mycutlass fp16 (no runtime)"
+$SMOKE --gemm mycutlass --census-out docs/sglang-kernel-census.mycutlass.raw.md 2>&1 | grep -E "^\[(smoke|poisson|stream|census)\]|SMOKE|Error"
+
+RT="SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=1000000 LD_PRELOAD=$HOOK_DIR/libcuda.so:$HOOK_DIR/libpreload.so"
+echo "== 4. mycutlass fp16 under the MorphX runtime (hostmapped)"
+env $RT $SMOKE --gemm mycutlass --num-requests 8 --output-len 32 --census-decode-steps 4 \
+    --census-out docs/sglang-kernel-census.mycutlass-runtime.raw.md > /tmp/j1-rt-$PBS_JOBID.log 2>&1
+echo "exit=$?"
+grep -E "^\[(smoke|poisson|stream|census)\]|SMOKE|Error|error" /tmp/j1-rt-$PBS_JOBID.log | head -60
+echo "-- runtime debug summary (all launches)"
+grep -oE "\[MorphX-debug\] [a-z_-]+" /tmp/j1-rt-$PBS_JOBID.log | sort | uniq -c
+grep -E "\[MorphX-debug\] (profile|assign|launch) func=[^ ]*cutlass" /tmp/j1-rt-$PBS_JOBID.log | sed -E 's/grid=[0-9]+ block=[0-9]+ stream=0x[0-9a-f]+ //' | cut -c1-160 | sort | uniq -c | sort -rn | head -12
+
+echo "== 5. correctness under the runtime"
+env LD_PRELOAD=$HOOK_DIR/libcuda.so:$HOOK_DIR/libpreload.so python scripts/sglang/check_mycutlass.py --model "$MODEL" 2>&1 | grep -E "^\[(check|e2e)\]|Error|error"
+echo "== done"

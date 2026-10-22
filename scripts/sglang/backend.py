@@ -159,6 +159,7 @@ class SglangBackend(LLMBackend):
         enable_chunked_prefill=False,
         gpu_memory_utilization=0.9,
         stream=None,
+        **runner_kwargs,
     ):
         if enable_chunked_prefill:
             raise NotImplementedError("chunked prefill is not implemented in the in-process SGLang runner yet")
@@ -169,6 +170,7 @@ class SglangBackend(LLMBackend):
             max_num_batched_tokens=max_num_batched_tokens,
             mem_fraction_static=gpu_memory_utilization,
             stream=stream,
+            **runner_kwargs,  # e.g. dtype, gemm (see runner.SglangRunner)
         )
         return SglangEngine(runner)
 
