@@ -2095,6 +2095,23 @@ typedef enum CUdriverProcAddressQueryResult_enum {
     CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT = 2   /**< Symbol was found but version supplied was not sufficient */
 }  CUdriverProcAddressQueryResult;
 
+/**
+ * Launch configuration of cuLaunchKernelEx (CUDA >= 11.8). Only the grid
+ * dimensions are read; attrs is left opaque.
+ */
+typedef struct CUlaunchConfig_st {
+  unsigned int gridDimX;
+  unsigned int gridDimY;
+  unsigned int gridDimZ;
+  unsigned int blockDimX;
+  unsigned int blockDimY;
+  unsigned int blockDimZ;
+  unsigned int sharedMemBytes;
+  CUstream hStream;
+  void *attrs;
+  unsigned int numAttrs;
+} CUlaunchConfig;
+
 #ifdef __cplusplus
 }
 #endif

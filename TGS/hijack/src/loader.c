@@ -472,7 +472,9 @@ entry_t cuda_library_entry[] = {
   {.name = "cuLibraryGetKernel"},
   {.name = "cuLibraryGetModule"},
   {.name = "cuGetProcAddress_v2"},
-  {.name = "cuGetProcAddress"}
+  {.name = "cuGetProcAddress"},
+  {.name = "cuLaunchKernelEx"},
+  {.name = "cuLaunchKernelEx_ptsz"}
 };
 
 entry_t nvml_library_entry[] = {
@@ -725,11 +727,21 @@ static void UNUSED bug_on() {
                CUDA_ENTRY_END);
 }
 
+int tgs_trace_calls(void) {
+  static int trace = -1;
+  if (trace < 0) {
+    const char *v = getenv("TGS_TRACE_CALLS");
+    trace = v && v[0] && strcmp(v, "0") != 0;
+  }
+  return trace;
+}
+
 /** register once set */
 static pthread_once_t g_cuda_set = PTHREAD_ONCE_INIT;
 
 char driver_version[FILENAME_MAX] = "580.95.05";
 
+#ifdef TGS_HIJACK_NVML
 static void load_driver_libraries() {
   void *table = NULL;
   char driver_filename[FILENAME_MAX];
@@ -757,6 +769,7 @@ static void load_driver_libraries() {
 
   dlclose(table);
 }
+#endif
 
 static void load_cuda_single_library(int idx) {
   void *table = NULL;
@@ -866,7 +879,9 @@ void load_sim(){
   read_version_from_proc(driver_version);
   load_cuda_single_library(CUDA_ENTRY_ENUM(cuDriverGetVersion));
   load_cuda_libraries();
+#ifdef TGS_HIJACK_NVML
   load_driver_libraries();
+#endif
 }
 void load_necessary_data() {
   pthread_once(&g_cuda_set, load_sim);

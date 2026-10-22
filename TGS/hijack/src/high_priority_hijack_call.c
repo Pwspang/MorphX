@@ -1064,110 +1064,18 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
     return result;
 }
 
-CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult* symbolStatus) {
-    // fprintf(stderr, "[mod] cuGetProcAddress_v2 called, symbol=%s, cudaVersion=%d, flags=%lu\n", symbol, cudaVersion, flags);
-    // fflush(stderr);
-    load_necessary_data();
-    if (strcmp(symbol, "cuGetProcAddress") == 0) {
-        *pfn = (void*)cuGetProcAddress_v2;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if (strcmp(symbol, "cuLaunchKernel") == 0) {
-        *pfn = (void*)cuLaunchKernel;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadData") == 0) {
-        *pfn = (void*)cuModuleLoadData;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryLoadData") == 0) {
-        *pfn = (void*)cuLibraryLoadData;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadDataEx") == 0) {
-        *pfn = (void*)cuModuleLoadDataEx;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleGetFunction") == 0) {
-        *pfn = (void*)cuModuleGetFunction;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuKernelGetFunction") == 0) {
-        *pfn = (void*)cuKernelGetFunction;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryGetKernel") == 0) {
-        *pfn = (void*)cuLibraryGetKernel;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryGetModule") == 0) {
-        *pfn = (void*)cuLibraryGetModule;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadFatBinary") == 0) {
-        *pfn = (void*)cuModuleLoadFatBinary;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    }
-  CUresult result = CUDA_ENTRY_CALL(cuda_library_entry, cuGetProcAddress_v2, symbol, pfn, cudaVersion, flags, symbolStatus);
-  return result;
+/* cuGetProcAddress(_v2) live in proc_address.c, shared by both libraries. */
+
+CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+                          void **kernelParams, void **extra) {
+  rate_estimator(config->gridDimX * config->gridDimY * config->gridDimZ);
+  return CUDA_ENTRY_CALL(cuda_library_entry, cuLaunchKernelEx, config, f,
+                         kernelParams, extra);
 }
 
-CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult* symbolStatus) {
-    // fprintf(stderr, "[mod] cuGetProcAddress called, symbol=%s, cudaVersion=%d, flags=%lu\n", symbol, cudaVersion, flags);
-    // fflush(stderr);
-    load_necessary_data();
-    if (strcmp(symbol, "cuGetProcAddress") == 0) {
-        *pfn = (void*)cuGetProcAddress;
-        return CUDA_SUCCESS;
-    } else if (strcmp(symbol, "cuLaunchKernel") == 0) {
-        *pfn = (void*)cuLaunchKernel;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadData") == 0) {
-        *pfn = (void*)cuModuleLoadData;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryLoadData") == 0) {
-        *pfn = (void*)cuLibraryLoadData;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadDataEx") == 0) {
-        *pfn = (void*)cuModuleLoadDataEx;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleGetFunction") == 0) {
-        *pfn = (void*)cuModuleGetFunction;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuKernelGetFunction") == 0) {
-        *pfn = (void*)cuKernelGetFunction;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryGetKernel") == 0) {
-        *pfn = (void*)cuLibraryGetKernel;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuLibraryGetModule") == 0) {
-        *pfn = (void*)cuLibraryGetModule;
-        return CUDA_SUCCESS;
-    } else if(strcmp(symbol, "cuModuleLoadFatBinary") == 0) {
-        *pfn = (void*)cuModuleLoadFatBinary;
-        return CUDA_SUCCESS;
-    } 
-  CUresult result = CUDA_ENTRY_CALL(cuda_library_entry, cuGetProcAddress, symbol, pfn, cudaVersion, flags, symbolStatus);
-  return result;
+CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig *config, CUfunction f,
+                               void **kernelParams, void **extra) {
+  rate_estimator(config->gridDimX * config->gridDimY * config->gridDimZ);
+  return CUDA_ENTRY_CALL(cuda_library_entry, cuLaunchKernelEx_ptsz, config, f,
+                         kernelParams, extra);
 }

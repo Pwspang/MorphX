@@ -598,12 +598,12 @@ def build_tgs_preload_string(priority: str) -> Optional[str]:
         "libcontroller.so",
         "libcuda.so",
         "libcuda.so.1",
-        "libnvidia-ml.so",
-        "libnvidia-ml.so.1",
     )
     paths = [lib_dir / name for name in lib_names]
     if not all(path.exists() for path in paths):
         return None
+    # The NVML copies only exist when TGS/hijack/build.sh ran with TGS_HIJACK_NVML=1.
+    paths += [lib_dir / name for name in ("libnvidia-ml.so", "libnvidia-ml.so.1") if (lib_dir / name).exists()]
     return "LD_PRELOAD=" + ":".join(str(path) for path in paths)
 
 
