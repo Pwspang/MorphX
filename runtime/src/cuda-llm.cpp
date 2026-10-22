@@ -290,7 +290,13 @@ void generateProfileWaves(int nrSM, KernelInfo *info, std::vector<int> &profileW
         else if(waves >= 2.5) baseWaves = 4;
         else baseWaves = 3;
         int dec = nrSM / baseWaves;
-        int baseBlocks = (dec + nrSM) * info->occup * baseWaves / 2;
+        // Blocks in one pass over the waves below. Equals the original
+        // (dec + nrSM) * occup * baseWaves / 2 when baseWaves divides nrSM;
+        // otherwise (e.g. 132 SMs) the loop adds a short last wave.
+        int baseBlocks = 0;
+        for(int k = nrSM * info->occup; k > 0; k -= dec * info->occup) {
+            baseBlocks += k;
+        }
         int repeat = info->gridSize / baseBlocks;
         int remain = info->gridSize % baseBlocks;
         // printf("[smsched] baseWaves: %d, dec: %d, baseBlocks: %d, repeat: %d, remain: %d\n", baseWaves, dec, baseBlocks, repeat, remain);
