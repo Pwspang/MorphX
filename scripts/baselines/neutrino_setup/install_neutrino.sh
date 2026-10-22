@@ -11,6 +11,8 @@
 #    MorphX runtime/src/parse.py)
 #  - build.py: detect CUDA by the nvidia-smi binary (login nodes without GPUs return
 #    non-zero) and search $CUDA_HOME for cuda.h
+#  - cli.py: resolve the real driver to this node's versioned libcuda file at run time
+#    (see patch_neutrino.py)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +29,7 @@ git -C "$SRC" fetch -q origin "$COMMIT" 2>/dev/null || true
 git -C "$SRC" checkout -q -f "$COMMIT"
 
 cp "$HERE/parse.py" "$SRC/neutrino/src/parse.py"
-"$PY" "$HERE/patch_build.py" "$SRC/neutrino/build.py" "$CUDA_HOME"
+"$PY" "$HERE/patch_neutrino.py" "$SRC" "$CUDA_HOME"
 
 "$PY" -m pip install -q toml
 mkdir -p "$SRC/neutrino/build"
