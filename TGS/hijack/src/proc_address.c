@@ -11,6 +11,8 @@
  *
  * TGS_TRACE_GPA=1 logs every lookup. TGS_GPA_LEGACY=1 restores the original
  * behaviour (answer hooked names directly, whatever version or flags).
+ * TGS_GPA_HOOKS=name,name,... limits which names are hooked ("none" = pure
+ * pass-through); meant for bisecting.
  */
 #include <string.h>
 
@@ -70,6 +72,19 @@ static int env_flag(const char *name) {
   return v && v[0] && strcmp(v, "0") != 0;
 }
 
+static int hook_enabled(const char *name) {
+  static const char *list = (const char *)-1;
+  size_t n = strlen(name);
+  const char *p;
+
+  if (list == (const char *)-1) list = getenv("TGS_GPA_HOOKS");
+  if (!list) return 1;
+  for (p = list; (p = strstr(p, name)) != NULL; p += n) {
+    if ((p == list || p[-1] == ',') && (p[n] == ',' || p[n] == '\0')) return 1;
+  }
+  return 0;
+}
+
 static CUresult resolve(const char *symbol, void **pfn, int cudaVersion,
                         cuuint64_t flags,
                         CUdriverProcAddressQueryResult *symbolStatus, int v2) {
@@ -107,7 +122,8 @@ static CUresult resolve(const char *symbol, void **pfn, int cudaVersion,
   if (ret == CUDA_SUCCESS && pfn && *pfn) {
     real = *pfn;
     for (i = 0; i < GPA_HOOKS; i++) {
-      if (real == cuda_library_entry[g_hooks[i].real].fn_ptr) {
+      if (real == cuda_library_entry[g_hooks[i].real].fn_ptr &&
+          hook_enabled(g_hooks[i].name)) {
         *pfn = g_hooks[i].hook;
         swapped = cuda_library_entry[g_hooks[i].real].name;
         break;

@@ -20,10 +20,16 @@ extern "C" {
 
 #define CUDA_FIND_ENTRY(table, sym) ({ (table)[CUDA_ENTRY_ENUM(sym)].fn_ptr; })
 
-#define CUDA_ENTRY_CALL(table, sym, ...)             \
-  ({                                                 \
-    cuda_sym_t _entry = CUDA_FIND_ENTRY(table, sym); \
-    _entry(__VA_ARGS__);                             \
+/* TGS_TRACE_CALLS=1 logs every call forwarded to the real driver. */
+int tgs_trace_calls(void);
+
+#define CUDA_ENTRY_CALL(table, sym, ...)                              \
+  ({                                                                  \
+    cuda_sym_t _entry = CUDA_FIND_ENTRY(table, sym);                  \
+    CUresult _ret = _entry(__VA_ARGS__);                              \
+    if (tgs_trace_calls())                                            \
+      fprintf(stderr, "[TGS-CALL] %s -> %d\n", #sym, (int)_ret);       \
+    _ret;                                                             \
   })
 
 #define CUDA_ENTRY_DEBUG_VOID_CALL(table, sym, ...)             \

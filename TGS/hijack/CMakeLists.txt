@@ -14,6 +14,19 @@ set(MORPHX_TGS_SOCKET_DIR "${MORPHX_TGS_SOCKET_DIR_DEFAULT}" CACHE PATH "Directo
 add_definitions(-DMORPHX_TGS_SOCKET_DIR="${MORPHX_TGS_SOCKET_DIR}")
 add_compile_options(-Wall -Wshadow -Werror -Wno-format)
 
+# The NVML wrappers never had an entry table (nvml_library_entry is empty, and
+# loading it called dlsym with NULL names), so every exported nvml* symbol jumps
+# through NULL: preloading the libnvidia-ml copies alone segfaults torch on the
+# H200. TGS itself doesn't use NVML, so leave it out unless asked for
+# (build.sh: TGS_HIJACK_NVML=1).
+option(TGS_HIJACK_NVML "Export the (unpopulated) NVML wrappers" OFF)
+if(TGS_HIJACK_NVML)
+    add_definitions(-DTGS_HIJACK_NVML)
+    set(TGS_NVML_SOURCES src/nvml_entry.c)
+else()
+    set(TGS_NVML_SOURCES "")
+endif()
+
 include_directories(${CMAKE_SOURCE_DIR})
 
 if (${ENABLE_DEBUG})
@@ -32,7 +45,7 @@ add_library(cuda-control-high-priority SHARED
         include/cuda-helper.h
         include/nvml-helper.h
         src/cuda_originals.c
-        src/nvml_entry.c
+        ${TGS_NVML_SOURCES}
         src/loader.c
         src/proc_address.c)
 
@@ -48,7 +61,7 @@ add_library(cuda-control-low-priority SHARED
         include/cuda-helper.h
         include/nvml-helper.h
         src/cuda_originals.c
-        src/nvml_entry.c
+        ${TGS_NVML_SOURCES}
         src/loader.c
         src/proc_address.c)
 

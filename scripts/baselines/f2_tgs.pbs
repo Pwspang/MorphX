@@ -2,7 +2,7 @@
 # Track F2: TGS hijack on CUDA 13 (hpcc H200). Probes torch/cuBLAS under the
 # hijack (new vs legacy cuGetProcAddress handling), then a Fig 11(a) TGS point.
 #   cd <repo> && qsub scripts/baselines/f2_tgs.pbs
-#   qsub -v PARTS="probe" ...   (parts: probe fig11), FIG11_DURATION=60
+#   qsub -v PARTS="probe" ...   (parts: probe bisect calls identity bindings fig11), FIG11_DURATION=60
 # Needs TGS/hijack/{high,low}-priority-lib (TGS/hijack/build.sh) and
 # microbench/build-model/libmycutlass.so in this checkout.
 #PBS -N morphx-f2-tgs
@@ -33,7 +33,7 @@ print("fp16 matmul", float((h @ h).float().sum()))
 print("linear", float(torch.nn.functional.linear(h, h).float().sum()))
 torch.cuda.synchronize()
 print("PROBE_OK")'
-libs() { ls TGS/hijack/$1-priority-lib/{libcontroller.so,libcuda.so,libcuda.so.1,libnvidia-ml.so,libnvidia-ml.so.1} | paste -sd:; }
+libs() { ls TGS/hijack/$1-priority-lib/{libcontroller.so,libcuda.so,libcuda.so.1} | paste -sd:; }
 run_probe() {  # label env...
   local label=$1; shift
   echo "-- $label"
@@ -50,6 +50,55 @@ if [[ " $PARTS " == *" probe "* ]]; then
   run_probe low-new TGS_TRACE_GPA=1 LD_PRELOAD="$(libs low)"
   echo "-- high-legacy: last lookups before the failure"
   grep '^\[TGS-GPA\]' "$OUT/probe-high-legacy.log" | tail -8
+fi
+
+if [[ " $PARTS " == *" bisect "* ]]; then
+  launch=cuGetProcAddress,cuLaunchKernel,cuLaunchKernelEx,cuLaunchCooperativeKernel
+  mod=cuGetProcAddress,cuModuleLoadData,cuLibraryLoadData,cuModuleLoadDataEx,cuModuleLoadFatBinary,cuModuleGetFunction,cuKernelGetFunction,cuLibraryGetKernel,cuLibraryGetModule
+  cudaonly=$(ls TGS/hijack/high-priority-lib/{libcuda.so,libcuda.so.1} | paste -sd:)
+  run_probe high-none TGS_GPA_HOOKS=none LD_PRELOAD="$(libs high)"
+  run_probe high-gpaonly TGS_GPA_HOOKS=cuGetProcAddress LD_PRELOAD="$(libs high)"
+  run_probe high-launch TGS_GPA_HOOKS=$launch LD_PRELOAD="$(libs high)"
+  run_probe high-mod TGS_GPA_HOOKS=$mod LD_PRELOAD="$(libs high)"
+  run_probe cudaonly-none TGS_GPA_HOOKS=none LD_PRELOAD="$cudaonly"
+fi
+
+if [[ " $PARTS " == *" calls "* ]]; then
+  cudaonly=$(ls TGS/hijack/high-priority-lib/{libcuda.so,libcuda.so.1} | paste -sd:)
+  run_probe calls-none TGS_GPA_HOOKS=none TGS_TRACE_CALLS=1 LD_PRELOAD="$cudaonly"
+  echo "-- forwarded calls (count, name, result)"
+  grep '^\[TGS-CALL\]' "$OUT/probe-calls-none.log" | sort | uniq -c | sort -rn | head -30
+  echo "-- last forwarded calls"
+  grep -n '^\[TGS-CALL\]\|cublas\|Error' "$OUT/probe-calls-none.log" | tail -15
+fi
+
+if [[ " $PARTS " == *" identity "* ]]; then
+  # Does cuBLAS care which file provides libcuda.so.1?
+  drv=$(sed -n 's/.*Kernel Module  *\([0-9.]*\).*/\1/p' /proc/driver/nvidia/version)
+  V=/tmp/f2-ver-$PBS_JOBID; mkdir -p $V
+  cp TGS/hijack/high-priority-lib/libcuda.so.1 $V/libcuda.so.$drv
+  ln -sf libcuda.so.$drv $V/libcuda.so.1
+  run_probe versioned-name TGS_GPA_HOOKS=none LD_PRELOAD=$V/libcuda.so.1
+  R=$HOME/MorphX/runtime/build
+  run_probe morphx-hook LD_PRELOAD=$R/libcuda.so:$R/libpreload.so
+  run_probe morphx-cudahook LD_PRELOAD=$R/libcuda_hook.so
+  run_probe real-preload LD_PRELOAD=/usr/lib64/libcuda.so.1
+  ls -l $V
+fi
+
+if [[ " $PARTS " == *" bindings "* ]]; then
+  # Which objects bind symbols to the hijack, and which libcuda/libnvidia objects load?
+  cudaonly=$(ls TGS/hijack/high-priority-lib/{libcuda.so,libcuda.so.1} | paste -sd:)
+  rm -f /tmp/f2-ld-$PBS_JOBID.*
+  LD_DEBUG=bindings,libs LD_DEBUG_OUTPUT=/tmp/f2-ld-$PBS_JOBID TGS_GPA_HOOKS=none LD_PRELOAD="$cudaonly" \
+    timeout 180 python -c "$probe" > "$OUT/probe-bindings.log" 2>&1; echo "   rc=$?"
+  cat /tmp/f2-ld-$PBS_JOBID.* > "$OUT/ld-debug.txt"
+  echo "-- objects binding to the hijack (count, from-object)"
+  grep "to $PWD/TGS/hijack" "$OUT/ld-debug.txt" | sed -E 's/.*binding file ([^ ]+).*/\1/' | sort | uniq -c | sort -rn | head -20
+  echo "-- symbols bound to the hijack from non-python objects"
+  grep "to $PWD/TGS/hijack" "$OUT/ld-debug.txt" | grep -v "python" | sed -E "s/.*binding file ([^ ]+) .*symbol \`([^']+)'.*/\1 \2/" | sort | uniq -c | sort -rn | head -30
+  echo "-- libcuda / nvidia objects loaded"
+  grep -E "calling init: .*(cuda|nvidia)" "$OUT/ld-debug.txt" | sed -E 's/^ *[0-9]+: *//' | sort -u | head -20
 fi
 
 if [[ " $PARTS " == *" fig11 "* ]]; then

@@ -606,9 +606,44 @@ schedulers (timeslice, TGS, MPS) load the model in each process: request
 | **ncu** | Fig 15 | Nsight Compute from `cuda/13.0` (2025.4.1 on the GPU node). `RmProfilingAdminOnly` is 1 on the login node but 0 on the GPU node, so counters work as a normal user | **Works** (job 91686): GEMM 445× base (A100 ref 200×), GEMV 7691× (ref 5553×) |
 | **NVBit** | Fig 15 | Vendored NVBit 1.7.6 (CUDA 13.0 headers per its release notes) + `tools/mem_trace` builds with nvcc 13.0 (`make -C nvbit-tutorial/tools/mem_trace`, also done by `run_all.py`). 1.7.7+ (CUDA 13.1 headers) and 1.8.x (CMake build) exist but aren't needed for CUDA 13.0 | **Works** (job 91686): GEMM 632× (ref 645×), GEMV 458× (ref 801×) |
 | **neutrino** | Fig 15 | The authors' `neutrino==0.1.0` is **Neutrino** (OSDI'25, github.com/open-neutrino/neutrino, commit `4a82cd2`); PyPI's `neutrino` is an unrelated Redis package. `scripts/baselines/neutrino_setup/install_neutrino.sh` clones it, swaps in a CUDA 13 `parse.py` (same `_v2` macro fixes as `runtime/src/parse.py`), patches `build.py` for GPU-less login nodes and `$CUDA_HOME`, and makes `cli.py` resolve the real driver to the node's versioned file at run time (Neutrino's `preload.so` redirects any path containing `libcuda.so.1` back to the hook, and login/GPU nodes run different 580 drivers). Installed editable into `~/morphx/envs/sglang-stock` | **Works** (job 91696, after the driver fix; 91686 died silently): GEMM 1.003× (ref 1.603×), GEMV 1.552× (ref 1.788×); the `dmat` probe instruments the CUTLASS kernel (1 kernel per run in the trace) |
-| **TGS** | Fig 10–12 | `pip install --user patchelf` (0.19.1), then `TGS/hijack/build.sh` builds `high/low-priority-lib` with gcc 12.3 / CUDA 13 headers. The libs are LD_PRELOADed into the LLM / background processes (`--use-tgs --use-multiprocess`); the real driver is found as `libcuda.so.<version from /proc/driver/nvidia/version>`. Rate-watcher sockets go to `$MORPHX_TGS_SOCKET_DIR` (created fine) | **Broken on CUDA 13**: builds, but `cublasCreate` returns `CUBLAS_STATUS_INTERNAL_ERROR` under the hijack (high and low priority), even for a plain `torch` matmul (`PARTS=tgsprobe`, job 91708); the cuBLAS debug log gives no reason. Suspects: the hijack converts every `cuMemAlloc` into managed memory + `cuMemAdvise`, exports only ~440 pre-CUDA-12 driver symbols, and lacks `cuLaunchKernelEx`. Needs a port of the hijack (e.g. generate pass-through wrappers for all CUDA 13 driver symbols as `runtime/src/parse.py` does, then bisect the hooked calls) |
+| **TGS** | Fig 10–12 | `pip install --user patchelf` (0.19.1), then `TGS/hijack/build.sh` builds `high/low-priority-lib` with gcc 12.3 / CUDA 13 headers and records the real driver (`/usr/lib64/libcuda.so.1`, or `$TGS_REAL_LIBCUDA`) as a `DT_NEEDED` of the hijack. The libs are LD_PRELOADed into the LLM / background processes (`--use-tgs --use-multiprocess`); rate-watcher sockets go to `$MORPHX_TGS_SOCKET_DIR` | **Works after Track F2** (jobs 91719–91740): torch fp32/fp16 matmul and `F.linear` pass under both libs; Fig 11(a) `llm-1-mm-1` 60 s: TGS 48 requests, TTFT 31.8 ms, latency 4518 ms, 380 matmuls vs stream 48 / 29.2 ms / 3919 ms / 490 (A100 reference, 180 s: TGS 4867 ms / 1180 matmuls vs stream 5266 ms / 1700). Background throttling shows (−22% matmuls, A100 −31%), but the LLM is 15% slower than stream here instead of 8% faster — not investigated (shorter run, plus per-launch hijack cost) |
 | **orion** | Fig 10–12 | Nothing to build: `scripts/colocate/run.py --use-orion` only forces multithread mode with a high-priority LLM stream and low-priority background streams (`runtime/src/cuda-orion.cpp` is a separate experimental runtime variant not used by the AE) | **Works** (job 91696, 60 s): 48 requests, TTFT 29.3 ms, latency 3770 ms, 490 matmuls (stream in J2: 3787 ms) |
 | **timeslice** | Fig 10–12 | Nothing to build: LLM and background work in separate processes without MPS, so the driver time-slices them (default compute mode, no root needed) | **Works** (job 91686, 30 s): 18 requests, TTFT 22.3 ms, latency 2995 ms, 280 matmuls |
+
+#### TGS on CUDA 13 (Track F2)
+
+- **Root cause.** The hijack is preloaded under the `libcuda.so.1` soname, so a
+  library that does `dlopen("libcuda.so.1")` + `dlsym()` gets the hijack's
+  handle. cuBLAS 13 resolves several newer driver entry points that way
+  (`cuTensorMapEncodeTiled`, `cuKernelSetAttribute`, `cuKernelGetAttribute`,
+  `cuKernelGetLibrary`, `cuLibraryUnload`, `cuStreamGetCaptureInfo_v2`, found
+  with `LD_DEBUG=bindings`). The hijack only implements ~440 pre-CUDA-12
+  symbols, the lookups failed, and `cublasCreate` returned
+  `CUBLAS_STATUS_INTERNAL_ERROR`. Managed memory, NVML and `cuGetProcAddress`
+  were ruled out by bisecting (`TGS_GPA_HOOKS=none`, cuda-only preload, call
+  trace).
+- **Fix.** `build.sh` adds the real driver as a `DT_NEEDED` of the hijack (by
+  absolute path, since both share the soname), so `dlsym` on the hijack's
+  handle falls back to the real driver for anything it doesn't export.
+- **Also changed.**
+  - `cuGetProcAddress(_v2)` moved to `TGS/hijack/src/proc_address.c`, shared
+    by both libraries. It asks the real driver first, so the requested version
+    and per-thread-stream flags pick the right variant and `symbolStatus` is
+    the driver's. A wrapper is substituted only when the driver returned exactly
+    the function it wraps; `_ptsz` launch variants now map to the `_ptsz`
+    wrappers. The v1 export takes 4 arguments, not 5.
+  - New `cuLaunchKernelEx(_ptsz)` wrappers, so Ex launches (cudart 12+/13,
+    cluster launches) are rate-controlled like `cuLaunchKernel`. This is a
+    small semantic extension: before, those launches bypassed TGS.
+  - The NVML wrappers (empty entry table; preloading the `libnvidia-ml` copies
+    alone segfaults torch) are off by default: `TGS_HIJACK_NVML=1 build.sh`
+    restores them. `run_colocate_part1.py` preloads the NVML copies only if
+    they exist.
+  - Debug switches: `TGS_TRACE_GPA=1` (lookups), `TGS_TRACE_CALLS=1` (calls
+    forwarded to the driver), `TGS_GPA_HOOKS=name,...|none`,
+    `TGS_GPA_LEGACY=1` (old lookup behaviour).
+- `scripts/baselines/f2_tgs.pbs` reproduces the probes, bisection and the
+  Fig 11(a) TGS point.
 
 ## 9. SGLang backend (primary LLM engine)
 
