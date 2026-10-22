@@ -16,7 +16,10 @@ import threading
 import json
 import smsched_api
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
+# Machine-specific settings (see scripts/ae/morphx_env.py); defaults match the A100 AE machine.
+HF_CACHE = os.environ.get("MORPHX_HF_CACHE") or "/huggingface-cache/hub"
+_CUDA_ARCH = int(os.environ.get("MORPHX_CUDA_ARCH") or "80")
+os.environ["TORCH_CUDA_ARCH_LIST"] = f"{_CUDA_ARCH // 10}.{_CUDA_ARCH % 10}"
 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 os.environ["VLLM_USE_V1"] = "0"
@@ -42,13 +45,13 @@ def exit_after_flush_if_morphx_preloaded():
     os._exit(0)
 
 model_paths = {
-    "qwen2.5-7b": "/huggingface-cache/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
-    "glm-9b": "/huggingface-cache/hub/models--zai-org--GLM-Z1-9B-0414/snapshots/b221b06fefb23ca320922cf6e68ab5f2fb82de81",
-    "llama-2-7b": "/huggingface-cache/hub/models--meta-llama--Llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590",
-    "llama-3-8b": "/huggingface-cache/hub/models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
-    "qwen3-4b": "/huggingface-cache/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f",
-    "qwen3-8b": "/huggingface-cache/hub/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2", 
-    "gpt2-l": "/huggingface-cache/hub/models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519"
+    "qwen2.5-7b": f"{HF_CACHE}/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
+    "glm-9b": f"{HF_CACHE}/models--zai-org--GLM-Z1-9B-0414/snapshots/b221b06fefb23ca320922cf6e68ab5f2fb82de81",
+    "llama-2-7b": f"{HF_CACHE}/models--meta-llama--Llama-2-7b-chat-hf/snapshots/f5db02db724555f92da89c216ac04704f23d4590",
+    "llama-3-8b": f"{HF_CACHE}/models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+    "qwen3-4b": f"{HF_CACHE}/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f",
+    "qwen3-8b": f"{HF_CACHE}/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2", 
+    "gpt2-l": f"{HF_CACHE}/models--openai-community--gpt2-large/snapshots/32b71b12589c2f8d625668d2335a01cac3249519"
 }
 
 def create_prompts(vocab_size, num_requests, input_len, output_len) -> list[tuple[TokensPrompt, SamplingParams]]:

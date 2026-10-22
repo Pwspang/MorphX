@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import morphx_env
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOGS_ROOT = REPO_ROOT / "logs"
@@ -71,15 +73,16 @@ SPLIT_NAME_RE = re.compile("split", re.IGNORECASE)
 
 
 def default_python() -> str:
-    candidates = (
-        os.environ.get("PYTHON"),
-        "/home/rtx/miniconda3/envs/smsched/bin/python",
-        "/mnt/data/rtx/miniconda3/envs/smsched/bin/python",
-    )
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    return sys.executable
+    return morphx_env.default_python()
+
+
+def morphx_cmake_args() -> list[str]:
+    """CMake cache settings shared by the repo-local builds (see scripts/ae/morphx_env.py)."""
+    return [f"-DMORPHX_SYNC_BACKEND={morphx_env.env_str('MORPHX_SYNC_BACKEND')}"]
+
+
+# Part 1 split hint tuned on the 108-SM A100, scaled to MORPHX_NUM_SMS.
+PART1_SPLIT_HINT = morphx_env.scale_split_hint("76")
 
 
 def parse_args() -> argparse.Namespace:
@@ -314,6 +317,7 @@ def configure_runtime(use_cuda_llm: bool, *, prefix: str = "[AE]") -> None:
         "-DUSE_CUDA_LOG=OFF",
         "-DUSE_CUDA_ORION=OFF",
         "-DUSE_CUDA_LITHOS=OFF",
+        *morphx_cmake_args(),
     ]
     run_command(cmake_args, prefix=prefix, quiet=True)
     run_command(
@@ -326,14 +330,11 @@ def configure_runtime(use_cuda_llm: bool, *, prefix: str = "[AE]") -> None:
 def build_common_tools(include_model: bool, *, python_bin: str, prefix: str = "[AE]") -> None:
     smsched_pass_build = REPO_ROOT / "smsched-pass" / "build"
     if not smsched_pass_build.is_dir():
-        llvm_candidates = [
-            os.environ.get("LLVM_DIR"),
-            "/home/rtx/llvm-project/install/lib/cmake/llvm",
-            "/mnt/data/rtx/llvm-project/install/lib/cmake/llvm",
-        ]
-        llvm_dir = next((candidate for candidate in llvm_candidates if candidate and Path(candidate).exists()), None)
+        llvm_dir = next((candidate for candidate in morphx_env.llvm_cmake_dirs() if candidate.exists()), None)
         if llvm_dir is None:
-            raise RuntimeError("LLVM_DIR was not found; expected the MorphX compiler pass toolchain on this machine.")
+            raise RuntimeError(
+                "LLVM_DIR was not found; set MORPHX_LLVM_ROOT (or LLVM_DIR) to the MorphX compiler pass toolchain."
+            )
         run_command(
             [
                 "cmake",
@@ -356,13 +357,20 @@ def build_common_tools(include_model: bool, *, python_bin: str, prefix: str = "[
 
     microbench = REPO_ROOT / "microbench"
     if not (microbench / "build").is_dir():
-        run_command(["cmake", "-S", str(microbench), "-B", str(microbench / "build")], prefix=prefix, quiet=True)
+        run_command(
+            ["cmake", "-S", str(microbench), "-B", str(microbench / "build"), *morphx_cmake_args()],
+            prefix=prefix,
+            quiet=True,
+        )
     if (microbench / "build").is_dir():
         run_command(["cmake", "--build", str(microbench / "build"), "--target", "bench", "-j"], prefix=prefix, quiet=True)
     if include_model:
         model_build = microbench / "build-model"
         if not model_build.is_dir():
-            run_command(["cmake", "-S", str(microbench), "-B", str(model_build), "-DSMSCHED_ENABLE_PASS=ON"], prefix=prefix, quiet=True)
+            model_args = ["-DSMSCHED_ENABLE_PASS=ON", *morphx_cmake_args()]
+            if os.environ.get("MORPHX_LLVM_ROOT"):
+                model_args.append(f"-DSMSCHED_LLVM_ROOT={morphx_env.env_path('MORPHX_LLVM_ROOT')}")
+            run_command(["cmake", "-S", str(microbench), "-B", str(model_build), *model_args], prefix=prefix, quiet=True)
         run_command(["cmake", "--build", str(model_build), "--target", "bench", "-j"], prefix=prefix, quiet=True)
 
     nvbit_mem_trace = REPO_ROOT / "nvbit-tutorial" / "tools" / "mem_trace"
@@ -472,7 +480,7 @@ def run_part(
                 "--duration",
                 "180",
                 "--smsched-split-hint",
-                "76",
+                PART1_SPLIT_HINT,
                 "--fail-fast",
             ]
             command.extend(["--only-scheduler", "stream", "--only-experiment", "llm-1-ggnn-1", "--duration", "1", "--dry-run"])
@@ -488,7 +496,7 @@ def run_part(
             "--duration",
             "180",
             "--smsched-split-hint",
-            "76",
+            PART1_SPLIT_HINT,
             "--fail-fast",
         ]
         ggnn_command = [
@@ -572,7 +580,7 @@ def analyze_part(part: Part, run_dir: Path, args: argparse.Namespace, *, short: 
             str(REPO_ROOT / "scripts" / "ae" / "run_colocate_part1.py"),
             *common,
             "--smsched-split-hint",
-            "76",
+            PART1_SPLIT_HINT,
         ]
         if short:
             command.extend(["--only-table", "llm-1-ggnn"])

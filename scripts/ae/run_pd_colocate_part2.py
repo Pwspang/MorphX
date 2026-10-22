@@ -20,12 +20,12 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+import morphx_env
 from process_control import run_process
 
 
@@ -86,10 +86,8 @@ TTFT_PATTERN = re.compile(r"TTFT:\s*([0-9.+-eE]+)\s*([a-zA-Z]*)", re.IGNORECASE)
 TOKENS_PATTERN = re.compile(r"Total generated tokens:\s*(\d+)", re.IGNORECASE)
 
 MODEL_PATHS = {
-    "llama-3-8b": Path(
-        "/huggingface-cache/hub/models--meta-llama--Meta-Llama-3-8B-Instruct/"
-        "snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"
-    ),
+    "llama-3-8b": morphx_env.hf_cache()
+    / "models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
 }
 
 
@@ -126,10 +124,7 @@ MetricData = dict[str, float | int]
 def parse_args() -> argparse.Namespace:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     default_output = REPO_ROOT / "ae-results" / "pd-colocate-part2" / timestamp
-    default_python = os.environ.get("PYTHON")
-    if not default_python:
-        conda_python = Path("/home/rtx/miniconda3/envs/smsched/bin/python")
-        default_python = str(conda_python if conda_python.exists() else Path(sys.executable))
+    default_python = morphx_env.default_python()
 
     parser = argparse.ArgumentParser(
         description="Run and summarize SOSP 2026 AE part 2 PD co-location experiments.",
@@ -315,7 +310,9 @@ def parse_workload_rows(table: str, configs: Sequence[str]) -> list[WorkloadRow]
         output_length = int(match.group(2))
         rps_text = match.group(3)
         rps = float(rps_text)
-        split_hint = match.group(4)
+        # Config names keep the split tuned on the 108-SM A100; the hint actually
+        # used is scaled to MORPHX_NUM_SMS (identity on the original machine).
+        split_hint = morphx_env.scale_split_hint(match.group(4))
         normalized_rps_text = format_rps_for_name(rps)
         output_config = f"in-{input_length}-out-{output_length}-rps-{normalized_rps_text}"
         rows.append(
@@ -451,14 +448,10 @@ def python_lib_dir(python_bin: str) -> Optional[Path]:
 def known_runtime_library_dirs(args: argparse.Namespace) -> list[Path]:
     dirs: list[Path] = []
     candidates = (
-        Path("/mnt/data/rtx/llvm-project/install/lib/x86_64-unknown-linux-gnu"),
-        Path("/mnt/data/rtx/llvm-project/build/lib/x86_64-unknown-linux-gnu"),
-        Path("/home/rtx/llvm-project/install/lib/x86_64-unknown-linux-gnu"),
-        Path("/home/rtx/llvm-project/build/lib/x86_64-unknown-linux-gnu"),
+        *morphx_env.llvm_runtime_lib_dirs(),
         python_lib_dir(args.python_bin),
         Path("/usr/mpi/gcc/openmpi-4.1.7rc1/lib"),
-        Path("/mnt/data/rtx/miniconda3/envs/nanoflow/lib"),
-        Path("/home/rtx/miniconda3/envs/nanoflow/lib"),
+        *morphx_env.nanoflow_lib_dirs(),
     )
     for candidate in candidates:
         if candidate is not None and candidate.is_dir():
