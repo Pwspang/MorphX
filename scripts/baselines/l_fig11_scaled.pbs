@@ -1,0 +1,42 @@
+#!/bin/bash
+# Fig 11(a) (LLM + matmul) with H200-scaled matmul load: every scheduler at the
+# A100 points llm-1-mm-1/6/10, with the matmul rate multiplied by MM_SCALES.
+#   cd <repo> && qsub scripts/baselines/l_fig11_scaled.pbs
+#   qsub -v MM_SCALES="3 4",POINTS="llm-1-mm-10",FIG11_DURATION=90 ...
+# Needs microbench/build-model (pass-built libmycutlass.so); builds runtime/build
+# (memcpy backend) and the TGS libs itself.
+#PBS -N morphx-l-fig11
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=200gb
+#PBS -l walltime=05:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+MM_SCALES=${MM_SCALES:-"3"}
+POINTS=${POINTS:-"llm-1-mm-1 llm-1-mm-6 llm-1-mm-10"}
+SCHEDULERS=${SCHEDULERS:-"stream smsched mps-30 mps-50 orion tgs timeslice"}
+OUT=${OUT:-$HOME/morphx/runs/l-fig11-$PBS_JOBID}
+echo "== host=$(hostname) job=$PBS_JOBID commit=$(git log --oneline -1) scales=$MM_SCALES points=$POINTS out=$OUT"
+
+( module load gnu/gcc-12.3
+  rm -rf runtime/build && CC=gcc CXX=g++ cmake -S runtime -B runtime/build > /tmp/l-rt-$PBS_JOBID.log 2>&1 \
+  && cmake --build runtime/build -j 12 >> /tmp/l-rt-$PBS_JOBID.log 2>&1 \
+  && (cd TGS/hijack && bash build.sh > /tmp/l-tgs-$PBS_JOBID.log 2>&1) ) \
+  || { tail -20 /tmp/l-rt-$PBS_JOBID.log /tmp/l-tgs-$PBS_JOBID.log; exit 1; }
+
+points=(); for p in $POINTS; do points+=(--only-experiment "$p"); done
+scheds=(); for s in $SCHEDULERS; do scheds+=(--only-scheduler "$s"); done
+for scale in $MM_SCALES; do
+  echo "== mm rps scale $scale"
+  timeout 16000 python scripts/ae/run_colocate_part1.py "${points[@]}" "${scheds[@]}" \
+    --mm-rps-scale "$scale" --model llama-3-8b --duration "${FIG11_DURATION:-90}" \
+    --output-dir "$OUT/scale-$scale" --run-timeout 900 2>&1 | grep -E "DONE|FAILED|ERROR|rps_scale|table"
+  cat "$OUT/scale-$scale/tables/compact/"*.tsv
+done
