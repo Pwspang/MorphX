@@ -97,6 +97,9 @@ class Experiment:
     llm_rps: float
     secondary_rps_raw: float
     secondary_rps_scaled: float
+    # A100 point name (e.g. llm-1-mm-10); differs from experiment_name when
+    # --mm/--ggnn-rps-scale changed the rate. Selectors match this name.
+    a100_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ggnn-base-size", type=int, default=DEFAULT_GGNN_BASE_SIZE)
     parser.add_argument("--ggnn-query-size", type=int, default=DEFAULT_GGNN_QUERY_SIZE)
     parser.add_argument("--mm-size", type=int, default=DEFAULT_MM_SIZE)
+    for task, label in (("mm", "matmul"), ("ggnn", "GGNN")):
+        env = f"MORPHX_{task.upper()}_RPS_SCALE"
+        parser.add_argument(
+            f"--{task}-rps-scale",
+            type=float,
+            default=float(os.environ.get(env, "1")),
+            help=(
+                f"Multiply the {label} request rate of every llm-*-{task} point. The A100 points "
+                f"leave a faster GPU lightly loaded (e.g. use 3 on an H200). Points are named "
+                f"after the rate actually used; selectors (--only-experiment, split-hint rules) use the A100 name. "
+                f"Default: {env} or 1."
+            ),
+        )
     parser.add_argument(
         "--smsched-env",
         default=os.environ.get("SMSCHED"),
@@ -295,12 +311,14 @@ def parse_float(value: str) -> Optional[float]:
     return parsed
 
 
-def build_experiments() -> list[Experiment]:
+def build_experiments(mm_rps_scale: float = 1.0, ggnn_rps_scale: float = 1.0) -> list[Experiment]:
     experiments: list[Experiment] = []
     for llm_rps in (1.0, 4.0):
-        for ggnn_rps in (1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0):
+        for a100_ggnn_rps in (1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0):
+            ggnn_rps = a100_ggnn_rps * ggnn_rps_scale
             llm_tag = format_rps_for_name(llm_rps)
             other_tag = format_rps_for_name(ggnn_rps)
+            a100_name = f"llm-{llm_tag}-ggnn-{format_rps_for_name(a100_ggnn_rps)}"
             experiments.append(
                 Experiment(
                     scenario_dir="llm-ggnn",
@@ -310,6 +328,7 @@ def build_experiments() -> list[Experiment]:
                     llm_rps=llm_rps,
                     secondary_rps_raw=ggnn_rps,
                     secondary_rps_scaled=ggnn_rps * 0.1,
+                    a100_name=a100_name,
                 )
             )
 
@@ -318,9 +337,11 @@ def build_experiments() -> list[Experiment]:
         4.0: (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
     }
     for llm_rps, values in mm_points.items():
-        for mm_rps in values:
+        for a100_mm_rps in values:
+            mm_rps = a100_mm_rps * mm_rps_scale
             llm_tag = format_rps_for_name(llm_rps)
             other_tag = format_rps_for_name(mm_rps)
+            a100_name = f"llm-{llm_tag}-mm-{format_rps_for_name(a100_mm_rps)}"
             experiments.append(
                 Experiment(
                     scenario_dir="llm-mm",
@@ -330,6 +351,7 @@ def build_experiments() -> list[Experiment]:
                     llm_rps=llm_rps,
                     secondary_rps_raw=mm_rps,
                     secondary_rps_scaled=mm_rps * 0.01,
+                    a100_name=a100_name,
                 )
             )
     return experiments
@@ -350,12 +372,15 @@ def parse_smsched_split_hint_overrides(values: Iterable[str]) -> tuple[tuple[str
 
 
 def experiment_selector_candidates(experiment: Experiment) -> tuple[str, ...]:
+    # Selectors use the A100 point name, so the same --only-experiment and
+    # split-hint rules work whatever --mm/--ggnn-rps-scale is.
+    name = experiment.a100_name or experiment.experiment_name
     return (
         experiment.table_key,
         experiment.scenario_dir,
-        experiment.experiment_name,
-        f"{experiment.table_key}:{experiment.experiment_name}",
-        f"{experiment.scenario_dir}:{experiment.experiment_name}",
+        name,
+        f"{experiment.table_key}:{name}",
+        f"{experiment.scenario_dir}:{name}",
     )
 
 
@@ -726,7 +751,7 @@ def build_run_spec(
 
 
 def selected_experiments(args: argparse.Namespace) -> list[Experiment]:
-    experiments = build_experiments()
+    experiments = build_experiments(args.mm_rps_scale, args.ggnn_rps_scale)
     if args.only_table:
         allowed = set(args.only_table)
         experiments = [exp for exp in experiments if exp.table_key in allowed]
@@ -1338,6 +1363,12 @@ def main() -> int:
         print(f"[AE][part1][Figures10-12][setup] CUDA_VISIBLE_DEVICES={args.effective_cuda_visible_devices}", flush=True)
     print(f"[AE][part1][Figures10-12][setup] non_mps_cuda_pipe_dir={args.cuda_plain_mps_pipe_dir}", flush=True)
     print(f"[AE][part1][Figures10-12][setup] private_mps_pipe_dir={args.cuda_mps_pipe_dir}", flush=True)
+    if args.mm_rps_scale != 1.0 or args.ggnn_rps_scale != 1.0:
+        print(
+            f"[AE][part1][Figures10-12][setup] rps_scale mm={args.mm_rps_scale:g} ggnn={args.ggnn_rps_scale:g} "
+            "(point names use the scaled rate; selectors the A100 name)",
+            flush=True,
+        )
 
     ok, errors, warnings = preflight(args, output_dir)
     for warning in warnings:
