@@ -911,6 +911,44 @@ split measured.
 6. [ ] Add `--llm-backend` to `run.sh` / `scripts/ae/run_all.py`; keep logs separate
        (`logs/<timestamp>-sglang/`).
 
+### Fig 11(a) with H200-scaled matmul load (Track L, job 92495, 2026-10-23)
+
+At the A100 rates the H200 is barely loaded: in job 91967 (llm-1-mm-1/6/10,
+all schedulers, 90 s) stream's LLM latency only went 15.5 → 20.0 ms/token, and
+MorphX was 1.6–1.8 ms behind stream everywhere. `run_colocate_part1.py` now has
+`--mm-rps-scale` / `--ggnn-rps-scale` (`MORPHX_MM_RPS_SCALE` /
+`MORPHX_GGNN_RPS_SCALE`, default 1). Points are named after the rate actually
+used (A100 `llm-1-mm-10` at ×3 → `llm-1-mm-30`); `--only-experiment` and
+split-hint rules keep the A100 names. `env-h100.sh` sets `MORPHX_MM_RPS_SCALE=3`.
+Job: `scripts/baselines/l_fig11_scaled.pbs`, results in
+`~/morphx/runs/l-fig11-92495.gaas` on hpcc.
+
+One matmul request is 10 GEMMs of 8192³ (mycutlass, ~23 ms), so the GPU
+saturates around 30 req/s: the matmul throughput is the same at 30 and 50 req/s.
+LLM latency in ms/token (matmul throughput in brackets, the table's `completed`
+column; stream completes everything that's offered):
+
+| mm req/s | stream | MorphX | orion | timeslice | MPS-30 | MPS-50 | TGS |
+|---|---|---|---|---|---|---|---|
+| 3 | 16.6 (0.30) | 17.7 (0.30) | 16.3 (0.30) | 17.5 (0.30) | 17.7 (0.30) | 16.9 (0.30) | 18.2 (0.07) |
+| 18 | 26.0 (1.78) | 28.4 (1.78) | 20.9 (1.78) | 20.0 (1.78) | 18.9 (1.78) | 17.0 (1.77) | 18.4 (0.07) |
+| 30 | 63.8 (3.02) | 38.7 (2.34) | 31.1 (2.74) | 21.9 (2.13) | 19.6 (2.37) | 17.3 (1.80) | 18.3 (0.07) |
+| 50 | 68.9 (3.07) | 37.0 (2.33) | 31.1 (2.74) | 21.9 (2.14) | 19.6 (2.37) | 17.4 (1.81) | 18.3 (0.07) |
+| A100 heaviest (0.10): | 59.5 (0.99) | 40.0 (0.98) | 52.1 (0.99) | 74.2 (0.99) | 39.8 (0.98) | 28.1 (0.78) | 18.5 (0.07) |
+
+- The scaled load reproduces the A100's contention: stream degrades 4× at
+  saturation (16.6 → 63.8 ms), like the A100 (20 → 59.5).
+- MorphX cuts LLM latency vs stream by ~40% at saturation (38.7 vs 63.8) but
+  gives up ~22% of the matmul throughput (2.34 vs 3.02). On the A100 it cut
+  latency by 33% with no throughput loss.
+- Unlike the A100, MorphX doesn't lead the latency/throughput trade-off on the
+  H200: orion (31.1, 2.74) and MPS-30 (19.6, 2.37) both beat it on both axes at
+  saturation, and at 18 req/s MorphX is behind stream (28.4 vs 26.0).
+- Likely causes: the per-launch overhead (§5, C3), the A100-tuned split hint
+  (76 → 93 by SM ratio, never re-tuned for this point), and the Sm80-style
+  mycutlass GEMMs. Next: sweep `--smsched-split-hint` at 18 and 30 req/s; GGNN
+  scale (Fig 10, 11(b), 12) not measured yet.
+
 ### Expected outcome
 
 - A recent SGLang release supports CUDA 13 and Hopper. This avoids

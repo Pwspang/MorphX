@@ -44,6 +44,9 @@ export MORPHX_MODEL_ALIASES="${MORPHX_MODEL_ALIASES-llama-3-8b=qwen3-8b,llama-2-
 # Fig 13-14: the A100 request rates leave the H200 lightly loaded; 3x puts the
 # baseline's saturation knee on the same rows (docs/h100-port-plan.md section 9, J4).
 export MORPHX_PD_RPS_SCALE="${MORPHX_PD_RPS_SCALE:-3}"
+# Fig 10-12: same for the matmul load; 3x takes llm-1-mm from light (mm 3/s) to
+# saturated (mm 30/s), as the A100 grid did (section 9, Track L). GGNN unmeasured.
+export MORPHX_MM_RPS_SCALE="${MORPHX_MM_RPS_SCALE:-3}"
 unset _morphx_repo
 
 # Data and baselines
