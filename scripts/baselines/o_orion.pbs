@@ -1,0 +1,68 @@
+#!/bin/bash
+# Track O: the Orion-style runtime (runtime/src/cuda-orion.cpp) on the H200.
+#   cd <repo> && qsub scripts/baselines/o_orion.pbs
+#   qsub -v PARTS="hooktest fig11",SCHEDULERS="orion-rt orion smsched stream" ...
+# parts: hooktest (orion_hook_test.cu with and without the hook),
+#        debug (one short orion-rt run with MORPHX_ORION_DEBUG=1),
+#        fig11 (Fig 11(a) at the Track L points, MORPHX_MM_RPS_SCALE from env-h100.sh).
+# Needs microbench/build-model (pass-built libmycutlass.so).
+#PBS -N morphx-o-orion
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=200gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"hooktest debug fig11"}
+POINTS=${POINTS:-"llm-1-mm-6 llm-1-mm-10"}
+SCHEDULERS=${SCHEDULERS:-"orion-rt orion smsched stream"}
+OUT=${OUT:-$HOME/morphx/runs/o-$PBS_JOBID}
+mkdir -p "$OUT"
+echo "== host=$(hostname) job=$PBS_JOBID commit=$(git log --oneline -1) parts=$PARTS out=$OUT"
+
+( module load gnu/gcc-12.3
+  for v in "build:OFF:OFF" "build-orion:ON:OFF" "build-lithos:OFF:ON"; do
+    IFS=: read -r dir orion lithos <<< "$v"
+    rm -rf runtime/$dir && CC=gcc CXX=g++ cmake -S runtime -B runtime/$dir -DUSE_CUDA_ORION=$orion -DUSE_CUDA_LITHOS=$lithos \
+      > /tmp/o-$dir-$PBS_JOBID.log 2>&1 && cmake --build runtime/$dir -j 12 --target cuda cuda_hook preload api \
+      >> /tmp/o-$dir-$PBS_JOBID.log 2>&1 || { tail -20 /tmp/o-$dir-$PBS_JOBID.log; exit 1; }
+  done ) || exit 1
+
+if [[ " $PARTS " == *" hooktest "* ]]; then
+  echo "== hook test"
+  nvcc -O2 -arch=sm_90 -o "$OUT/orion_hook_test" runtime/test/orion_hook_test.cu
+  echo "-- without hook"; ORION_EXPECT=plain "$OUT/orion_hook_test"
+  echo "-- with hook"
+  ORION_EXPECT=hooked MORPHX_ORION_DEBUG=1 SMSCHED_DEBUG_LIMIT=20 \
+    LD_PRELOAD=$PWD/runtime/build-orion/libcuda.so:$PWD/runtime/build-orion/libpreload.so "$OUT/orion_hook_test"
+  echo "-- with hook, MORPHX_ORION_SERIALIZE=0"
+  ORION_EXPECT=plain MORPHX_ORION_SERIALIZE=0 \
+    LD_PRELOAD=$PWD/runtime/build-orion/libcuda.so:$PWD/runtime/build-orion/libpreload.so "$OUT/orion_hook_test"
+fi
+
+if [[ " $PARTS " == *" debug "* ]]; then
+  echo "== orion-rt debug run (llm-1-mm-10, 60 s)"
+  timeout 900 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-10 --only-scheduler orion-rt \
+    --orion-rt-env "MORPHX_ORION_DEBUG=1 SMSCHED_DEBUG_LIMIT=10" --model llama-3-8b --duration 60 \
+    --output-dir "$OUT/debug" --run-timeout 600 2>&1 | grep -E "DONE|FAILED|ERROR"
+  for f in "$OUT"/debug/logs/colocate/llm-mm/*/orion-rt.*; do
+    echo "-- $f"; grep -E "\[orion\]|Error|error|Traceback" "$f" | head -20; sed -n '/=== Results ===/,$p' "$f" | head -12
+  done
+fi
+
+if [[ " $PARTS " == *" fig11 "* ]]; then
+  echo "== Fig 11(a) points=$POINTS schedulers=$SCHEDULERS mm_scale=$MORPHX_MM_RPS_SCALE"
+  points=(); for p in $POINTS; do points+=(--only-experiment "$p"); done
+  scheds=(); for s in $SCHEDULERS; do scheds+=(--only-scheduler "$s"); done
+  timeout 6000 python scripts/ae/run_colocate_part1.py "${points[@]}" "${scheds[@]}" \
+    --model llama-3-8b --duration "${FIG11_DURATION:-90}" --output-dir "$OUT/fig11" --run-timeout 900 2>&1 \
+    | grep -E "DONE|FAILED|ERROR|rps_scale|table"
+  cat "$OUT/fig11/tables/compact/"*.tsv
+fi

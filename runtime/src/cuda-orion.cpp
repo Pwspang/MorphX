@@ -657,6 +657,43 @@ int getenv_int(const char* varname, int default_value) {
 
 
 
+/**
+ * Orion-style policy (EuroSys'24 "Orion: Interference-aware, Fine-grained GPU
+ * Sharing for ML Applications", simplified):
+ *  - a launch on a high-priority stream (cuStreamGetPriority < 0, which
+ *    scripts/colocate/run.py --use-orion gives the LLM) goes straight to the
+ *    driver;
+ *  - best-effort launches (every other stream, including the default stream)
+ *    are serialized across all best-effort streams: each waits on an event
+ *    recorded after the previous best-effort kernel, so at most one
+ *    best-effort kernel is in flight and it can only use what the
+ *    high-priority work leaves free.
+ * Real Orion also uses offline kernel profiles to decide when a best-effort
+ * kernel may run; this variant only bounds best-effort concurrency.
+ *
+ * MORPHX_ORION_DEBUG=1 prints the first SMSCHED_DEBUG_LIMIT decisions and
+ * launch counts at exit. MORPHX_ORION_SERIALIZE=0 disables the best-effort
+ * serialization (pass-through hook, stream priorities only).
+ */
+static CUevent be_event = nullptr;
+static std::mutex be_mutex;
+static int orion_debug = 0;
+static int orion_debug_limit = 200;
+static int orion_serialize = 1;
+static std::atomic<long> orion_hp_launches{0};
+static std::atomic<long> orion_be_launches{0};
+static std::atomic<long> orion_be_waits{0};
+static std::atomic<int> orion_debug_prints{0};
+
+static void orionPrintStats() {
+    fprintf(stderr, "[orion] launches: high-priority=%ld best-effort=%ld (waited=%ld) serialize=%d\n",
+        orion_hp_launches.load(), orion_be_launches.load(), orion_be_waits.load(), orion_serialize);
+}
+
+static bool orionDebugPrint() {
+    return orion_debug && orion_debug_prints.fetch_add(1) < orion_debug_limit;
+}
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
@@ -824,43 +861,6 @@ std::shared_mutex launchMutex;
  * aims at providing runtime probing support
  */
 
-/**
- * Orion-style policy (EuroSys'24 "Orion: Interference-aware, Fine-grained GPU
- * Sharing for ML Applications", simplified):
- *  - a launch on a high-priority stream (cuStreamGetPriority < 0, which
- *    scripts/colocate/run.py --use-orion gives the LLM) goes straight to the
- *    driver;
- *  - best-effort launches (every other stream, including the default stream)
- *    are serialized across all best-effort streams: each waits on an event
- *    recorded after the previous best-effort kernel, so at most one
- *    best-effort kernel is in flight and it can only use what the
- *    high-priority work leaves free.
- * Real Orion also uses offline kernel profiles to decide when a best-effort
- * kernel may run; this variant only bounds best-effort concurrency.
- *
- * MORPHX_ORION_DEBUG=1 prints the first SMSCHED_DEBUG_LIMIT decisions and
- * launch counts at exit. MORPHX_ORION_SERIALIZE=0 disables the best-effort
- * serialization (pass-through hook, stream priorities only).
- */
-static CUevent be_event = nullptr;
-static std::mutex be_mutex;
-static int orion_debug = 0;
-static int orion_debug_limit = 200;
-static int orion_serialize = 1;
-static std::atomic<long> orion_hp_launches{0};
-static std::atomic<long> orion_be_launches{0};
-static std::atomic<long> orion_be_waits{0};
-static std::atomic<int> orion_debug_prints{0};
-
-static void orionPrintStats() {
-    fprintf(stderr, "[orion] launches: high-priority=%ld best-effort=%ld (waited=%ld) serialize=%d\n",
-        orion_hp_launches.load(), orion_be_launches.load(), orion_be_waits.load(), orion_serialize);
-}
-
-static bool orionDebugPrint() {
-    return orion_debug && orion_debug_prints.fetch_add(1) < orion_debug_limit;
-}
-
 // True if launches on hStream go straight to the driver.
 static bool orionPassThrough(CUstream hStream) {
     if(!orion_serialize) {
@@ -881,6 +881,8 @@ static bool orionPassThrough(CUstream hStream) {
 
 // Runs launch() as the next best-effort kernel: after the previous one, and
 // records be_event behind it.
+// (C++ linkage: templates cannot live in the extern "C" block.)
+extern "C++" {
 template <typename LaunchFn>
 static CUresult orionLaunchBestEffort(CUstream hStream, LaunchFn launch) {
     std::lock_guard<std::mutex> lock(be_mutex);
@@ -903,6 +905,7 @@ static CUresult orionLaunchBestEffort(CUstream hStream, LaunchFn launch) {
     }
     return res;
 }
+} // extern "C++"
 
 CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,

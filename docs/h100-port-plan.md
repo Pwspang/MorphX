@@ -645,6 +645,39 @@ schedulers (timeslice, TGS, MPS) load the model in each process: request
 - `scripts/baselines/f2_tgs.pbs` reproduces the probes, bisection and the
   Fig 11(a) TGS point.
 
+#### Extra methods: Orion-style and LithOS-style runtimes (Track O / LI)
+
+The repo ships two more interception variants that the AE never ran
+(`-DUSE_CUDA_ORION` / `-DUSE_CUDA_LITHOS`, forced OFF in `run_all.py`). They are
+now Figure 10–12 schedulers, outside the paper's set:
+
+| Scheduler | Process setup | Hook | Policy |
+|---|---|---|---|
+| `orion` (paper) | multithread, `--use-orion` stream priorities | none | priorities only |
+| `orion-rt` | same as `orion` | `runtime/build-orion` (`cuda-orion.cpp`) | high-priority streams launch straight through; launches on every other stream are serialized across streams (each waits on an event after the previous best-effort kernel), so at most one best-effort kernel runs at a time. No offline kernel profiles, unlike real Orion |
+| `lithos` | same as `smsched` | `runtime/build-lithos` (`cuda-lithos.cpp`) | MorphX mechanism with kernels cut into slices of a few waves (Track LI) |
+
+- Selection: `--only-scheduler orion-rt|lithos`, `--extra-scheduler`, or
+  `MORPHX_EXTRA_SCHEDULERS=orion-rt,lithos|all` (also makes `run_all.py` build
+  the variant dirs). The default `./run.sh` scheduler set is unchanged, and
+  compact tables only gain `orion-rt_*`/`lithos_*` columns when they ran.
+- Env: `--orion-rt-env` / `ORION_RT` (e.g. `MORPHX_ORION_DEBUG=1`,
+  `MORPHX_ORION_SERIALIZE=0` for a pass-through hook); `--lithos-env` /
+  `LITHOS`, applied on top of the smsched environment.
+- `plot_figures.py` draws them as Orion-RT / LithOS-style; `--autoscale-x`
+  fits the Figure 11 latency axes to the data (H200 values fall outside the
+  paper's 20–60 ms range).
+- `cuda-orion.cpp` CUDA 13 port: the best-effort event was never created
+  (so nothing was serialized), `cuLaunchKernelEx` exited the process, and
+  the `_ptsz` launches weren't hooked. Now all four launch entry points
+  share the policy, launch attributes pass through unchanged,
+  `cuGetProcAddress` hands out the per-thread-stream hooks, capturing
+  streams pass through, and the per-call stderr prints are gone. Compiles
+  against CUDA 13.0 and 12.4 headers.
+- Test: `runtime/test/orion_hook_test.cu` (best-effort kernels must not
+  overlap, high priority must overlap them); `scripts/baselines/o_orion.pbs`
+  runs it, a debug run and Fig 11(a).
+
 ## 9. SGLang backend (primary LLM engine)
 
 **SGLang-first** (decision 2026-10-22, see top of this document). SGLang
