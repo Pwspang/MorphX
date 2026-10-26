@@ -678,6 +678,30 @@ now Figure 10–12 schedulers, outside the paper's set:
   overlap, high priority must overlap them); `scripts/baselines/o_orion.pbs`
   runs it, a debug run and Fig 11(a).
 
+Results on the H200 (job 94060, 2026-10-26; memcpy backend, Qwen3-8B for
+Llama-3-8B, matmul load ×3, 90 s per run, default smsched env as in Track L):
+
+| Check | Result |
+|---|---|
+| Hook test, no hook | both best-effort kernels overlap (0–101 ms) — PASS |
+| Hook test, `orion-rt` hook | best-effort kernels run back to back (0–101, 101–203 ms), high priority overlaps them, results correct, `cudaLaunchKernelExC` serialized too — PASS |
+| Hook test, `MORPHX_ORION_SERIALIZE=0` | behaves like no hook — PASS |
+| Debug run (llm-1-mm at 30/s, 60 s) | 47 requests served, matmul launches serialized on the best-effort stream, no errors |
+
+Fig 11(a), LLM mean per-token latency in ms (matmul throughput in 10^5 op/s):
+
+| Matmul rate | stream | smsched (MorphX) | orion | orion-rt |
+|---|---|---|---|---|
+| 18/s | 25.87 (1.78) | 28.88 (1.78) | 21.30 (1.78) | 21.17 (1.78) |
+| 30/s | 63.78 (3.02) | 40.75 (2.41) | 30.87 (2.74) | 30.89 (2.74) |
+
+`orion-rt` matches `orion` here: the matmul side uses a single stream, whose
+kernels are already serialized, so cross-stream best-effort serialization adds
+nothing. It would differ only with several best-effort streams (e.g. GGNN's
+internal streams, or several background tasks). A stronger Orion stand-in
+would also have to hold best-effort kernels while high-priority work runs,
+which needs Orion's kernel profiles.
+
 ## 9. SGLang backend (primary LLM engine)
 
 **SGLang-first** (decision 2026-10-22, see top of this document). SGLang
