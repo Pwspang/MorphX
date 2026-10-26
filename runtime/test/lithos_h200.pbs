@@ -1,0 +1,98 @@
+#!/bin/bash
+# LithOS-style runtime (runtime/src/cuda-lithos.cpp) on the hpcc H200:
+# unit tests (memcpy + hostmapped), Fig16 GEMM bench overhead and an SGLang
+# mycutlass smoke run, each compared with no runtime and the MorphX hook.
+#   cd <repo> && qsub runtime/test/lithos_h200.pbs     (PARTS="unit bench sglang fig11")
+# fig11: Fig 11(a) llm-1-mm-6/-10 (matmul x3 via env-h100.sh, 90 s) for lithos,
+# smsched and stream, built into runtime/build{,-lithos} of this checkout.
+# Needs smsched-pass/build/libsmsched.so in this checkout and a pass-built
+# microbench (bench + libmycutlass.so) in $MB_DIR.
+#PBS -N morphx-li-test
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=200gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+module purge
+module load cuda/13.0 gnu/gcc-12.3
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh > /dev/null
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"unit bench sglang fig11"}
+MB_DIR=${MB_DIR:-$HOME/MorphX/microbench/build-model}
+OUT=/tmp/li-$PBS_JOBID
+mkdir -p $OUT
+echo "== host=$(hostname) job=$PBS_JOBID parts=$PARTS"
+
+if [[ " $PARTS " == *" unit "* ]]; then
+  for be in memcpy hostmapped; do
+    echo "######## unit tests, backend=$be"
+    MORPHX_SYNC_BACKEND=$be OUT=$OUT/$be timeout 900 bash runtime/test/run_lithos_test.sh
+    echo "exit=$?"
+  done
+fi
+
+# Hooks for the comparisons (memcpy backend): lithos and MorphX's cuda.cpp.
+REAL_LIBCUDA=/usr/lib64/libcuda.so
+for v in lithos cuda; do
+  src=runtime/src/cuda-$v.cpp; [[ $v == cuda ]] && src=runtime/src/cuda.cpp
+  mkdir -p $OUT/hook-$v
+  g++ -std=c++20 -O3 -g -fPIC -shared -DMORPHX_SYNC_BACKEND_MEMCPY -I$CUDA_HOME/include -Iinclude $src \
+      -o $OUT/hook-$v/libcuda.so -L$CUDA_HOME/lib64 -lcudart -ldl $REAL_LIBCUDA
+  gcc -O3 -fPIC -shared runtime/src/preload.c -o $OUT/hook-$v/libpreload.so -ldl
+done
+pre() { echo "LD_PRELOAD=$OUT/hook-$1/libcuda.so:$OUT/hook-$1/libpreload.so"; }
+
+if [[ " $PARTS " == *" bench "* ]]; then
+  echo "######## Fig16 bench, M=16 N=K=65536 (CUTLASS column is the patched kernel)"
+  export SMSCHED_BENCH_M_SIZES=16 SMSCHED_BENCH_N_SIZES=65536 SMSCHED_BENCH_K_SIZES=65536
+  export SMSCHED_BENCH_WARMUP_ITERS=2 SMSCHED_BENCH_TIMED_ITERS=5 SMSCHED_TARGET_PATTERNS=__smsched_no_target__
+  for cfg in "none" "morphx" "lithos" "lithos SMSCHED_LITHOS_SLICE_WAVES=4" "lithos SMSCHED_LITHOS_SYNC=0"; do
+    set -- $cfg; kind=$1; shift
+    envs="$*"
+    case $kind in none) p= ;; morphx) p=$(pre cuda) ;; lithos) p="$(pre lithos) MORPHX_LAUNCH_STATS=1" ;; esac
+    echo "-- $cfg"
+    (cd $MB_DIR && timeout 600 env $p $envs ./bench 2>$OUT/bench.err | grep -E "^M=")
+    grep -E "lithos-stats" $OUT/bench.err || true
+  done
+fi
+
+if [[ " $PARTS " == *" sglang "* ]]; then
+  module unload gnu/gcc-12.3
+  source /opt/rh/gcc-toolset-13/enable
+  source $HOME/morphx/envs/sglang-stock/bin/activate
+  export MYCUTLASS_LIB_DIR=$MB_DIR
+  MODEL=$HOME/morphx/hf/hub/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f
+  SMOKE="python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16 --gemm mycutlass --num-requests 8 --output-len 32 --census-decode-steps 4"
+  for kind in none morphx lithos; do
+    case $kind in none) p= ;; morphx) p=$(pre cuda) ;; lithos) p="$(pre lithos) MORPHX_LAUNCH_STATS=1" ;; esac
+    echo "######## SGLang mycutlass smoke, runtime=$kind"
+    timeout 900 env $p $SMOKE > $OUT/smoke-$kind.log 2>&1
+    echo "exit=$?"
+    grep -E "^\[(smoke|poisson|census)\]|SMOKE|lithos-stats|Error" $OUT/smoke-$kind.log | head -30
+  done
+  echo "######## greedy tokens mycutlass vs torch under the lithos hook"
+  timeout 900 env $(pre lithos) python scripts/sglang/check_mycutlass.py --model "$MODEL" 2>&1 | grep -E "^\[(check|e2e)\]|Error|error"
+fi
+if [[ " $PARTS " == *" fig11 "* ]]; then
+  echo "######## Fig 11(a) llm-1-mm-6/-10, lithos vs smsched vs stream"
+  ( module load gnu/gcc-12.3
+    for v in "build:OFF" "build-lithos:ON"; do
+      IFS=: read -r dir lithos <<< "$v"
+      rm -rf runtime/$dir && CC=gcc CXX=g++ cmake -S runtime -B runtime/$dir -DUSE_CUDA_LITHOS=$lithos \
+        > $OUT/cmake-$dir.log 2>&1 && cmake --build runtime/$dir -j 12 --target cuda cuda_hook preload api \
+        >> $OUT/cmake-$dir.log 2>&1 || { tail -20 $OUT/cmake-$dir.log; exit 1; }
+    done ) || exit 1
+  [[ -e microbench/build-model ]] || ln -s $MB_DIR microbench/build-model
+  source scripts/ae/env-h100.sh > /dev/null
+  export MORPHX_PYTHON="$(command -v python)"
+  F11=$HOME/morphx/runs/li-fig11-$PBS_JOBID
+  timeout 3000 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-6 --only-experiment llm-1-mm-10 \
+    --only-scheduler lithos --only-scheduler smsched --only-scheduler stream \
+    --model llama-3-8b --duration 90 --output-dir "$F11" --run-timeout 900 2>&1 | grep -E "DONE|FAILED|ERROR|rps_scale"
+  cat "$F11"/tables/compact/llm-1-mm.tsv 2>/dev/null
+  for f in "$F11"/logs/colocate/llm-mm/*/lithos.err; do
+    echo "-- $f"; grep -E "\[smsched\]\[lithos\] (profile|register)" "$f" | head -4
+  done
+fi
+echo "== done"
