@@ -13,6 +13,9 @@
 # See docs/h100-port-plan.md, "nscc2b (ASPIRE 2B) setup".
 
 export MORPHX_ROOT="${MORPHX_ROOT:-${HOME}/scratch/morphx}"
+# The default PrgEnv makes `cc`/`CC` the Cray compiler wrappers, which link
+# MPI/xpmem into everything; build with the plain gcc-toolset-14 compilers.
+export CC="${CC:-gcc}" CXX="${CXX:-g++}"
 export MORPHX_LLVM_ROOT="${MORPHX_LLVM_ROOT:-${MORPHX_ROOT}/llvm}"
 export MORPHX_CUTLASS_ROOT="${MORPHX_CUTLASS_ROOT:-${MORPHX_ROOT}/src/cutlass}"
 export MORPHX_HF_CACHE="${MORPHX_HF_CACHE:-${MORPHX_ROOT}/hf/hub}"
@@ -33,6 +36,15 @@ export MORPHX_SYNC_BACKEND="${MORPHX_SYNC_BACKEND:-gdr}"
 case ":${LD_LIBRARY_PATH:-}:" in
   *":${MORPHX_LLVM_ROOT}/compat:"*) ;;
   *) export LD_LIBRARY_PATH="${MORPHX_LLVM_ROOT}/compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+esac
+
+# Boost headers (the runtime's lock-free pool queue) aren't installed on
+# nscc2b; a copy of hpcc's /usr/include/boost (1.75) lives here. CPATH reaches
+# gcc and clang alike.
+export MORPHX_BOOST_INCLUDE="${MORPHX_BOOST_INCLUDE:-${MORPHX_ROOT}/boost/include}"
+case ":${CPATH:-}:" in
+  *":${MORPHX_BOOST_INCLUDE}:"*) ;;
+  *) export CPATH="${MORPHX_BOOST_INCLUDE}${CPATH:+:${CPATH}}" ;;
 esac
 
 if [[ -z "${MORPHX_PYTHON:-}" && -n "${VIRTUAL_ENV:-}" ]]; then
