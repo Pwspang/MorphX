@@ -145,3 +145,20 @@ locally. hpcc is no longer used.
    variant not run yet).
 7. **Fig 15 neutrino:** crashes with "illegal instruction" in its instrumented kernels on DNN
    and LLM (cells N/A).
+
+### Answers so far (23:30 SGT)
+
+- **Q1 (Fig 11 whitelist): confirmed, mostly fixed.** With `MORPHX_TARGET_MM_STREAM=1`
+  MorphX at saturation is 15.4 ms/token vs stream 63.0 in Fig 11(a) (old: 68.7) and 17.7 vs
+  21.0 in Fig 11(b) (old: 47.8), keeping 63% / 100% of stream's matmul throughput. Light load:
+  12.1 vs stream 9.9 (old 14.2). **New anomaly:** in Fig 11(a) at 6 and 12 mm/s MorphX's LLM
+  sits at ~25–26 ms/token for the whole run (every request), worse than at 18–30 mm/s (~15).
+  Not explained yet.
+- **Q2 (gdr vs memcpy): gdr is better, not the cause.** Job 187714: SGLang decode TBT none
+  11.25 / gdr 11.98 / memcpy 14.56 ms; host cost per patched launch 0.91 µs (gdr) vs 5.87 µs
+  (memcpy); Fig 11(a) MorphX (old whitelist) with memcpy is 15–16% worse than with gdr at every
+  point (e.g. 80.2 vs 68.7 at 30 mm/s).
+- **Q3 (Fig 10/12): no re-run needed.** The GGNN tables reproduce the paper's shape: at
+  saturation MorphX 14.2 ms/token vs stream 53.3 (A100: 28.2 vs 116.5) with 65% of stream's
+  GGNN throughput (A100: 73%); MorphX ≈ stream at light load. **New issue:** lithos breaks from
+  GGNN 0.8 req/s up (LLM latency 70–3800 ms/token, throughput capped ~0.94).
