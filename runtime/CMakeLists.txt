@@ -50,6 +50,7 @@ target_link_libraries(stub
     PRIVATE
     dl
     cudart
+    ${MORPHX_GDR_LIBS}
 )
 set_property(TARGET stub PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -67,6 +68,7 @@ target_link_libraries(stub_raw
     PRIVATE
     dl
     cudart
+    ${MORPHX_GDR_LIBS}
 )
 set_property(TARGET stub_raw PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -85,6 +87,7 @@ target_link_libraries(api
     PRIVATE
     dl
     cudart
+    ${MORPHX_GDR_LIBS}
 )
 set_property(TARGET api PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -102,6 +105,7 @@ target_link_libraries(base
     PRIVATE
     dl
     cudart
+    ${MORPHX_GDR_LIBS}
 )
 set_property(TARGET base PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -130,7 +134,7 @@ set_target_properties(cuda PROPERTIES OUTPUT_NAME "cuda" PREFIX "lib")
 target_include_directories(cuda PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ../include)
 target_link_directories(cuda PRIVATE ${CUDAToolkit_LIBRARY_DIR})
 target_compile_options(cuda PRIVATE -O3 -g -fPIC)
-target_link_libraries(cuda PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA})
+target_link_libraries(cuda PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA} ${MORPHX_GDR_LIBS})
 
 # Narrow LD_PRELOAD shim for workloads where preloading the full fake libcuda
 # changes too many driver symbols. It reuses the scheduler implementation but
@@ -140,7 +144,7 @@ set_target_properties(cuda_hook PROPERTIES OUTPUT_NAME "cuda_hook" PREFIX "lib" 
 target_include_directories(cuda_hook PRIVATE ${CUDAToolkit_INCLUDE_DIRS} ../include)
 target_link_directories(cuda_hook PRIVATE ${CUDAToolkit_LIBRARY_DIR})
 target_compile_options(cuda_hook PRIVATE -O3 -g -fPIC)
-target_link_libraries(cuda_hook PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA})
+target_link_libraries(cuda_hook PRIVATE cudart dl stdc++ ${MORPHX_REAL_LIBCUDA} ${MORPHX_GDR_LIBS})
 target_link_options(cuda_hook PRIVATE
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/cuda_hook_exports.map"
     "-Wl,-soname,libcuda.so"

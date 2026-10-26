@@ -15,6 +15,7 @@
 //   per-block protocol stays in device memory.
 #if !defined(MORPHX_SYNC_BACKEND_HOSTMAPPED) && !defined(MORPHX_SYNC_BACKEND_MEMCPY)
 #include <gdrapi.h>
+#include <immintrin.h>
 #else
 #define GPU_PAGE_SHIFT 16
 #define GPU_PAGE_SIZE (1UL << GPU_PAGE_SHIFT)
@@ -110,6 +111,8 @@ class GdrPool {
 private:
     CUdeviceptr d_pool;
     uintptr_t h_pool;
+    CUdeviceptr d_alloc;  // cudaMalloc result (d_pool is rounded up from it)
+    void *h_map;          // gdr_map result (h_pool is offset from it)
     gdr_t g;
     gdr_mh_t g_mh;
     boost::lockfree::queue<GdrEntry> buffer{GDR_POOL_SIZE / GDR_ENTRY_SIZE};
@@ -117,28 +120,31 @@ public:
     GdrPool() {
         g = gdr_open();
         if(g == nullptr) {
-            std::cerr << "Failed to open gdr";
+            std::cerr << "Failed to open gdr (is /dev/gdrdrv present and accessible?)\n";
             exit(EXIT_FAILURE);
         }
-        CHECK_CUDA_ERROR(cudaMalloc((void**)&d_pool, GDR_POOL_SIZE));
-        CHECK_CUDA_ERROR(cudaMemset((void*)d_pool, 0, GDR_POOL_SIZE));
-        d_pool = (d_pool + (GPU_PAGE_SIZE - 1)) & ~(GPU_PAGE_SIZE - 1);
+        // gdr_pin_buffer needs a GPU-page (64 KB) aligned range: over-allocate
+        // by one page so the rounded-up pool stays inside the allocation.
+        CHECK_CUDA_ERROR(cudaMalloc((void**)&d_alloc, GDR_POOL_SIZE + GPU_PAGE_SIZE));
+        CHECK_CUDA_ERROR(cudaMemset((void*)d_alloc, 0, GDR_POOL_SIZE + GPU_PAGE_SIZE));
+        d_pool = (d_alloc + (GPU_PAGE_SIZE - 1)) & ~(CUdeviceptr)(GPU_PAGE_SIZE - 1);
         if(gdr_pin_buffer(g, (unsigned long)d_pool, GDR_POOL_SIZE, 0, 0, &g_mh) != 0) {
-            std::cerr << "Failed to pin input buffer";
+            std::cerr << "Failed to pin input buffer\n";
             exit(EXIT_FAILURE);
         }
-        if (gdr_map(g, g_mh, (void**)&h_pool, GDR_POOL_SIZE) != 0) {
-            std::cerr << "Failed to map input GPU buffer";
+        if (gdr_map(g, g_mh, &h_map, GDR_POOL_SIZE) != 0) {
+            std::cerr << "Failed to map input GPU buffer\n";
             exit(EXIT_FAILURE);
         }
         gdr_info_t info;
         if(gdr_get_info(g, g_mh, &info) != 0) {
-            std::cerr << "Failed to get info";
+            std::cerr << "Failed to get info\n";
             exit(EXIT_FAILURE);
         }
-        int off = info.va - d_pool;
-        h_pool = h_pool + off;
-        d_pool = d_pool + off;
+        // The mapping starts at the pinned page (info.va); d_pool is page
+        // aligned, so off is 0, but keep the general form.
+        long off = (long)(d_pool - info.va);
+        h_pool = (uintptr_t)h_map + off;
         // printf("h_pool: %lx, d_pool: %llx\n", h_pool, d_pool);
         for(size_t i = 0; i < GDR_POOL_SIZE; i += GDR_ENTRY_SIZE) {
             GdrEntry entry({d_pool + i, h_pool + i});
@@ -183,13 +189,16 @@ public:
         return (entry.h - h_pool) / GDR_BUFFER_SIZE;
     }
 
+    // The BAR mapping is write-combining: one aligned 8-byte store, then sfence
+    // so it leaves the WC buffer (and, PCIe posted writes being ordered, lands
+    // before the doorbell of a following kernel launch). Same effect as
+    // gdr_copy_to_mapping/gdr_copy_from_mapping for 8 bytes, minus the call.
     inline void set(GdrEntry &entry, uint64_t value) {
-        gdr_copy_to_mapping(g_mh, (void*)entry.h, &value, GDR_ENTRY_SIZE);
+        *(volatile uint64_t*)entry.h = value;
+        _mm_sfence();
     }
     inline uint64_t get(GdrEntry &entry) {
-        uint64_t ret = 0;
-        gdr_copy_from_mapping(g_mh, &ret, (void*)entry.h, GDR_ENTRY_SIZE);
-        return ret;
+        return *(volatile uint64_t*)entry.h;
     }
 
     // Host writes are visible immediately; nothing to order before a launch.
@@ -197,7 +206,7 @@ public:
     MORPHX_IMMEDIATE_LAUNCH_SLOTS
 
     ~GdrPool() {
-        if(gdr_unmap(g, g_mh, (void*)h_pool, GDR_POOL_SIZE) != 0) {
+        if(gdr_unmap(g, g_mh, h_map, GDR_POOL_SIZE) != 0) {
             std::cerr << "Failed to unmap input GPU buffer";
             exit(EXIT_FAILURE);
         }
@@ -209,7 +218,7 @@ public:
             std::cerr << "Failed to close gdr";
             exit(EXIT_FAILURE);
         }
-        CHECK_CUDA_ERROR(cudaFree((void*)d_pool));
+        CHECK_CUDA_ERROR(cudaFree((void*)d_alloc));
         while(!buffer.empty()) {
             GdrEntry entry;
             buffer.pop(entry);

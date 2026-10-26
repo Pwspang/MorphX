@@ -78,7 +78,10 @@ def default_python() -> str:
 
 def morphx_cmake_args() -> list[str]:
     """CMake cache settings shared by the repo-local builds (see scripts/ae/morphx_env.py)."""
-    return [f"-DMORPHX_SYNC_BACKEND={morphx_env.env_str('MORPHX_SYNC_BACKEND')}"]
+    args = [f"-DMORPHX_SYNC_BACKEND={morphx_env.env_str('MORPHX_SYNC_BACKEND')}"]
+    if os.environ.get("MORPHX_GDRCOPY_ROOT"):
+        args.append(f"-DMORPHX_GDRCOPY_ROOT={os.environ['MORPHX_GDRCOPY_ROOT']}")
+    return args
 
 
 # Part 1 split hint tuned on the 108-SM A100, scaled to MORPHX_NUM_SMS.

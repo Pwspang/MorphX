@@ -22,7 +22,7 @@ done
 case "${MORPHX_SYNC_BACKEND:-hostmapped}" in
     hostmapped) SYNC_DEF=-DMORPHX_SYNC_BACKEND_HOSTMAPPED; GDR_LIB= ;;
     memcpy) SYNC_DEF=-DMORPHX_SYNC_BACKEND_MEMCPY; GDR_LIB= ;;
-    gdr) SYNC_DEF=; GDR_LIB=-lgdrapi ;;
+    gdr) SYNC_DEF=${MORPHX_GDRCOPY_ROOT:+-I$MORPHX_GDRCOPY_ROOT/include}; GDR_LIB="${MORPHX_GDRCOPY_ROOT:+-L$MORPHX_GDRCOPY_ROOT/lib} -lgdrapi" ;;
     *) echo "unknown MORPHX_SYNC_BACKEND" >&2; exit 1 ;;
 esac
 g++ -std=c++20 -O3 -g -fPIC -shared $SYNC_DEF \

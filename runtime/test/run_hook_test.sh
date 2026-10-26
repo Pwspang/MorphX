@@ -20,6 +20,10 @@ if [[ "$BACKEND" == hostmapped ]]; then
 elif [[ "$BACKEND" == memcpy ]]; then
     DEFS+=(-DMORPHX_SYNC_BACKEND_MEMCPY)
 else
+    if [[ -n "${MORPHX_GDRCOPY_ROOT:-}" ]]; then
+        DEFS+=(-I"$MORPHX_GDRCOPY_ROOT/include")
+        GDR_LIB+=(-L"$MORPHX_GDRCOPY_ROOT/lib")
+    fi
     GDR_LIB+=(-lgdrapi)
 fi
 REAL_LIBCUDA=""

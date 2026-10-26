@@ -23,20 +23,22 @@ done
 
 # build_hook <repo> <backend> <name>
 build_hook() {
-    local def
+    local def gdr=
     case "$2" in
         hostmapped) def=-DMORPHX_SYNC_BACKEND_HOSTMAPPED ;;
         memcpy) def=-DMORPHX_SYNC_BACKEND_MEMCPY ;;
+        gdr) def="${MORPHX_GDRCOPY_ROOT:+-I$MORPHX_GDRCOPY_ROOT/include}"; gdr="${MORPHX_GDRCOPY_ROOT:+-L$MORPHX_GDRCOPY_ROOT/lib} -lgdrapi" ;;
         *) echo "unknown backend $2" >&2; exit 1 ;;
     esac
     mkdir -p "$OUT/$3"
     g++ -std=c++20 -O3 -g -fPIC -shared $def \
         -I"$CUDA_HOME/include" -I"$1/include" "$1/runtime/src/cuda.cpp" -o "$OUT/$3/libcuda.so" \
-        -L"$CUDA_HOME/lib64" -lcudart -ldl "$REAL_LIBCUDA"
+        -L"$CUDA_HOME/lib64" -lcudart -ldl ${gdr:-} "$REAL_LIBCUDA"
     gcc -O3 -g -fPIC -shared "$1/runtime/src/preload.c" -o "$OUT/$3/libpreload.so" -ldl
 }
 build_hook "$REPO" memcpy memcpy
 build_hook "$REPO" hostmapped hostmapped
+[[ -e /dev/gdrdrv ]] && build_hook "$REPO" gdr gdr
 if [[ -n "${BEFORE_REPO:-}" ]]; then
     build_hook "$BEFORE_REPO" memcpy before-memcpy
 fi
@@ -48,6 +50,7 @@ fi
 DEFAULT_CONFIGS="none:"
 [[ -n "${BEFORE_REPO:-}" ]] && DEFAULT_CONFIGS+=" before-memcpy:"
 DEFAULT_CONFIGS+=" memcpy: memcpy:MORPHX_MEMCPY_INIT=stream memcpy:MORPHX_AGENTS=grid memcpy:MORPHX_LAUNCH_CACHE=0 memcpy:MORPHX_AGENT_BATCH=0 memcpy:MORPHX_AGENT_CPU=-1 hostmapped:"
+[[ -e /dev/gdrdrv ]] && DEFAULT_CONFIGS+=" gdr: gdr:MORPHX_AGENTS=grid"
 for cfg in ${CONFIGS:-$DEFAULT_CONFIGS}; do
     hook=${cfg%%:*}
     extra=${cfg#*:}

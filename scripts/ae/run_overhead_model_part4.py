@@ -1076,6 +1076,11 @@ def main() -> int:
         print(f"{prefix}[setup] CUDA_VISIBLE_DEVICES={args.effective_cuda_visible_devices}", flush=True)
     for warning in preflight(args):
         print(f"{prefix}[preflight] WARNING: {warning}", flush=True)
+    sync_errors = [] if args.analyze_only or args.dry_run else morphx_env.sync_backend_errors()
+    for error in sync_errors:
+        print(f"{prefix}[preflight] ERROR: {error}", flush=True)
+    if sync_errors:
+        return 1
     if args.preflight_only:
         return 0
 

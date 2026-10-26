@@ -7,6 +7,7 @@
 //   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_HOSTMAPPED -I include -lcuda \
 //        -o sync_backend_test scripts/ae/sync_backend_test.cu
 //   nvcc -O2 -arch=sm_90 -DMORPHX_SYNC_BACKEND_MEMCPY -I include -lcuda ...
+//   nvcc -O2 -arch=sm_90 -I include -I$GDRCOPY/include -L$GDRCOPY/lib -lgdrapi -lcuda ...   (gdr, needs /dev/gdrdrv)
 // With the memcpy backend, run it with MORPHX_MEMCPY_INIT=control (default) and
 // MORPHX_MEMCPY_INIT=stream to cover both launch_init() paths.
 #include "common.h"

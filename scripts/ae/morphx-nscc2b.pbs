@@ -1,0 +1,68 @@
+#!/bin/bash
+# MorphX AE job for NSCC ASPIRE 2B (nscc2b) H200 nodes (PBS Pro, paid allocation).
+# See docs/h100-port-plan.md, "nscc2b (ASPIRE 2B) setup".
+#
+#   cd ~/scratch/morphx/MorphX
+#   qsub -v MODE=probe scripts/ae/morphx-nscc2b.pbs    # GPU, GDRCopy, MPS and %smid checks
+#   qsub -v MODE=smoke scripts/ae/morphx-nscc2b.pbs    # ./run.sh smoke
+#   qsub -l walltime=08:00:00 -v MODE=short scripts/ae/morphx-nscc2b.pbs
+#
+# MODE is any ./run.sh mode (smoke, short, resume, analyse, ...) or "probe".
+# Queue "normal" routes by size: <= 2 h -> gdev (max 2 running per user),
+# 2-24 h -> g1. One H200 per job; everything runs on GPU 0 of the allocation.
+#PBS -N morphx-ae
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+MODE="${MODE:-smoke}"
+REPO="${MORPHX_REPO:-${PBS_O_WORKDIR:-$HOME/scratch/morphx/MorphX}}"
+VENV="${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}"
+
+module load cuda/13.0
+# SGLang compiles some kernels with nvcc at run time; the default gcc-toolset-14
+# host compiler works with CUDA 13.0.
+source "$VENV/bin/activate"
+cd "$REPO"
+source scripts/ae/env-nscc2b.sh
+
+# PBS hands out GPU UUIDs; the AE scripts pin experiments to index 0.
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then
+  export CUDA_VISIBLE_DEVICES=0
+fi
+
+echo "host=$(hostname) job=${PBS_JOBID:-none} mode=${MODE} repo=${REPO} sync=${MORPHX_SYNC_BACKEND}"
+nvidia-smi --query-gpu=name,driver_version,memory.total,compute_mode --format=csv
+
+# The runtime is built for one backend and never falls back: fail early.
+if [[ "$MORPHX_SYNC_BACKEND" == gdr ]]; then
+  [[ -r /dev/gdrdrv && -w /dev/gdrdrv ]] || { echo "MORPHX_SYNC_BACKEND=gdr but /dev/gdrdrv is unusable on $(hostname)" >&2; exit 1; }
+  ls /usr/lib64/libgdrapi.so* >/dev/null 2>&1 || { echo "MORPHX_SYNC_BACKEND=gdr but libgdrapi is missing on $(hostname)" >&2; exit 1; }
+fi
+
+if [[ "$MODE" == probe ]]; then
+  echo "== GDRCopy"
+  ls -l /dev/gdrdrv /usr/lib64/libgdrapi.so* 2>&1
+  lsmod | grep -i gdrdrv || echo "gdrdrv module: not loaded"
+  echo "== MPS"
+  export CUDA_MPS_PIPE_DIRECTORY="/tmp/mps-${PBS_JOBID:-$$}" CUDA_MPS_LOG_DIRECTORY="/tmp/mps-log-${PBS_JOBID:-$$}"
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+  if nvidia-cuda-mps-control -d; then
+    echo "MPS: OK"
+    echo quit | nvidia-cuda-mps-control
+  else
+    echo "MPS: FAILED"
+  fi
+  rm -rf "$CUDA_MPS_PIPE_DIRECTORY"
+  echo "== %smid probe"
+  probe_bin="${TMPDIR:-/tmp}/smid_probe-${PBS_JOBID:-$$}"
+  nvcc -O2 -arch="sm_${MORPHX_CUDA_ARCH}" -o "$probe_bin" scripts/ae/smid_probe.cu
+  "$probe_bin" probe
+  exit 0
+fi
+
+log_tag="${PBS_JOBID:-$$}"
+./run.sh "$MODE" > "run-${log_tag}.log" 2> "run-${log_tag}.err"
