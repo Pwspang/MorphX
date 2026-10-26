@@ -682,9 +682,13 @@ static void ld_init(void) {
         pthread_mutex_unlock(&mutex);
         return;
     }
-    with_profile = getenv_int("SMSCHED_PROFILE", 1);
-    split_hint = getenv_int("SMSCHED_SPLIT_HINT", 0);
-    fprintf(stderr, "[smsched] with_profile=%d, split_hint=%d\n", with_profile, split_hint);
+    orion_debug = getenv_int("MORPHX_ORION_DEBUG", 0);
+    orion_debug_limit = getenv_int("SMSCHED_DEBUG_LIMIT", 200);
+    orion_serialize = getenv_int("MORPHX_ORION_SERIALIZE", 1);
+    if(orion_debug) {
+        fprintf(stderr, "[orion] hook loaded, serialize=%d\n", orion_serialize);
+        std::atexit(orionPrintStats);
+    }
     common_init(); // init common modules
     // load hooked function of Neutrino
     real_cuModuleLoadData      = (cuModuleLoadData_func_t) dlsym(shared_lib, "cuModuleLoadData");
@@ -715,7 +719,6 @@ CUresult cuModuleLoadData(CUmodule* module, const void* image) {
         fprintf(event_log, "[mod] cuModuleLoadData called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuModuleLoadData called for image %p\n", image);
     CUresult result = real_cuModuleLoadData(module, image);
     return result;
 }
@@ -725,7 +728,6 @@ CUresult cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* j
         fprintf(event_log, "[mod] cuLibraryLoadData called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuLibraryLoadData called for code %p\n", code);
     CUresult result = real_cuLibraryLoadData(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions, libraryOptionValues, numLibraryOptions);
     return result;
 }
@@ -735,7 +737,6 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image, unsigned int nu
         fprintf(event_log, "[mod] cuModuleLoadDataEx called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuModuleLoadDataEx called for image %p\n", image);
     CUresult ret = real_cuModuleLoadDataEx(module, image, numOptions, options, optionValues);
     return ret;
 }
@@ -746,7 +747,6 @@ CUresult cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin) {
         fprintf(event_log, "[mod] cuModuleLoadFatBinary called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuModuleLoadFatBinary called for fatCubin %p\n", fatCubin);
     CUresult result = real_cuModuleLoadFatBinary(module, fatCubin); // call the symbol
     return result;
 }
@@ -768,13 +768,11 @@ CUresult cuKernelGetFunction(CUfunction* pFunc, CUkernel kernel) {
         fprintf(event_log, "[mod] cuKernelGetFunction called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuKernelGetFunction called for %p\n", kernel);
     CUresult result = real_cuKernelGetFunction(pFunc, kernel);
     return result;
 }
 
 CUresult cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, const char* name) {
-    fprintf(stderr, "[mod] cuLibraryGetKernel called for %s\n", name);
     if (shared_lib == NULL) {
         fprintf(event_log, "[mod] cuLibraryGetKernel called before ld_init, calling ld_init now...\n");
         ld_init(); 
@@ -788,7 +786,6 @@ CUresult cuLibraryGetModule(CUmodule* pMod, CUlibrary library) {
         fprintf(event_log, "[mod] cuLibraryGetModule called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuLibraryGetModule called for library %p\n", library);
     CUresult result = real_cuLibraryGetModule(pMod, library);
     return result;
 }
@@ -827,47 +824,141 @@ std::shared_mutex launchMutex;
  * aims at providing runtime probing support
  */
 
-CUevent be_event;
+/**
+ * Orion-style policy (EuroSys'24 "Orion: Interference-aware, Fine-grained GPU
+ * Sharing for ML Applications", simplified):
+ *  - a launch on a high-priority stream (cuStreamGetPriority < 0, which
+ *    scripts/colocate/run.py --use-orion gives the LLM) goes straight to the
+ *    driver;
+ *  - best-effort launches (every other stream, including the default stream)
+ *    are serialized across all best-effort streams: each waits on an event
+ *    recorded after the previous best-effort kernel, so at most one
+ *    best-effort kernel is in flight and it can only use what the
+ *    high-priority work leaves free.
+ * Real Orion also uses offline kernel profiles to decide when a best-effort
+ * kernel may run; this variant only bounds best-effort concurrency.
+ *
+ * MORPHX_ORION_DEBUG=1 prints the first SMSCHED_DEBUG_LIMIT decisions and
+ * launch counts at exit. MORPHX_ORION_SERIALIZE=0 disables the best-effort
+ * serialization (pass-through hook, stream priorities only).
+ */
+static CUevent be_event = nullptr;
+static std::mutex be_mutex;
+static int orion_debug = 0;
+static int orion_debug_limit = 200;
+static int orion_serialize = 1;
+static std::atomic<long> orion_hp_launches{0};
+static std::atomic<long> orion_be_launches{0};
+static std::atomic<long> orion_be_waits{0};
+static std::atomic<int> orion_debug_prints{0};
 
-CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, 
-    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, 
-    CUstream hStream, void** kernelParams, void** extra) 
-{
-    if (shared_lib == NULL) { 
-        fprintf(event_log, "[mod] cuLaunchKernel called before ld_init, calling ld_init now...\n");
-        ld_init(); 
+static void orionPrintStats() {
+    fprintf(stderr, "[orion] launches: high-priority=%ld best-effort=%ld (waited=%ld) serialize=%d\n",
+        orion_hp_launches.load(), orion_be_launches.load(), orion_be_waits.load(), orion_serialize);
+}
+
+static bool orionDebugPrint() {
+    return orion_debug && orion_debug_prints.fetch_add(1) < orion_debug_limit;
+}
+
+// True if launches on hStream go straight to the driver.
+static bool orionPassThrough(CUstream hStream) {
+    if(!orion_serialize) {
+        return true;
     }
-    
     int priority = 0;
-    real_cuStreamGetPriority(hStream, &priority);
-    if(priority < 0) {
-        return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, 
-            blockDimX, blockDimY, blockDimZ, sharedMemBytes, 
-            hStream, kernelParams, extra);
+    if(real_cuStreamGetPriority(hStream, &priority) == CUDA_SUCCESS && priority < 0) {
+        orion_hp_launches.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
-    if(be_event != nullptr) {
+    // Cross-stream event waits are illegal inside a stream capture.
+    CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
+    if(real_cuStreamIsCapturing(hStream, &capture) == CUDA_SUCCESS && capture != CU_STREAM_CAPTURE_STATUS_NONE) {
+        return true;
+    }
+    return false;
+}
+
+// Runs launch() as the next best-effort kernel: after the previous one, and
+// records be_event behind it.
+template <typename LaunchFn>
+static CUresult orionLaunchBestEffort(CUstream hStream, LaunchFn launch) {
+    std::lock_guard<std::mutex> lock(be_mutex);
+    if(be_event == nullptr) {
+        if(real_cuEventCreate(&be_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
+            be_event = nullptr;
+            return launch();
+        }
+    } else {
         real_cuStreamWaitEvent(hStream, be_event, 0);
+        orion_be_waits.fetch_add(1, std::memory_order_relaxed);
     }
-    auto res = real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, 
-        blockDimX, blockDimY, blockDimZ, sharedMemBytes, 
-        hStream, kernelParams, extra);
-    real_cuEventRecord(be_event, hStream);
+    CUresult res = launch();
+    if(res == CUDA_SUCCESS) {
+        real_cuEventRecord(be_event, hStream);
+    }
+    long n = orion_be_launches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if(orionDebugPrint()) {
+        fprintf(stderr, "[orion] best-effort launch #%ld stream=%p serialized\n", n, hStream);
+    }
     return res;
 }
 
-CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
-    if (shared_lib == NULL) { 
-        fprintf(event_log, "[mod] cuLaunchKernelEx called before ld_init, calling ld_init now...\n");
-        ld_init(); 
+CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
+    CUstream hStream, void** kernelParams, void** extra)
+{
+    if (shared_lib == NULL) {
+        ld_init();
     }
+    auto launch = [&]() {
+        return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ, sharedMemBytes,
+            hStream, kernelParams, extra);
+    };
+    if(orionPassThrough(hStream)) {
+        return launch();
+    }
+    return orionLaunchBestEffort(hStream, launch);
+}
 
-    // call the real function
-    CUresult result = real_cuLaunchKernelEx(config, f, kernelParams, extra);
-    fprintf(event_log, "[mod] cuLaunchKernelEx %d config %p func %p, shouldn't call this func!!!\n", result, config, f);
-    fprintf(stderr, "[mod] cuLaunchKernelEx %d config %p func %p, shouldn't call this func!!!\n", result, config, f);
-    exit(-1);
-    
-    return result;
+// Launch attributes (clusters, PDL, cooperative, ...) are passed through
+// unchanged; only the ordering of best-effort launches is added.
+CUresult cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+    if (shared_lib == NULL) {
+        ld_init();
+    }
+    if(config == nullptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    auto launch = [&]() {
+        return real_cuLaunchKernelEx(config, f, kernelParams, extra);
+    };
+    if(orionPassThrough(config->hStream)) {
+        return launch();
+    }
+    return orionLaunchBestEffort(config->hStream, launch);
+}
+
+// Per-thread default stream variants: the legacy entry points accept
+// CU_STREAM_PER_THREAD, so map stream 0 to it and share the policy above.
+CUresult cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes,
+    CUstream hStream, void** kernelParams, void** extra) {
+    if(hStream == nullptr) {
+        hStream = CU_STREAM_PER_THREAD;
+    }
+    return cuLaunchKernel(
+        f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
+}
+
+CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+    if(config != nullptr && config->hStream == nullptr) {
+        CUlaunchConfig ptds = *config;
+        ptds.hStream = CU_STREAM_PER_THREAD;
+        return cuLaunchKernelEx(&ptds, f, kernelParams, extra);
+    }
+    return cuLaunchKernelEx(config, f, kernelParams, extra);
 }
 
 /**
@@ -885,15 +976,38 @@ CUresult cuModuleLoad(CUmodule* module, const char* fname) {
     return result;
 }
 
+// CUDA 12 generated wrappers also define the _ptsz launches: keep ours.
+#define cuLaunchKernel_ptsz cuLaunchKernel_ptsz_unmodified
+#define cuLaunchKernelEx_ptsz cuLaunchKernelEx_ptsz_unmodified
 #include "unmodified.c" // include the auto-generated code
+#undef cuLaunchKernel_ptsz
+#undef cuLaunchKernelEx_ptsz
+
+// Launch entry points handed out by cuGetProcAddress. cudart asks for
+// "cuLaunchKernel" with CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM when it
+// wants the per-thread default stream variant.
+static void* orionLaunchHook(const std::string& sym, cuuint64_t flags) {
+    bool ptds = (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) != 0;
+    if(sym == "cuLaunchKernel") {
+        return ptds ? (void*)cuLaunchKernel_ptsz : (void*)cuLaunchKernel;
+    }
+    if(sym == "cuLaunchKernelEx") {
+        return ptds ? (void*)cuLaunchKernelEx_ptsz : (void*)cuLaunchKernelEx;
+    }
+    if(sym == "cuLaunchKernel_ptsz") {
+        return (void*)cuLaunchKernel_ptsz;
+    }
+    if(sym == "cuLaunchKernelEx_ptsz") {
+        return (void*)cuLaunchKernelEx_ptsz;
+    }
+    return nullptr;
+}
 
 CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult* symbolStatus) {
     if (shared_lib == NULL) { 
         fprintf(event_log, "[mod] cuGetProcAddress called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    fprintf(stderr, "[mod] cuGetProcAddress_v2 called, symbol=%s, cudaVersion=%d, flags=%lu\n", symbol, cudaVersion, flags);
-    fflush(stderr);
     std::string sym_str(symbol);
     if (sym_str == "cuGetProcAddress") {
         *pfn = (void*)cuGetProcAddress_v2;
@@ -901,8 +1015,8 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
             *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
         }
         return CUDA_SUCCESS;
-    } else if (sym_str == "cuLaunchKernel") {
-        *pfn = (void*)cuLaunchKernel;
+    } else if (void* hook = orionLaunchHook(sym_str, flags)) {
+        *pfn = hook;
         if (symbolStatus) {
             *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
         }
@@ -951,12 +1065,6 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
         return CUDA_SUCCESS;
     } else if(sym_str == "cuModuleLoadFatBinary") {
         *pfn = (void*)cuModuleLoadFatBinary;
-        if (symbolStatus) {
-            *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
-        }
-        return CUDA_SUCCESS;
-    } else if(sym_str == "cuLaunchKernelEx") {
-        *pfn = (void*)cuLaunchKernelEx;
         if (symbolStatus) {
             *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
         }
@@ -971,14 +1079,12 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuui
         fprintf(event_log, "[mod] cuGetProcAddress called before ld_init, calling ld_init now...\n");
         ld_init(); 
     }
-    // fprintf(stderr, "[mod] cuGetProcAddress called, symbol=%s, cudaVersion=%d, flags=%lu\n", symbol, cudaVersion, flags);
-    // fflush(stderr);
     std::string sym_str(symbol);
     if (sym_str == "cuGetProcAddress") {
         *pfn = (void*)cuGetProcAddress;
         return CUDA_SUCCESS;
-    } else if (sym_str == "cuLaunchKernel") {
-        *pfn = (void*)cuLaunchKernel;
+    } else if (void* hook = orionLaunchHook(sym_str, flags)) {
+        *pfn = hook;
         return CUDA_SUCCESS;
     } else if(sym_str == "cuModuleLoadData") {
         *pfn = (void*)cuModuleLoadData;
@@ -1003,9 +1109,6 @@ CUresult cuGetProcAddress(const char* symbol, void** pfn, int  cudaVersion, cuui
         return CUDA_SUCCESS;
     } else if(sym_str == "cuModuleLoadFatBinary") {
         *pfn = (void*)cuModuleLoadFatBinary;
-        return CUDA_SUCCESS;
-    } else if(sym_str == "cuLaunchKernelEx") {
-        *pfn = (void*)cuLaunchKernelEx;
         return CUDA_SUCCESS;
     }
     CUresult result = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags, symbolStatus);

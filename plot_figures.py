@@ -25,7 +25,12 @@ PART1_METHODS = [
     (("orion",), "Orion", "#9467bd", "D"),
     (("tgs",), "TGS", "#8c564b", "P"),
     (("timeslice",), "TimeSlice", "#7f7f7f", "X"),
+    # Extra methods (run_colocate_part1.py EXTRA_SCHEDULERS); plotted when present.
+    (("orion-rt",), "Orion-RT", "#e377c2", "*"),
+    (("lithos",), "LithOS-style", "#17becf", "h"),
 ]
+
+AUTOSCALE_X = False
 
 PD_METHODS = [
     (("MorphX", "smsched"), "MorphX", "#d62728", "o"),
@@ -56,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         "--allow-missing",
         action="store_true",
         help="Skip figures whose input tables are absent. Used by the short AE mode.",
+    )
+    parser.add_argument(
+        "--autoscale-x",
+        action="store_true",
+        help="Fit the Figure 11 latency axes to the data instead of the paper's fixed ranges.",
     )
     return parser.parse_args()
 
@@ -141,14 +151,20 @@ def plot_latency_throughput(
     axes_list = np.atleast_1d(axes)
     for ax, (panel_idx, table_name, title) in zip(axes_list, panels):
         rows = read_tsv(tables_dir / table_name)
+        xs: list[float] = []
         for methods, label, color, marker in PART1_METHODS:
             x, y = sorted_xy(rows, (f"{method}_llm_p99_ms" for method in methods), (f"{method}_completed" for method in methods))
             if x:
                 ax.plot(x, y, label=label, color=color, marker=marker, linewidth=1.8, markersize=4.5)
+                xs.extend(x)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel("LLM P99 Token Latency (ms)", fontsize=10)
         ax.set_ylabel(y_label, fontsize=10)
-        ax.set_xlim((20, 60) if panel_idx == 0 else (20, 130))
+        # The paper's ranges; --autoscale-x fits the data instead (e.g. other GPUs).
+        lo, hi = (20, 60) if panel_idx == 0 else (20, 130)
+        if AUTOSCALE_X and xs:
+            lo, hi = 0.95 * min(xs), 1.05 * max(xs)
+        ax.set_xlim((lo, hi))
         style_axes(ax)
 
     handles, labels = axes_list[0].get_legend_handles_labels()
@@ -353,7 +369,9 @@ def plot_model_accuracy(tables_dir: Path, output_dir: Path, formats: Iterable[st
 
 
 def main() -> int:
+    global AUTOSCALE_X
     args = parse_args()
+    AUTOSCALE_X = args.autoscale_x
     formats = [item.strip() for item in args.formats.split(",") if item.strip()]
     plt.rcParams.update(
         {

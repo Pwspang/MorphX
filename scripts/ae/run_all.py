@@ -327,6 +327,45 @@ def configure_runtime(use_cuda_llm: bool, *, prefix: str = "[AE]") -> None:
     )
 
 
+# Extra Figure 10-12 methods (scripts/ae/run_colocate_part1.py EXTRA_SCHEDULERS)
+# and the runtime variant each one preloads, built next to runtime/build.
+RUNTIME_VARIANTS = {
+    "orion-rt": ("build-orion", "-DUSE_CUDA_ORION=ON"),
+    "lithos": ("build-lithos", "-DUSE_CUDA_LITHOS=ON"),
+}
+
+
+def extra_schedulers_from_env() -> list[str]:
+    names = [part.strip() for part in os.environ.get("MORPHX_EXTRA_SCHEDULERS", "").split(",") if part.strip()]
+    if "all" in names:
+        return list(RUNTIME_VARIANTS)
+    return [name for name in RUNTIME_VARIANTS if name in names]
+
+
+def configure_runtime_variant(scheduler: str, *, prefix: str = "[AE]") -> None:
+    build_name, variant_flag = RUNTIME_VARIANTS[scheduler]
+    build_dir = REPO_ROOT / "runtime" / build_name
+    cmake_args = [
+        "cmake",
+        "-S",
+        str(REPO_ROOT / "runtime"),
+        "-B",
+        str(build_dir),
+        "-DUSE_CUDA_LLM=OFF",
+        "-DUSE_CUDA_LOG=OFF",
+        "-DUSE_CUDA_ORION=OFF",
+        "-DUSE_CUDA_LITHOS=OFF",
+        variant_flag,
+        *morphx_cmake_args(),
+    ]
+    run_command(cmake_args, prefix=prefix, quiet=True)
+    run_command(
+        ["cmake", "--build", str(build_dir), "--target", "cuda", "cuda_hook", "preload", "-j"],
+        prefix=prefix,
+        quiet=True,
+    )
+
+
 def build_common_tools(include_model: bool, *, python_bin: str, prefix: str = "[AE]") -> None:
     smsched_pass_build = REPO_ROOT / "smsched-pass" / "build"
     if not smsched_pass_build.is_dir():
@@ -436,6 +475,9 @@ def build_for_part(part_name: str, args: argparse.Namespace, *, prefix: str = "[
         configure_runtime(use_cuda_llm=True, prefix=prefix)
     else:
         configure_runtime(use_cuda_llm=False, prefix=prefix)
+    if part_name == "part1-colocate":
+        for scheduler in extra_schedulers_from_env():
+            configure_runtime_variant(scheduler, prefix=prefix)
     if part_name in {"part1-colocate", "part3-overhead", "part4-model"}:
         # The pass-built microbench also provides libmycutlass.so for MORPHX_LLM_GEMM=mycutlass.
         include_model = part_name == "part4-model" or os.environ.get("MORPHX_LLM_GEMM", "").lower() == "mycutlass"
