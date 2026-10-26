@@ -191,3 +191,29 @@ def sm_sweep(reference: Sequence[int]) -> tuple[int, ...]:
 def morphx_env_vars() -> dict[str, str]:
     """All MORPHX_* variables currently set, for passing to child processes."""
     return {key: value for key, value in os.environ.items() if key.startswith("MORPHX_")}
+
+
+def sync_backend_errors() -> list[str]:
+    """Problems that would make the gdr sync backend fail on this node.
+
+    The runtime is built for one backend (MORPHX_SYNC_BACKEND); with gdr it needs
+    the gdrdrv device and the GDRCopy user library at run time. Nothing falls
+    back to memcpy, so report it up front instead of failing in every child.
+    """
+    backend = env_str("MORPHX_SYNC_BACKEND")
+    if backend != "gdr":
+        return []
+    errors: list[str] = []
+    dev = Path("/dev/gdrdrv")
+    if not dev.exists():
+        errors.append("MORPHX_SYNC_BACKEND=gdr but /dev/gdrdrv is missing (gdrdrv kernel module not loaded); "
+                      "use a node with GDRCopy or set MORPHX_SYNC_BACKEND=memcpy and rebuild the runtime")
+    elif not os.access(dev, os.R_OK | os.W_OK):
+        errors.append("MORPHX_SYNC_BACKEND=gdr but /dev/gdrdrv is not readable and writable by this user")
+    import ctypes.util
+    lib_dirs = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    lib_dirs += ["/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib", "/usr/local/lib64"]
+    found = any(Path(d, name).exists() for d in lib_dirs for name in ("libgdrapi.so.2", "libgdrapi.so"))
+    if not found and ctypes.util.find_library("gdrapi") is None:
+        errors.append("MORPHX_SYNC_BACKEND=gdr but libgdrapi (GDRCopy user library) was not found")
+    return errors

@@ -67,11 +67,26 @@ set_property(CACHE MORPHX_SYNC_BACKEND PROPERTY STRINGS gdr hostmapped memcpy)
 if(MORPHX_SYNC_BACKEND STREQUAL "hostmapped")
     add_compile_definitions(MORPHX_SYNC_BACKEND_HOSTMAPPED)
     set(MORPHX_GDR_LINK "")
+    set(MORPHX_GDR_LIBS "")
 elseif(MORPHX_SYNC_BACKEND STREQUAL "memcpy")
     add_compile_definitions(MORPHX_SYNC_BACKEND_MEMCPY)
     set(MORPHX_GDR_LINK "")
+    set(MORPHX_GDR_LIBS "")
 elseif(MORPHX_SYNC_BACKEND STREQUAL "gdr")
-    set(MORPHX_GDR_LINK "-lgdrapi")
+    # GDRCopy user-space library: system-wide by default, or a local build
+    # (MORPHX_GDRCOPY_ROOT/{include,lib}) when the build host lacks it (nscc2b's
+    # login node). At run time the node's libgdrapi.so.2 must match its gdrdrv.
+    morphx_option(MORPHX_GDRCOPY_ROOT "" PATH "GDRCopy install prefix (include/gdrapi.h, lib/libgdrapi.so); empty = system")
+    # MORPHX_GDR_LINK is a flag string (CMAKE_*_LINKER_FLAGS users);
+    # MORPHX_GDR_LIBS the same as a list for target_link_libraries.
+    if(MORPHX_GDRCOPY_ROOT)
+        include_directories(${MORPHX_GDRCOPY_ROOT}/include)
+        set(MORPHX_GDR_LINK "-L${MORPHX_GDRCOPY_ROOT}/lib -lgdrapi")
+        set(MORPHX_GDR_LIBS -L${MORPHX_GDRCOPY_ROOT}/lib -lgdrapi)
+    else()
+        set(MORPHX_GDR_LINK "-lgdrapi")
+        set(MORPHX_GDR_LIBS -lgdrapi)
+    endif()
 else()
     message(FATAL_ERROR "Unknown MORPHX_SYNC_BACKEND: ${MORPHX_SYNC_BACKEND}")
 endif()

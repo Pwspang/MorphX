@@ -1,0 +1,130 @@
+#!/bin/bash
+# Track N: validate MorphX on nscc2b (H200 + GDRCopy) and compare the gdr sync
+# backend with memcpy on the same node.
+#   cd ~/scratch/morphx/MorphX && qsub scripts/baselines/n_nscc2b_validate.pbs
+#   qsub -v PARTS="probe tests" ...   (parts: probe tests launch fig16 fig15 sglang fig11 fig13)
+# Needs (scripts/ae/build-nscc2b.sh): smsched-pass/build, runtime/build (gdr),
+# runtime/build-llm (gdr), runtime/build-memcpy + runtime/build-llm-memcpy
+# (MORPHX_SYNC_BACKEND=memcpy), microbench/build-model, ggnn in the venv.
+#PBS -N morphx-n-validate
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=01:50:00
+#PBS -j oe
+module load cuda/13.0
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"probe tests launch fig16 fig15 sglang fig11 fig13"}
+OUT=${OUT:-$HOME/scratch/morphx/runs/n-$PBS_JOBID}
+T=${TMPDIR:-/tmp}/n-$PBS_JOBID
+mkdir -p "$OUT" "$T"
+R=$PWD
+GDRHOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build/libcuda.so LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
+MEMHOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build-memcpy/libcuda.so LD_PRELOAD=$R/runtime/build-memcpy/libcuda.so:$R/runtime/build-memcpy/libpreload.so"
+echo "== host=$(hostname) job=$PBS_JOBID parts=$PARTS out=$OUT"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+
+has() { [[ " $PARTS " == *" $1 "* ]]; }
+
+if has probe; then
+  echo "######## probe"
+  ls -l /dev/gdrdrv /usr/lib64/libgdrapi.so* 2>&1
+  cat /sys/module/gdrdrv/version 2>/dev/null | sed 's/^/gdrdrv module version: /'
+  rpm -qa 2>/dev/null | grep -i gdr
+  ldd runtime/build/libcuda.so | grep -E "gdrapi|libcuda"
+fi
+
+if has tests; then
+  echo "######## functional tests"
+  for b in gdr memcpy hostmapped; do
+    case $b in
+      gdr) defs=(-I"$MORPHX_GDRCOPY_ROOT/include" -L"$MORPHX_GDRCOPY_ROOT/lib" -lgdrapi) ;;
+      memcpy) defs=(-DMORPHX_SYNC_BACKEND_MEMCPY) ;;
+      hostmapped) defs=(-DMORPHX_SYNC_BACKEND_HOSTMAPPED) ;;
+    esac
+    nvcc -O2 -arch=sm_90 "${defs[@]}" -I include -lcuda -o "$T/sbt-$b" scripts/ae/sync_backend_test.cu > "$T/sbt-$b.build" 2>&1 || { echo "sbt $b build FAILED"; tail -5 "$T/sbt-$b.build"; continue; }
+    timeout 300 "$T/sbt-$b" > "$OUT/sync_backend_test-$b.log" 2>&1
+    echo "-- sync_backend_test $b:"; grep -E "^\[(1|2|3|4|5|6|7|8|9)|RESULT" "$OUT/sync_backend_test-$b.log" | sed 's/^/   /'
+  done
+  for t in run_hook_test run_pass_test run_lithos_test; do
+    MORPHX_SYNC_BACKEND=gdr OUT=$T/$t timeout 600 bash runtime/test/$t.sh > "$OUT/$t-gdr.log" 2>&1
+    echo "-- $t gdr: rc=$? $(grep -c 'RESULT: PASS' "$OUT/$t-gdr.log") PASS, $(grep -c 'RESULT: FAIL' "$OUT/$t-gdr.log") FAIL"
+  done
+fi
+
+if has lithos; then
+  echo "######## run_lithos_test (gdr vs memcpy)"
+  for b in gdr memcpy; do
+    MORPHX_SYNC_BACKEND=$b OUT=$T/lithos-$b timeout 900 bash runtime/test/run_lithos_test.sh > "$OUT/lithos-$b.log" 2>&1
+    echo "-- run_lithos_test $b: rc=$? $(grep -c 'RESULT: PASS' "$OUT/lithos-$b.log") PASS, $(grep -c 'RESULT: FAIL' "$OUT/lithos-$b.log") FAIL"
+    grep -E "^\[concurrent\]" "$OUT/lithos-$b.log" | sed 's/^/   /'
+  done
+fi
+
+if has launch; then
+  echo "######## per-launch host cost (MORPHX_LAUNCH_STATS)"
+  CONFIGS="none: memcpy: hostmapped: gdr: gdr:MORPHX_AGENTS=grid memcpy:MORPHX_AGENTS=grid" OUT=$T/launch timeout 900 bash runtime/test/run_launch_overhead.sh > "$OUT/launch.log" 2>&1
+  grep -E "^==|^\[(tiny|medium|MorphX-stats)\]" "$OUT/launch.log" | sed 's/^/   /'
+fi
+
+if has fig16; then
+  echo "######## Fig 16 bench M=16 (CUTLASS ms)"
+  for cfg in none gdr memcpy; do
+    case $cfg in none) PRE= ;; gdr) PRE=$GDRHOOK ;; memcpy) PRE=$MEMHOOK ;; esac
+    for r in 1 2; do
+      (cd microbench && env $PRE SMSCHED_BENCH_M_SIZES=16 SMSCHED_BENCH_N_SIZES=65536 SMSCHED_BENCH_K_SIZES=65536 \
+        SMSCHED_BENCH_WARMUP_ITERS=2 SMSCHED_BENCH_TIMED_ITERS=5 SMSCHED_TARGET_PATTERNS=__smsched_no_target__ \
+        timeout 600 ./build-model/bench > "$OUT/fig16-$cfg-$r.log" 2>&1)
+      echo "-- $cfg run $r: $(grep -E '^M=' "$OUT/fig16-$cfg-$r.log")"
+    done
+  done
+fi
+
+fig15() {  # fig15 <label> <smsched-env> <tasks...>
+  local label=$1 senv=$2; shift 2
+  local tasks=(); for t in "$@"; do tasks+=(--only-task "$t"); done
+  timeout 1500 python scripts/ae/run_overhead_model_part4.py --no-build --only-section overhead "${tasks[@]}" \
+    --only-method base --only-method smsched --smsched-env "$senv" --output-dir "$OUT/fig15-$label" --run-timeout 600 > "$OUT/fig15-$label.log" 2>&1
+  echo "-- fig15 $label"; grep -E "^(DNN|GEMM|GEMV|GGNN|LLM)" "$OUT/fig15-$label/tables/Figure15.tsv" | awk -F'\t' '{printf "   %s base=%s MorphX=%s rel=%s\n", $1, $2, $6, $11}'
+  grep -E "ERROR|FAILED" "$OUT/fig15-$label.log" | head -3
+}
+if has fig15; then
+  echo "######## Fig 15"
+  fig15 gdr "$GDRHOOK" DNN GEMM GEMV GGNN LLM
+  fig15 memcpy "$MEMHOOK" GEMM GEMV LLM
+fi
+
+if has sglang; then
+  echo "######## SGLang Qwen3-4B fp16 + mycutlass"
+  MODEL=$MORPHX_HF_CACHE/models--Qwen--Qwen3-4B/snapshots/82d62bb073771e7a1ea59435f548908540217d1f
+  for cfg in none gdr memcpy; do
+    case $cfg in none) PRE= ;; gdr) PRE=$GDRHOOK ;; memcpy) PRE=$MEMHOOK ;; esac
+    env $PRE timeout 900 python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16 --gemm mycutlass \
+      --num-requests 8 --output-len 32 --census-decode-steps 4 > "$OUT/sglang-$cfg.log" 2>&1
+    echo "-- sglang $cfg: $(grep -oE "TBT  ms: mean=[0-9.]+|TTFT ms: mean=[0-9.]+|decode: [0-9]+ kernels, [0-9.]+ ms|prefill: [0-9]+ kernels, [0-9.]+ ms|SMOKE: [A-Z]+" "$OUT/sglang-$cfg.log" | tr '\n' ' ')"
+  done
+  echo "-- greedy tokens (gdr): $(env $GDRHOOK timeout 600 python scripts/sglang/check_mycutlass.py --model "$MODEL" 2>&1 | grep -E "^\[e2e\] greedy|Error")"
+fi
+
+if has fig11; then
+  echo "######## Fig 11(a) x$MORPHX_MM_RPS_SCALE, ${FIG11_DURATION:-90} s, stream vs MorphX (gdr)"
+  timeout 2400 python scripts/ae/run_colocate_part1.py --only-experiment llm-1-mm-6 --only-experiment llm-1-mm-10 \
+    --only-scheduler stream --only-scheduler smsched --smsched-env "$GDRHOOK" \
+    --model llama-3-8b --duration "${FIG11_DURATION:-90}" --output-dir "$OUT/fig11" --run-timeout 900 > "$OUT/fig11.log" 2>&1
+  grep -E "DONE|FAILED|ERROR" "$OUT/fig11.log" | head -6
+  cut -f1,11-16 "$OUT"/fig11/tables/compact/llm-1-mm.tsv
+fi
+
+if has fig13; then
+  echo "######## Fig 13 in-2048-out-256 rps 9 (x$MORPHX_PD_RPS_SCALE), 60 s, all variants (gdr)"
+  LLMHOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$R/runtime/build-llm/libcuda.so:$R/runtime/build-llm/libpreload.so SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
+  timeout 2400 python scripts/ae/run_pd_colocate_part2.py --only-config "Figure13:in-2048-out-256-rps-9" \
+    --model llama-3-8b --duration 60 --smsched-env "$LLMHOOK" --output-dir "$OUT/fig13" --run-timeout 900 --no-update-latest-link > "$OUT/fig13.log" 2>&1
+  grep -E "DONE|FAILED|ERROR" "$OUT/fig13.log" | head -6
+  cut -f1-14 "$OUT"/fig13/tables/Figure13.tsv
+fi
+echo "== done $(date +%T)"

@@ -1073,6 +1073,8 @@ def preflight(args: argparse.Namespace, output_dir: Path) -> tuple[bool, list[st
     for path in required_paths:
         if not path.exists():
             errors.append(f"Missing required path: {path}")
+    if not args.analyze_only and not args.dry_run:
+        errors.extend(morphx_env.sync_backend_errors())
 
     model_path = morphx_env.model_path(args.model) or MODEL_PATHS.get(args.model)
     if model_path and not model_path.exists():

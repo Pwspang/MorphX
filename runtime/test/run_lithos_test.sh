@@ -23,7 +23,7 @@ done
 case "$BACKEND" in
     hostmapped) SYNC_DEF=-DMORPHX_SYNC_BACKEND_HOSTMAPPED; GDR_LIB= ;;
     memcpy) SYNC_DEF=-DMORPHX_SYNC_BACKEND_MEMCPY; GDR_LIB= ;;
-    gdr) SYNC_DEF=; GDR_LIB=-lgdrapi ;;
+    gdr) SYNC_DEF=${MORPHX_GDRCOPY_ROOT:+-I$MORPHX_GDRCOPY_ROOT/include}; GDR_LIB="${MORPHX_GDRCOPY_ROOT:+-L$MORPHX_GDRCOPY_ROOT/lib} -lgdrapi" ;;
     *) echo "unknown MORPHX_SYNC_BACKEND" >&2; exit 1 ;;
 esac
 g++ -std=c++20 -O3 -g -fPIC -shared $SYNC_DEF \
@@ -53,6 +53,11 @@ run() {
 }
 
 half=$((NUM_SMS / 2))
+# Keep the two-stream kernel's waves well above the runtime's 50 us
+# short-kernel bypass: with spin 20000 (~10 us per block) the profiled wave time
+# lands near the threshold and a fast sync backend (gdr) measures it below, so
+# the kernel runs unmodified and the partition check fails.
+export LITHOS_TEST_SPIN="${LITHOS_TEST_SPIN:-200000}"
 for loading in LAZY EAGER; do
     run hook_launch_test CUDA_MODULE_LOADING=$loading
 done
