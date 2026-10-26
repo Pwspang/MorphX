@@ -1,0 +1,43 @@
+#!/bin/bash
+# nscc2b: why is MorphX slower in Fig 11(a) with gdr than hpcc's memcpy runs?
+# Same node type, same 180 s points: Fig 11(a) MorphX with the memcpy runtime,
+# plus SGLang decode under none/gdr/memcpy with MORPHX_LAUNCH_STATS.
+#   cd ~/scratch/morphx/MorphX && qsub scripts/baselines/n_gdr_vs_memcpy.pbs
+#PBS -N mx-gdr-vs-memcpy
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=01:50:00
+#PBS -j oe
+module load cuda/13.0
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+export MORPHX_TGS_SOCKET_DIR="${TMPDIR:-/tmp}/mxtgs-${PBS_JOBID%%.*}"; mkdir -p "$MORPHX_TGS_SOCKET_DIR"
+R=$PWD
+OUT=${OUT:-$R/logs/20261026-nscc2b/diag-gdr-vs-memcpy}
+mkdir -p "$OUT"
+hook() { echo "NEUTRINO_HOOK_DRIVER=$R/runtime/$1/libcuda.so LD_PRELOAD=$R/runtime/$1/libcuda.so:$R/runtime/$1/libpreload.so"; }
+echo "== host=$(hostname) job=$PBS_JOBID out=$OUT"
+
+echo "######## SGLang Qwen3-8B fp16 + mycutlass decode, MORPHX_LAUNCH_STATS=1"
+MODEL=$(python -c "import sys; sys.path.insert(0,'scripts/ae'); import morphx_env; print(morphx_env.model_path('llama-3-8b'))")
+for cfg in none gdr memcpy; do
+  case $cfg in none) PRE= ;; gdr) PRE="$(hook build)" ;; memcpy) PRE="$(hook build-memcpy)" ;; esac
+  env $PRE MORPHX_LAUNCH_STATS=1 timeout 900 python scripts/sglang/smoke_runner.py --model "$MODEL" --dtype float16 --gemm mycutlass \
+    --num-requests 8 --output-len 64 --census-decode-steps 4 > "$OUT/sglang-$cfg.log" 2>&1
+  echo "-- $cfg: $(grep -oE "TBT  ms: mean=[0-9.]+|TTFT ms: mean=[0-9.]+|decode: [0-9]+ kernels, [0-9.]+ ms|SMOKE: [A-Z]+" "$OUT/sglang-$cfg.log" | tr '\n' ' ')"
+  grep -h "MorphX-stats" "$OUT/sglang-$cfg.log" | tail -n 2 | sed 's/^/   /'
+done
+
+echo "######## Fig 11(a) MorphX with the memcpy runtime (180 s points)"
+HINT=$(python -c "import sys; sys.path.insert(0,'scripts/ae'); import morphx_env; print(morphx_env.scale_split_hint('76'))")
+timeout 6000 python scripts/ae/run_colocate_part1.py --output-dir "$OUT/fig11a-memcpy" --python "$MORPHX_PYTHON" --duration 180 \
+  --smsched-split-hint "$HINT" --only-table llm-1-mm --only-scheduler smsched \
+  --smsched-env "$(hook build-memcpy) SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1" > "$OUT/fig11a-memcpy.log" 2>&1
+grep -E "DONE|FAILED" "$OUT/fig11a-memcpy.log" | tail -n 8
+cut -f1,11-16 "$OUT/fig11a-memcpy/tables/compact/llm-1-mm.tsv" 2>/dev/null
+rm -rf "$MORPHX_TGS_SOCKET_DIR"
+echo "== done $(date +%T)"

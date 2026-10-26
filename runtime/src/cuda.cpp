@@ -907,6 +907,34 @@ extern "C" void suggest_SM(CUstream stream, int minSM, int maxSM) {
     gSuggestSM[stream] = std::make_pair(minSM, maxSM);
 }
 
+// morphx_target_stream(stream): only kernels launched on registered streams
+// count as SMSCHED_TARGET_PATTERNS targets; with none registered, every stream
+// does (the original behaviour). Needed when the protected workload runs the
+// same kernels as the background one: on the H200 port SGLang's linear layers
+// and the Fig 11 matmul task are both mycutlass (half_t) GEMMs.
+constexpr int kMaxTargetStreams = 16;
+std::atomic<CUstream> gTargetStreams[kMaxTargetStreams];
+std::atomic<int> gNumTargetStreams{0};
+
+extern "C" void morphx_target_stream(CUstream stream) {
+    int n = gNumTargetStreams.load();
+    if(n >= kMaxTargetStreams) {
+        std::cerr << "Too many MorphX target streams" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    gTargetStreams[n].store(stream);
+    gNumTargetStreams.store(n + 1);
+}
+
+inline bool isTargetStream(CUstream stream) {
+    int n = gNumTargetStreams.load();
+    if(n == 0) return true;
+    for(int i = 0; i < n; ++i) {
+        if(gTargetStreams[i].load() == stream) return true;
+    }
+    return false;
+}
+
 inline StreamInfo* checkStream(CUstream stream) {
     if(stream == 0) {
         std::cerr << "Default stream is not supported" << std::endl;
@@ -1225,7 +1253,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         }
     }
 
-    int inWhiteList = isTargetKernelName(funcName) ? 1 : 0;
+    int inWhiteList = isTargetKernelName(funcName) && isTargetStream(hStream) ? 1 : 0;
     bool debugThisLaunch = shouldDebugPrint();
     if(debugThisLaunch) {
         fprintf(stderr, "[MorphX-debug] launch func=%s grid=%d block=%u stream=%p split=%d nActive=%d inWhiteList=%d\n",

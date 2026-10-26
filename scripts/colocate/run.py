@@ -208,6 +208,25 @@ def _restore_env(prev_map):
             os.environ[k] = old
 
 
+def mark_morphx_target_stream(stream):
+    """MORPHX_TARGET_MM_STREAM=1: tell a preloaded MorphX runtime that only this
+    stream's whitelisted kernels are its targets. On the H200 port the LLM's linear
+    layers are the same mycutlass (half_t) GEMMs as the matmul task, so a
+    name-only whitelist would also confine the LLM it is meant to protect."""
+    if os.environ.get("MORPHX_TARGET_MM_STREAM", "0") != "1":
+        return
+    import ctypes
+
+    try:
+        fn = ctypes.CDLL(None).morphx_target_stream
+    except (OSError, AttributeError):
+        print("[GEMM] MORPHX_TARGET_MM_STREAM=1 but the MorphX runtime isn't preloaded")
+        return
+    fn.argtypes = [ctypes.c_void_p]
+    fn(stream.cuda_stream)
+    print(f"[GEMM] MorphX target stream: {stream.cuda_stream:#x}")
+
+
 def create_cuda_stream(label: str = "", is_llm: bool = False):
     if not ORION_SCHEDULER:
         return torch.cuda.Stream()
@@ -491,6 +510,7 @@ def gemm_worker(thread_id, cpu_affinity, config, total_time, result_dict, warmup
 
     # 在进程内部创建 CUDA stream（若启用 ORION，则为 GEMM 使用低优先级）
     stream = create_cuda_stream("mm", is_llm=False)
+    mark_morphx_target_stream(stream)
     
     device = torch.device("cuda")
 

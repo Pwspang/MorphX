@@ -15,6 +15,10 @@
 # p2-Figure13 p2-Figure14 (Fig 13-14), p3 (Fig 15), p4 (Fig 16).
 # Output: $RUN/shards/$SHARD. Then scripts/ae/merge_nscc2b_shards.sh $RUN puts
 # them together as $RUN/<part> and runs ./run.sh analyse.
+#
+# Re-running one method of a Fig 10-12 table into an existing shard (move its
+# old logs aside first; --skip-existing keeps the rest):
+#   qsub -v SHARD=p1-llm-1-mm,RUN=$RUN,ONLY_SCHEDULER=smsched,HOOK_BUILD=build-tgt,SMSCHED_EXTRA_ENV=MORPHX_TARGET_MM_STREAM=1 ...
 #PBS -N morphx-shard
 #PBS -P 12004493
 #PBS -q normal
@@ -63,8 +67,11 @@ case "$SHARD" in
     cmd=(python scripts/ae/run_colocate_part1.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "$DURATION"
          --smsched-split-hint "$HINT" --only-table "$table" --skip-existing)
     if [[ "$table" == *-mm ]]; then
-      cmd+=(--smsched-env "$(hook build) SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1")
+      cmd+=(--smsched-env "$(hook "${HOOK_BUILD:-build}") SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1 ${SMSCHED_EXTRA_ENV:-}")
+    elif [[ -n "${HOOK_BUILD:-}${SMSCHED_EXTRA_ENV:-}" ]]; then
+      cmd+=(--smsched-env "$(hook "${HOOK_BUILD:-build}") ${SMSCHED_EXTRA_ENV:-}")
     fi
+    [[ -n "${ONLY_SCHEDULER:-}" ]] && cmd+=(--only-scheduler "$ONLY_SCHEDULER")
     ;;
   p2-*)
     cmd=(python scripts/ae/run_pd_colocate_part2.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "$DURATION"
