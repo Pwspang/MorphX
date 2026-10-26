@@ -679,6 +679,9 @@ def default_lithos_env(args: argparse.Namespace) -> dict[str, str]:
     env = split_env_assignments(default_smsched_env(args.smsched_env))
     env["NEUTRINO_HOOK_DRIVER"] = str(cuda_hook)
     env["LD_PRELOAD"] = f"{cuda_hook}:{preload}"
+    # Give [0, split) to the LLM (high-priority stream, see --use-orion below)
+    # rather than to whichever stream registered first.
+    env["SMSCHED_LITHOS_RANK"] = "priority"
     env.update(split_env_assignments(args.lithos_env))
     return env
 
@@ -779,6 +782,9 @@ def build_run_spec(
         cmd.insert(2, "--use-orion")
         env_updates.update(default_orion_rt_env(args.orion_rt_env))
     elif scheduler == "lithos":
+        # LLM stream high priority, others low, so the latency-critical stream
+        # gets the [0, split) partition (SMSCHED_LITHOS_RANK=priority).
+        cmd.insert(2, "--use-orion")
         env_updates.update(default_lithos_env(args))
         if args.smsched_debug:
             env_updates["SMSCHED_DEBUG"] = "1"
