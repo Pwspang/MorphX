@@ -1,0 +1,89 @@
+#!/bin/bash
+# One shard of the full ./run.sh workflow on nscc2b (H200, gdr backend). The
+# full run is ~30 GPU-hours in one process; shards put each part (and each
+# Fig 10-12 table) on its own H200 so they run in parallel. Same commands as
+# scripts/ae/run_all.py's full mode, except: no --fail-fast (one failed point
+# shouldn't end a 5-hour job; resubmitting the shard reruns only missing points
+# via --skip-existing), and part 2 uses runtime/build-llm so it can share the
+# checkout with parts 1, 3 and 4 (run_all.py rebuilds runtime/build per part).
+#
+#   cd ~/scratch/morphx/MorphX
+#   RUN=$PWD/logs/20261026-nscc2b
+#   qsub -l walltime=08:00:00 -v SHARD=p1-llm-1-ggnn,RUN=$RUN scripts/ae/morphx-nscc2b-shard.pbs
+#
+# Shards: p1-llm-1-ggnn p1-llm-4-ggnn p1-llm-1-mm p1-llm-4-mm (Fig 10-12),
+# p2-Figure13 p2-Figure14 (Fig 13-14), p3 (Fig 15), p4 (Fig 16).
+# Output: $RUN/shards/$SHARD. Then scripts/ae/merge_nscc2b_shards.sh $RUN puts
+# them together as $RUN/<part> and runs ./run.sh analyse.
+#PBS -N morphx-shard
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+
+set -uo pipefail
+: "${SHARD:?set SHARD}" "${RUN:?set RUN}"
+DURATION="${DURATION:-180}"
+VENV="${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}"
+
+module load cuda/13.0
+source "$VENV/bin/activate"
+cd "${PBS_O_WORKDIR:-$HOME/scratch/morphx/MorphX}"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+# Part 1's extra schedulers (orion-rt, lithos) and the H200 GGNN load (x2);
+# matmul (x3) and PD (x3) scales come from env-h100.sh. ./run.sh analyse must
+# see the same values (merge_nscc2b_shards.sh sets them).
+export MORPHX_EXTRA_SCHEDULERS="${MORPHX_EXTRA_SCHEDULERS-all}"
+export MORPHX_GGNN_RPS_SCALE="${MORPHX_GGNN_RPS_SCALE:-2}"
+# Node-local TGS sockets: concurrent shards may share a node, and home is shared.
+export MORPHX_TGS_SOCKET_DIR="${TMPDIR:-/tmp}/mxtgs-${PBS_JOBID%%.*}"
+mkdir -p "$MORPHX_TGS_SOCKET_DIR"
+
+if [[ "$MORPHX_SYNC_BACKEND" == gdr ]]; then
+  [[ -r /dev/gdrdrv && -w /dev/gdrdrv ]] || { echo "MORPHX_SYNC_BACKEND=gdr but /dev/gdrdrv is unusable on $(hostname)" >&2; exit 1; }
+fi
+
+R=$PWD
+OUT="$RUN/shards/$SHARD"
+mkdir -p "$OUT"
+hook() {  # hook <build dir>
+  echo "NEUTRINO_HOOK_DRIVER=$R/runtime/$1/libcuda.so LD_PRELOAD=$R/runtime/$1/libcuda.so:$R/runtime/$1/libpreload.so"
+}
+HINT=$(python -c "import sys; sys.path.insert(0, 'scripts/ae'); import morphx_env; print(morphx_env.scale_split_hint('76'))")
+echo "== host=$(hostname) job=${PBS_JOBID:-none} shard=$SHARD out=$OUT duration=$DURATION sync=$MORPHX_SYNC_BACKEND split_hint=$HINT"
+echo "   extra=$MORPHX_EXTRA_SCHEDULERS ggnn_scale=$MORPHX_GGNN_RPS_SCALE mm_scale=$MORPHX_MM_RPS_SCALE pd_scale=$MORPHX_PD_RPS_SCALE models=$MORPHX_MODEL_ALIASES"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+
+case "$SHARD" in
+  p1-*)
+    table=${SHARD#p1-}
+    cmd=(python scripts/ae/run_colocate_part1.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "$DURATION"
+         --smsched-split-hint "$HINT" --only-table "$table" --skip-existing)
+    if [[ "$table" == *-mm ]]; then
+      cmd+=(--smsched-env "$(hook build) SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1")
+    fi
+    ;;
+  p2-*)
+    cmd=(python scripts/ae/run_pd_colocate_part2.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "$DURATION"
+         --smsched-env "$(hook build-llm) SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
+         --only-table "${SHARD#p2-}" --no-update-latest-link --skip-existing)
+    ;;
+  p3)
+    cmd=(python scripts/ae/run_overhead_model_part4.py --output-dir "$OUT" --python "$MORPHX_PYTHON"
+         --only-section overhead --no-build --no-update-latest-link --skip-existing)
+    ;;
+  p4)
+    cmd=(python scripts/ae/run_overhead_model_part4.py --output-dir "$OUT" --python "$MORPHX_PYTHON"
+         --only-section model --no-build --no-update-latest-link --skip-existing)
+    ;;
+  *) echo "unknown SHARD $SHARD" >&2; exit 2 ;;
+esac
+echo "\$ ${cmd[*]}"
+"${cmd[@]}"
+rc=$?
+rm -rf "$MORPHX_TGS_SOCKET_DIR"
+echo "== done rc=$rc $(date +%T)"
+exit $rc
