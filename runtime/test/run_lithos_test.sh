@@ -53,6 +53,11 @@ run() {
 }
 
 half=$((NUM_SMS / 2))
+# Keep the two-stream kernel's waves well above the runtime's 50 us
+# short-kernel bypass: with spin 20000 (~10 us per block) the profiled wave time
+# lands near the threshold and a fast sync backend (gdr) measures it below, so
+# the kernel runs unmodified and the partition check fails.
+export LITHOS_TEST_SPIN="${LITHOS_TEST_SPIN:-200000}"
 for loading in LAZY EAGER; do
     run hook_launch_test CUDA_MODULE_LOADING=$loading
 done

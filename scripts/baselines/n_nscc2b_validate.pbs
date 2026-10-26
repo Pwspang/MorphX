@@ -56,6 +56,15 @@ if has tests; then
   done
 fi
 
+if has lithos; then
+  echo "######## run_lithos_test (gdr vs memcpy)"
+  for b in gdr memcpy; do
+    MORPHX_SYNC_BACKEND=$b OUT=$T/lithos-$b timeout 900 bash runtime/test/run_lithos_test.sh > "$OUT/lithos-$b.log" 2>&1
+    echo "-- run_lithos_test $b: rc=$? $(grep -c 'RESULT: PASS' "$OUT/lithos-$b.log") PASS, $(grep -c 'RESULT: FAIL' "$OUT/lithos-$b.log") FAIL"
+    grep -E "^\[concurrent\]" "$OUT/lithos-$b.log" | sed 's/^/   /'
+  done
+fi
+
 if has launch; then
   echo "######## per-launch host cost (MORPHX_LAUNCH_STATS)"
   CONFIGS="none: memcpy: hostmapped: gdr: gdr:MORPHX_AGENTS=grid memcpy:MORPHX_AGENTS=grid" OUT=$T/launch timeout 900 bash runtime/test/run_launch_overhead.sh > "$OUT/launch.log" 2>&1
