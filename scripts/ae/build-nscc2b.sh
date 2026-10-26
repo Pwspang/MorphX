@@ -63,7 +63,10 @@ fi
 
 if [[ " $STEPS " == *" ggnn "* ]]; then
   log ggnn
-  if python -m pip install -e ggnn --no-build-isolation > "$L/ggnn.log" 2>&1; then log "ggnn ok"; else log "ggnn FAILED"; tail -20 "$L/ggnn.log"; fail=1; fi
+  # The build imports the module to generate stubs; the login node has no
+  # libgdrapi, so borrow the local build's for that import only.
+  if LD_LIBRARY_PATH="$MORPHX_GDRCOPY_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+       python -m pip install -e ggnn --no-build-isolation > "$L/ggnn.log" 2>&1; then log "ggnn ok"; else log "ggnn FAILED"; tail -20 "$L/ggnn.log"; fail=1; fi
 fi
 log "done fail=$fail"
 exit $fail

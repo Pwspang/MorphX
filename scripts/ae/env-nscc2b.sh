@@ -51,5 +51,18 @@ if [[ -z "${MORPHX_PYTHON:-}" && -n "${VIRTUAL_ENV:-}" ]]; then
   export MORPHX_PYTHON="${VIRTUAL_ENV}/bin/python"
 fi
 
+# The pass-built ggnn module links libpython3.12.so, which the portable CPython
+# keeps in its own lib/ (no system Python 3.12 here); it is also imported at
+# build time to generate stubs. sysconfig's LIBDIR is the path the portable
+# build was made at, so use sys.base_prefix.
+if [[ -n "${MORPHX_PYTHON:-}" ]]; then
+  _morphx_pylib="$("${MORPHX_PYTHON}" -c 'import sys; print(sys.base_prefix + "/lib")' 2>/dev/null)"
+  case ":${LD_LIBRARY_PATH:-}:" in
+    *":${_morphx_pylib}:"*) ;;
+    *) [[ -n "${_morphx_pylib}" ]] && export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${_morphx_pylib}" ;;
+  esac
+  unset _morphx_pylib
+fi
+
 # shellcheck source=scripts/ae/env-h100.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env-h100.sh"
