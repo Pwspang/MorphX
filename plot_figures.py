@@ -274,7 +274,9 @@ def plot_pd_figure(
 
     handles, labels = axes_grid[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4, fontsize=9, frameon=False)
-    fig.subplots_adjust(top=0.92, hspace=0.48, wspace=0.25)
+    # Keep a fixed ~0.8 in band for the legend and the first row's titles, so
+    # they don't overlap when fewer than three configs are plotted (0.92 for three).
+    fig.subplots_adjust(top=1.0 - 0.8 / fig_height, hspace=0.48, wspace=0.25)
     save_figure(fig, output_dir, figure_name, formats)
 
 
