@@ -52,6 +52,21 @@ SCHEDULERS = (
     "tgs",
     "timeslice",
 )
+# Extra methods outside the paper's set; run only when selected with
+# --only-scheduler, --extra-scheduler or MORPHX_EXTRA_SCHEDULERS.
+#   orion-rt: Orion-style interception (runtime/build-orion, cuda-orion.cpp) on
+#             top of --use-orion stream priorities.
+#   lithos:   LithOS-style kernel slicing (runtime/build-lithos, cuda-lithos.cpp)
+#             with the same single-process setup as smsched.
+EXTRA_SCHEDULERS = (
+    "orion-rt",
+    "lithos",
+)
+ALL_SCHEDULERS = SCHEDULERS + EXTRA_SCHEDULERS
+RUNTIME_VARIANT_DIRS = {
+    "orion-rt": "build-orion",
+    "lithos": "build-lithos",
+}
 SYSTEM_NAME_RE = re.compile("smsched", re.IGNORECASE)
 SMSCHED_CONDA_ENV_RE = re.compile(r"(?<=/envs/)smsched(?=/)", re.IGNORECASE)
 SCHEDULER_LABELS = {"smsched": "MorphX"}
@@ -155,6 +170,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--orion-rt-env",
+        default=os.environ.get("ORION_RT"),
+        help=(
+            "Extra shell-style environment assignments for orion-rt runs (e.g. MORPHX_ORION_DEBUG=1). "
+            "LD_PRELOAD=<repo>/runtime/build-orion/libcuda.so:libpreload.so is always set unless given here."
+        ),
+    )
+    parser.add_argument(
+        "--lithos-env",
+        default=os.environ.get("LITHOS"),
+        help=(
+            "Extra shell-style environment assignments for lithos runs (e.g. SMSCHED_LITHOS_SLICE_WAVES=2). "
+            "lithos otherwise reuses the smsched environment with the hook paths pointed at runtime/build-lithos."
+        ),
+    )
+    parser.add_argument(
+        "--extra-scheduler",
+        action="append",
+        choices=EXTRA_SCHEDULERS,
+        default=[],
+        help=(
+            "Also run an extra method outside the paper's set. Repeat for several. "
+            "MORPHX_EXTRA_SCHEDULERS (comma-separated, or 'all') does the same."
+        ),
+    )
+    parser.add_argument(
         "--tgs-high-env",
         default=os.environ.get("TGS_HIGH"),
         help=(
@@ -187,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--only-scheduler",
         action="append",
-        choices=SCHEDULERS,
+        choices=ALL_SCHEDULERS,
         help="Limit to one scheduler. Repeat to select multiple schedulers.",
     )
     parser.add_argument(
@@ -617,6 +658,31 @@ def default_smsched_env(user_value: Optional[str]) -> str:
     return assignments
 
 
+def runtime_variant_hook(scheduler: str) -> tuple[Path, Path]:
+    build_dir = REPO_ROOT / "runtime" / RUNTIME_VARIANT_DIRS[scheduler]
+    return build_dir / "libcuda.so", build_dir / "libpreload.so"
+
+
+def default_orion_rt_env(user_value: Optional[str]) -> dict[str, str]:
+    cuda_hook, preload = runtime_variant_hook("orion-rt")
+    env = {
+        "NEUTRINO_HOOK_DRIVER": str(cuda_hook),
+        "LD_PRELOAD": f"{cuda_hook}:{preload}",
+    }
+    env.update(split_env_assignments(user_value))
+    return env
+
+
+def default_lithos_env(args: argparse.Namespace) -> dict[str, str]:
+    # Same knobs as smsched (target patterns, whitelist, ...), other hook.
+    cuda_hook, preload = runtime_variant_hook("lithos")
+    env = split_env_assignments(default_smsched_env(args.smsched_env))
+    env["NEUTRINO_HOOK_DRIVER"] = str(cuda_hook)
+    env["LD_PRELOAD"] = f"{cuda_hook}:{preload}"
+    env.update(split_env_assignments(args.lithos_env))
+    return env
+
+
 def build_tgs_preload_string(priority: str) -> Optional[str]:
     lib_dir = REPO_ROOT / "TGS" / "hijack" / f"{priority}-priority-lib"
     lib_names = (
@@ -709,6 +775,18 @@ def build_run_spec(
             env_updates["TGS_LOW"] = tgs_low
     elif scheduler == "orion":
         cmd.insert(2, "--use-orion")
+    elif scheduler == "orion-rt":
+        cmd.insert(2, "--use-orion")
+        env_updates.update(default_orion_rt_env(args.orion_rt_env))
+    elif scheduler == "lithos":
+        env_updates.update(default_lithos_env(args))
+        if args.smsched_debug:
+            env_updates["SMSCHED_DEBUG"] = "1"
+        split_hint = smsched_split_hint_for_experiment(args, experiment)
+        if split_hint:
+            env_updates["SMSCHED_SPLIT_HINT"] = split_hint
+        else:
+            env_removals = ("SMSCHED_SPLIT_HINT",)
     elif scheduler.startswith("mps-"):
         percentage = scheduler.split("-", 1)[1]
         cmd.insert(2, percentage)
@@ -767,11 +845,22 @@ def selected_experiments(args: argparse.Namespace) -> list[Experiment]:
     return experiments
 
 
+def enabled_extra_schedulers(args: argparse.Namespace) -> tuple[str, ...]:
+    requested = set(getattr(args, "extra_scheduler", None) or [])
+    raw = os.environ.get("MORPHX_EXTRA_SCHEDULERS", "")
+    for name in (part.strip() for part in raw.split(",")):
+        if name == "all":
+            requested.update(EXTRA_SCHEDULERS)
+        elif name in EXTRA_SCHEDULERS:
+            requested.add(name)
+    return tuple(scheduler for scheduler in EXTRA_SCHEDULERS if scheduler in requested)
+
+
 def selected_schedulers(args: argparse.Namespace) -> tuple[str, ...]:
     if not args.only_scheduler:
-        return SCHEDULERS
+        return SCHEDULERS + enabled_extra_schedulers(args)
     allowed = set(args.only_scheduler)
-    return tuple(scheduler for scheduler in SCHEDULERS if scheduler in allowed)
+    return tuple(scheduler for scheduler in ALL_SCHEDULERS if scheduler in allowed)
 
 
 def has_complete_log(path: Path) -> bool:
@@ -1231,16 +1320,21 @@ def build_compact_tables(full_dir: Path, compact_dir: Path) -> None:
         source = full_dir / f"{table_key}.tsv"
         if not source.exists():
             continue
-        _, rows = read_tsv(source)
+        source_headers, rows = read_tsv(source)
+        # Extra methods only get columns when they were run, so tables of the
+        # paper's scheduler set keep their original layout.
+        schedulers = SCHEDULERS + tuple(
+            scheduler for scheduler in EXTRA_SCHEDULERS if f"{scheduler}_{COMPACT_METRICS[0]}" in source_headers
+        )
         headers = ["other_rps"]
-        for scheduler in SCHEDULERS:
+        for scheduler in schedulers:
             for metric in COMPACT_METRICS:
                 headers.append(f"{scheduler_label(scheduler)}_{metric}")
 
         compact_rows: list[dict[str, object]] = []
         for row in rows:
             compact: dict[str, object] = {"other_rps": row.get("other_rps", "")}
-            for scheduler in SCHEDULERS:
+            for scheduler in schedulers:
                 for metric in COMPACT_METRICS:
                     col = f"{scheduler}_{metric}"
                     compact[f"{scheduler_label(scheduler)}_{metric}"] = row.get(col, "")
@@ -1306,6 +1400,22 @@ def preflight(args: argparse.Namespace, output_dir: Path) -> tuple[bool, list[st
                         warnings.append(f"TGS low-priority LD_PRELOAD target is missing: {preload_path}")
             except ValueError as exc:
                 errors.append(str(exc))
+
+    for scheduler in selected_schedulers(args):
+        if scheduler not in RUNTIME_VARIANT_DIRS:
+            continue
+        try:
+            env = default_orion_rt_env(args.orion_rt_env) if scheduler == "orion-rt" else default_lithos_env(args)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        for preload_path in env.get("LD_PRELOAD", "").split(":"):
+            if preload_path and not Path(preload_path).exists():
+                errors.append(
+                    f"{scheduler} LD_PRELOAD target is missing: {preload_path} "
+                    f"(build it: cmake -S runtime -B runtime/{RUNTIME_VARIANT_DIRS[scheduler]} "
+                    f"-D{'USE_CUDA_ORION' if scheduler == 'orion-rt' else 'USE_CUDA_LITHOS'}=ON)"
+                )
 
     if any(scheduler.startswith("mps-") for scheduler in selected_schedulers(args)):
         mps_cmd = mps_control_command(args)
