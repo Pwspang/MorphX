@@ -102,3 +102,46 @@ Disk under `~/scratch/morphx`:
 - Patched kernels on the default stream exit the process ("Default stream is not supported"), as in the original runtime.
 - `pkill -f "<pattern>"` over ssh can match its own `bash -c` and kill the session; kill by PID.
 - `qsub` from the checkout directory (`$PBS_O_WORKDIR` is used by several scripts).
+
+## 9. Open questions (2026-10-26, nscc2b full re-run, gdr)
+
+Run directory: `nscc2b:~/scratch/morphx/MorphX/logs/20261026-nscc2b` (shards per part/table,
+`scripts/ae/morphx-nscc2b-shard.pbs`); finished figures are copied to `logs/20261026-nscc2b/`
+locally. hpcc is no longer used.
+
+1. **Fig 11: did the LLM's own GEMMs get confined by MorphX?** The Fig 11 MorphX env is
+   `SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1`. In the paper the LLM's linear
+   layers were cuBLAS (vLLM fork), so only the background matmul matched. In this port SGLang's
+   linear layers are mycutlass, whose 56 kernels all contain `half_t`, so the LLM's GEMMs were
+   also confined to `[0, split)` and paid the patched-launch cost (~145 GEMMs/token). Observed
+   (gdr, Fig 11(a)): MorphX 14.2 vs stream 9.9 ms/token at 3 mm/s (+43%); 68.7 vs 63.0 at
+   30 mm/s (paper A100: 18.7 vs 20.0, and 40.0 vs 59.5). Same issue in the hpcc results.
+   Fix under test: `morphx_target_stream()` + `MORPHX_TARGET_MM_STREAM=1` (only the matmul
+   worker's stream is a target), runtime `runtime/build-tgt`; MorphX-only re-runs of
+   Fig 11(a)/(b) (jobs 187805/187806), old logs in `prev-morphx-v1/`. Confirm, then decide.
+2. **Does gdr itself cost more than memcpy on nscc2b?** MorphX's light-load overhead in Fig 11
+   is ~30 µs per patched launch here vs ~8 µs on hpcc (memcpy); the microbenchmark shows gdr
+   host cost 1.05 µs vs memcpy 6.46 µs, but end-to-end tiny-kernel latency only +9 µs (gdr) vs
+   +11 µs (memcpy) over unhooked. Job 187714 (`scripts/baselines/n_gdr_vs_memcpy.pbs`): Fig
+   11(a) MorphX with the memcpy runtime, and SGLang decode none/gdr/memcpy with
+   `MORPHX_LAUNCH_STATS=1`. Suspect (unverified): the agent thread's uncached PCIe BAR reads
+   interfering with kernel launches.
+3. **Fig 10/12: same question for the GGNN tables.** Their MorphX env uses the default
+   whitelist (`ggnn5query`), so the LLM's GEMMs aren't confined, but they are still patched and
+   managed by MorphX (in the paper they were cuBLAS and untouched). Check the MorphX column when
+   the shards finish; a MorphX-only re-run with `SMSCHED_ONLY_WHITELIST=1` may be needed.
+4. **Where does the remaining per-launch cost go?** GDRCopy removed the host-side cost, but a
+   patched launch still adds ~9–13 µs end to end (persistent agents = occupancy × 132 SMs,
+   per-block atomic dispatch, SM-range checks, first-launch profiling). The A100 reference has
+   the same order of overhead (Fig 15: GEMM 1.44, GEMV 1.34). Not broken down yet (proposed:
+   hook without transform vs `MORPHX_AGENTS=grid` vs default on the tiny/medium kernels).
+5. **H200-specific factors that may keep results from matching the paper** even after 1–3:
+   H200 vs A100; Sm80-style mycutlass on Hopper; Qwen3-8B standing in for Llama-3-8B; the
+   split hint scaled from the A100 (76 → 93 SMs), never re-tuned on the H200; H200 load scales
+   (mm ×3, GGNN ×2, PD ×3).
+6. **Fig 13/14 at high load:** with 180 s runs every method queues heavily from rps 9 up
+   (TTFT in seconds to tens of seconds; hpcc used 60 s runs). MorphX is 6–17% behind stream at
+   low load and runs without a split (default CI never splits on the H200; `MORPHX_CI_MODE=occ`
+   variant not run yet).
+7. **Fig 15 neutrino:** crashes with "illegal instruction" in its instrumented kernels on DNN
+   and LLM (cells N/A).
