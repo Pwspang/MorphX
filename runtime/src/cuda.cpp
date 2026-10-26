@@ -266,9 +266,12 @@ int cap_agents = 0;
 
 // MORPHX_LAUNCH_STATS=1: at exit, report the host time a patched (non-profiling)
 // launch spends in the runtime before the real cuLaunchKernel, and the agent
-// thread's batched reads.
+// thread's batched reads. Launches over 1 ms (first launch of a kernel: lazy
+// module loading, cold occupancy queries) are counted apart, so the steady-state
+// mean isn't swamped by one-time costs in short runs.
 int launch_stats = 0;
-std::atomic<uint64_t> gStatLaunches{0}, gStatLaunchNs{0};
+constexpr uint64_t kStatSlowLaunchNs = 1000000;
+std::atomic<uint64_t> gStatLaunches{0}, gStatLaunchNs{0}, gStatSlowLaunches{0}, gStatSlowLaunchNs{0};
 std::atomic<uint64_t> gStatAgentReads{0}, gStatAgentReadNs{0};
 
 int gNrSM;
@@ -878,9 +881,12 @@ static void runtimeShutdown() {
     }
     if(launch_stats) {
         uint64_t n = gStatLaunches.load(), reads = gStatAgentReads.load();
-        fprintf(stderr, "[MorphX-stats] patched_launches=%lu host_us_before_launch=%.2f agent_batched_reads=%lu us_per_read=%.2f\n",
+        uint64_t slow = gStatSlowLaunches.load(), slowNs = gStatSlowLaunchNs.load();
+        fprintf(stderr, "[MorphX-stats] patched_launches=%lu host_us_before_launch=%.2f agent_batched_reads=%lu us_per_read=%.2f"
+            " slow_launches=%lu slow_ms_total=%.1f host_us_before_launch_steady=%.2f\n",
             (unsigned long)n, n ? gStatLaunchNs.load() / 1000.0 / n : 0.0,
-            (unsigned long)reads, reads ? gStatAgentReadNs.load() / 1000.0 / reads : 0.0);
+            (unsigned long)reads, reads ? gStatAgentReadNs.load() / 1000.0 / reads : 0.0,
+            (unsigned long)slow, slowNs / 1e6, n > slow ? (gStatLaunchNs.load() - slowNs) / 1000.0 / (n - slow) : 0.0);
     }
 }
 
@@ -1376,8 +1382,13 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         }
         gGdrPool->launch_init(launchInfo->slot, pack4(agents, 0), pack4(launchInfo->h_minSM, launchInfo->h_maxSM), true, hStream);
         if(launch_stats) {
+            uint64_t ns = getNano(hrc::now() - tLaunch);
             gStatLaunches.fetch_add(1, std::memory_order_relaxed);
-            gStatLaunchNs.fetch_add(getNano(hrc::now() - tLaunch), std::memory_order_relaxed);
+            gStatLaunchNs.fetch_add(ns, std::memory_order_relaxed);
+            if(ns > kStatSlowLaunchNs) {
+                gStatSlowLaunches.fetch_add(1, std::memory_order_relaxed);
+                gStatSlowLaunchNs.fetch_add(ns, std::memory_order_relaxed);
+            }
         }
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
         streamInfo->pending->push(launchInfo);
