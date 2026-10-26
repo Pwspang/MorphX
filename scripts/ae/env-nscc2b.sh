@@ -64,5 +64,13 @@ if [[ -n "${MORPHX_PYTHON:-}" ]]; then
   unset _morphx_pylib
 fi
 
+# Nsight Compute (Fig 15's ncu column) ships in the HPC SDK's profilers/, not
+# in its cuda/13.0/bin, which env-h100.sh puts on PATH.
+_morphx_ncu_dir="${CUDA_HOME:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.11/cuda/13.0}/../../profilers/13.0/Nsight_Compute"
+if [[ -x "${_morphx_ncu_dir}/ncu" ]] && ! command -v ncu >/dev/null 2>&1; then
+  export PATH="$(cd "${_morphx_ncu_dir}" && pwd):${PATH}"
+fi
+unset _morphx_ncu_dir
+
 # shellcheck source=scripts/ae/env-h100.sh
 source "$(dirname "${BASH_SOURCE[0]}")/env-h100.sh"
