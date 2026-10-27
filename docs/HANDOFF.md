@@ -280,6 +280,38 @@ clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
   321 → 657 µs per launch; the pass build itself was +0.9% per prefill step), not
   confirmed: a stream run with `MORPHX_FLASHINFER_FA2=1` (stock nvcc FA2) would separate
   the two. Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-192386`.
+- **FlashInfer cost + sm90 mycutlass (branch `h100-port-fi-sm90`, job 192442, asp2b-gpu092,
+  all on one node, 60 s, `scripts/baselines/n_fig13_fi_sm90.pbs`)**. avg / p99 s per token /
+  TTFT avg s. Part 1, stream only, Sm80 mycutlass:
+
+  | config | stock nvcc (FA3 ragged) | stock nvcc FA2 | pass-built FA2 |
+  |---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.073 / 0.108 / 0.164 | 0.097 / 0.130 / 0.171 | 0.117 / 0.151 / 0.176 |
+  | in-4096-out-256-rps-6 | 0.099 / 0.112 / 0.471 | 0.102 / 0.117 / 0.569 | 0.103 / 0.120 / 0.591 |
+  | in-2048-out-256-rps-9 | 0.044 / 0.056 / 0.090 | 0.046 / 0.058 / 0.092 | 0.047 / 0.058 / 0.093 |
+
+  Stock numbers match the old refs (0.067 / 0.099 / 0.041) within node variance. FA3 → FA2
+  costs +33% and the pass build another +21% at 4096/128 (the most prefill-bound,
+  queue-amplified point); at the other two points both are 2–4%.
+  Part 2, pass-built FA2 + **sm90 mycutlass** (CUTLASS 3 WGMMA/TMA, `microbench/build-model-sm90`,
+  12 `_pk` kernels, the compile line carries `-mllvm -smsched-smem-handoff-barriers`); greedy
+  tokens and logits identical to the Sm80 library and under the runtime (per-grid on):
+
+  | config | stream | MorphX + per-grid | MorphX |
+  |---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.034 / 0.060 / 0.135 | 0.037 / 0.064 / 0.170 | 0.037 / 0.063 / 0.172 |
+  | in-4096-out-256-rps-6 | 0.054 / 0.067 / 0.142 | 0.063 / 0.082 / 0.151 | 0.061 / 0.077 / 0.169 |
+  | in-2048-out-256-rps-9 | 0.017 / 0.024 / 0.062 | 0.020 / 0.028 / 0.080 | 0.018 / 0.025 / 0.065 |
+
+  sm90 GEMMs cut stream latency 2.7–3.4x vs Sm80 (pass FA2), and MorphX is now 9–18% behind
+  stream (was 40–80%) because most sm90 GEMMs have first waves < 50 µs and are short-bypassed
+  (1–3 GEMM kernels managed). Summaries (managed / CI-limited / moved / full GPU), per-grid vs
+  default: 4096/128 22678 / 11339 / 0 / 11339 both; 4096/256 95251 / 11339 / 19542 / 64370 vs
+  46833 / 11303 / 7289 / 28241; 2048/256 80724 / 35350 / 2173 / 43201 vs 55078 / 0 / 0 / 55078.
+  Decode attention (paged FA2) managed with per-grid: 4096/128 0 of 73332 (all small grids),
+  4096/256 24191 of 41508 (moved 7048), 2048/256 3311 of 116928 (moved 725); default: 0 everywhere.
+  The ragged prefill kernel is managed and CI-limited on every launch at 4096 tokens.
+  Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-sm90-192442`.
 - Not done: SGLang `jit_kernel` ops (act_and_mul, rope, qknorm, store_kvcache; ~3%)
   go through tvm-ffi, which hard-codes `$CUDA_HOME/bin/nvcc`; easiest path is a shim
   CUDA_HOME (symlinked toolkit, `bin/nvcc` → the same wrapper) set only for those
