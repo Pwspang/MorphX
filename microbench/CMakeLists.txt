@@ -59,7 +59,31 @@ set(CUTLASS_INCLUDE_DIRS
 
 find_package(CUDAToolkit REQUIRED cublas)
 
-add_library(mycutlass SHARED src/my_cutlass_gemm.cu)
+# sm80 (default): CUTLASS 2 Sm80 kernels, what Figure 16 measures. sm90: CUTLASS 3
+# WGMMA/TMA kernels (src/my_cutlass_gemm_sm90.cu), same C API; needs the clang +
+# pass build and MORPHX_CUDA_ARCH=90a, into its own build dir, e.g.
+#   cmake -S microbench -B microbench/build-model-sm90 -DSMSCHED_ENABLE_PASS=ON \
+#         -DMORPHX_MYCUTLASS_ARCH=sm90 -DMORPHX_CUDA_ARCH=90a
+set(MORPHX_MYCUTLASS_ARCH "sm80" CACHE STRING "libmycutlass kernels: sm80 (CUTLASS 2) or sm90 (CUTLASS 3 WGMMA/TMA)")
+set_property(CACHE MORPHX_MYCUTLASS_ARCH PROPERTY STRINGS sm80 sm90)
+if(MORPHX_MYCUTLASS_ARCH STREQUAL "sm90")
+    if(NOT SMSCHED_ENABLE_PASS OR NOT MORPHX_CUDA_ARCH STREQUAL "90a")
+        message(FATAL_ERROR "MORPHX_MYCUTLASS_ARCH=sm90 needs -DSMSCHED_ENABLE_PASS=ON -DMORPHX_CUDA_ARCH=90a")
+    endif()
+    add_library(mycutlass SHARED src/my_cutlass_gemm_sm90.cu)
+    target_compile_definitions(mycutlass PRIVATE
+        # device asserts make ptxas serialize the wgmma pipeline (C7510)
+        NDEBUG
+        CUTLASS_GRID_CONSTANT=__grid_constant__
+        # CUTLASS sees CUDA 12.4 (see cmake/morphx.cmake); CUDA 13 keeps the _v12000 typedefs
+        PFN_cuTensorMapEncodeTiled=PFN_cuTensorMapEncodeTiled_v12000
+        PFN_cuTensorMapEncodeIm2col=PFN_cuTensorMapEncodeIm2col_v12000)
+    target_link_libraries(mycutlass PUBLIC CUDA::cuda_driver)
+elseif(MORPHX_MYCUTLASS_ARCH STREQUAL "sm80")
+    add_library(mycutlass SHARED src/my_cutlass_gemm.cu)
+else()
+    message(FATAL_ERROR "MORPHX_MYCUTLASS_ARCH must be sm80 or sm90")
+endif()
 # Shared library provides the kernels consumed by the executables.
 target_include_directories(mycutlass
     PUBLIC
