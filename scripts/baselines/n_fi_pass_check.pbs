@@ -1,0 +1,115 @@
+#!/bin/bash
+# nscc2b (gdr): pass-built FlashInfer (MORPHX_FLASHINFER_PASS=1): build, correctness,
+# step times and a Fig 13-like kernel census. Run from your own checkout.
+#   cd ~/scratch/morphx/trackFI && qsub -v PARTS="build check bench census" scripts/baselines/n_fi_pass_check.pbs
+# Parts (each step under a timeout; the job log is tee'd live to $OUT/job-<id>.log):
+#   build   smsched-pass/build and runtime/build-llm (USE_CUDA_LLM=ON, gdr)
+#   check   greedy tokens: pass (cold JIT: clang + pass build, timed), pass + runtime,
+#           stock (auto = FA3 ragged prefill), stock FA2; pairwise compare
+#   bench   prefill/decode step times, stock vs stock FA2 vs pass (no runtime)
+#   census  Fig 13-like run (in-4096-out-128, 18 req/s = rps 6 x 3): nsys GPU time
+#           per kernel (stream variant) + MorphX first wave / CI per kernel
+#           (smsched variant, split 108), stock and pass-built FlashInfer
+# Every FlashInfer JIT build (stock nvcc too) goes to this checkout, never ~/.cache/flashinfer.
+#PBS -N mx-fi-pass
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=01:10:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261027-fi-pass/check-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0 cmake/4.3.4
+[[ -n "${CUDA_HOME:-}" ]] || { echo "module load cuda/13.0 failed"; exit 1; }
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+# libmycutlass from the main checkout (read-only), unless given
+export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/scratch/morphx/MorphX/microbench/build-model}
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+J=${NCPUS:-16}
+export MAX_JOBS=$J
+# stock nvcc JIT output stays in this checkout too (pass runs override this)
+export FLASHINFER_WORKSPACE_BASE=$R/smsched-pass/fi-ws-stock
+NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.11/compilers/bin/nsys}
+PARTS=${PARTS:-"build check bench census"}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+RTB=$R/runtime/build-llm
+HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpreload.so"
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+echo "== host=$(hostname) job=${PBS_JOBID:-} parts=$PARTS ncpus=$J head=$(git log --oneline -1 | cut -c1-60) mycutlass=$MYCUTLASS_LIB_DIR"
+
+if [[ " $PARTS " == *" build "* ]]; then
+  step() {  # name timeout cmd...
+    local name=$1 t=$2; shift 2
+    echo "-- $name $(date +%T)"
+    if ! timeout -k 10 "$t" "$@" > "$OUT/build-$name.log" 2>&1; then
+      echo "FAILED: $name"; grep -E "error" "$OUT/build-$name.log" | head -20; tail -5 "$OUT/build-$name.log"; exit 1
+    fi
+  }
+  rm -rf smsched-pass/build "$RTB"
+  step pass-config 300 cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR="$MORPHX_LLVM_ROOT/lib/cmake/llvm"
+  step pass 600 cmake --build smsched-pass/build -j "$J"
+  step runtime-config 300 cmake -S runtime -B "$RTB" -DUSE_CUDA_LLM=ON -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+  step runtime 600 cmake --build "$RTB" -j "$J"
+  echo "runtime gdr imports: $(nm -D --undefined-only "$RTB/libcuda.so" | grep -cw gdr_open)"
+  echo "== build done $(date +%T)"
+fi
+
+if [[ " $PARTS " == *" check "* ]]; then
+  echo "== check $(date +%T)"
+  # cold pass-built JIT cache: the first generation includes the clang + pass build
+  MORPHX_FI_CLANG_LOG="$OUT/clang-cmds.log" MORPHX_FLASHINFER_PASS=1 timeout -k 10 1500 $CHECK --out "$OUT/pass.pt" > "$OUT/check-pass.log" 2>&1
+  rc=$?; echo "pass rc=$rc $(date +%T)"; grep -E "^\[fi\] (first|runner)" "$OUT/check-pass.log"
+  if [[ $rc != 0 ]]; then grep -E "error|Error" "$OUT/check-pass.log" | head -30; tail -20 "$OUT/check-pass.log"; exit 1; fi
+  echo "pass-built .so: $(ls smsched-pass/build/flashinfer-ws/.cache/flashinfer/*/*/cached_ops/*/*.so 2>/dev/null | wc -l); _pk kernels: $(for f in smsched-pass/build/flashinfer-ws/.cache/flashinfer/*/*/cached_ops/*/*.so; do cuobjdump -symbols "$f" 2>/dev/null; done | grep -c '_pk$')"
+  env MORPHX_FLASHINFER_PASS=1 SMSCHED_LLM_TRACE_LIMIT=400 SMSCHED_PROFILE_LOG=1 $HOOK \
+    timeout -k 10 600 $CHECK --out "$OUT/pass-rt.pt" > "$OUT/check-pass-rt.log" 2>&1; echo "pass+runtime rc=$? $(date +%T)"
+  timeout -k 10 1200 $CHECK --out "$OUT/stock.pt" > "$OUT/check-stock.log" 2>&1; echo "stock rc=$? $(date +%T)"
+  MORPHX_FLASHINFER_FA2=1 timeout -k 10 900 $CHECK --out "$OUT/stockfa2.pt" > "$OUT/check-stockfa2.log" 2>&1; echo "stock-fa2 rc=$? $(date +%T)"
+  for p in "stock stockfa2" "stock pass" "stockfa2 pass" "pass pass-rt" "stock pass-rt"; do
+    set -- $p; timeout 120 $CHECK --compare "$OUT/$1.pt" "$OUT/$2.pt" 2>&1 | grep "^\[cmp\]"
+  done
+  echo "-- kernels under the runtime: first launch per (phase, name)"
+  grep -E "\[MorphX-llm\] phase=" "$OUT/check-pass-rt.log" | awk '{print $2}' | sort | uniq -c
+  grep -E "\[MorphX-llm\] phase=" "$OUT/check-pass-rt.log" | grep -i flashinfer | sed -E 's/grid=.* name=/name=/' | cut -c1-170
+  grep -E "\[MorphX-profile\] name=" "$OUT/check-pass-rt.log" | sed -E 's/ stream=0x[0-9a-f]+//' | cut -c1-260
+fi
+
+if [[ " $PARTS " == *" bench "* ]]; then
+  echo "== bench $(date +%T)"
+  for cfg in stock stockfa2 pass; do
+    e=; [[ $cfg == stockfa2 ]] && e="MORPHX_FLASHINFER_FA2=1"; [[ $cfg == pass ]] && e="MORPHX_FLASHINFER_PASS=1"
+    env $e timeout -k 10 600 $CHECK --bench --max-tokens 4 > "$OUT/bench-$cfg.log" 2>&1
+    echo "$cfg rc=$? $(grep '^\[bench\]' "$OUT/bench-$cfg.log" | tr '\n' ' ') $(date +%T)"
+  done
+fi
+
+if [[ " $PARTS " == *" census "* ]]; then
+  echo "== census $(date +%T)"
+  CRPS=${CENSUS_RPS:-18}; CIN=${CENSUS_IN:-4096}; COUT=${CENSUS_OUT:-128}; CDUR=${CENSUS_DUR:-40}
+  C=$OUT/census; mkdir -p "$C"
+  python -c "import json; json.dump({'time': $CDUR, 'model': 'llama-3-8b', 'type': 'poisson', 'rps': $CRPS, 'input_length': $CIN, 'output_length': $COUT}, open('$C/cfg.json', 'w'))"
+  for fi in stock pass; do
+    e=; [[ $fi == pass ]] && e="MORPHX_FLASHINFER_PASS=1"
+    # stream variant (prefill thread, no runtime) under nsys: GPU time per kernel
+    env $e VLLM_PREFILL_THREAD=1 timeout -k 10 600 "$NSYS" profile -t cuda -o "$C/stream-$fi" -f true \
+      python scripts/test-pd-online.py "$C/cfg.json" > "$C/stream-$fi.log" 2> "$C/stream-$fi.err"
+    echo "nsys $fi rc=$? $(date +%T) $(grep '^\[final\]' "$C/stream-$fi.log" | tr '\n' ' ' | cut -c1-300)"
+    timeout 600 "$NSYS" export -t sqlite -o "$C/stream-$fi.sqlite" -f true "$C/stream-$fi.nsys-rep" > /dev/null 2>&1; echo "export rc=$?"
+    # MorphX (default CI, split 108) with the profile log: first wave, CI per kernel
+    env $e VLLM_PREFILL_THREAD=1 SMSCHED_SPLIT_HINT=108 SMSCHED_LLM_TRICK_MODE=0 SMSCHED_PROFILE_LOG=1 SMSCHED_LLM_TRACE_LIMIT=400 \
+      $HOOK timeout -k 10 600 python scripts/test-pd-online.py "$C/cfg.json" > "$C/morphx-$fi.log" 2> "$C/morphx-$fi.err"
+    echo "morphx $fi rc=$? $(date +%T) $(grep '^\[final\]' "$C/morphx-$fi.log" | tr '\n' ' ' | cut -c1-300)"
+    grep -E "\[MorphX-profile\] summary" "$C/morphx-$fi.err"
+  done
+  timeout 300 python scripts/sglang/fi_census.py "$C" > "$C/census.md" 2>&1; echo "census rc=$?"
+  cat "$C/census.md"
+fi
+echo "== done $(date +%T)"
