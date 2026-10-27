@@ -32,6 +32,11 @@ PART1_METHODS = [
 
 AUTOSCALE_X = False
 
+# Methods left out of Figure 12. On the H200 the LithOS-style variant breaks from
+# 0.8 GGNN req/s up (LLM P99 in the seconds, docs/HANDOFF.md), which would
+# flatten every other curve.
+FIGURE12_OMIT = {"lithos"}
+
 PD_METHODS = [
     (("MorphX", "smsched"), "MorphX", "#d62728", "o"),
     (("baseline",), "Baseline", "#2ca02c", "^"),
@@ -195,6 +200,8 @@ def plot_query_latency(
     for ax, (_panel_idx, table_name, title) in zip(axes_list, panels):
         rows = read_tsv(tables_dir / table_name)
         for methods, label, color, marker in PART1_METHODS:
+            if FIGURE12_OMIT.intersection(methods):
+                continue
             x, y = sorted_xy(rows, (f"{method}_completed" for method in methods), (f"{method}_llm_p99_ms" for method in methods))
             if x:
                 ax.plot(x, y, label=label, color=color, marker=marker, linewidth=1.8, markersize=4.5)
