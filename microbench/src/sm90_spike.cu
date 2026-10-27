@@ -6,6 +6,18 @@
 // is an ordinary grid of independent CTAs, which is what the pass assumes.
 //
 //   ./sm90_spike M N K [iters]          (LD_PRELOAD the runtime to test _pk)
+//   SPIKE_TWO_STREAMS=1: run the GEMM once on a second stream first. The runtime
+//   then has two active streams and runs every launch of a kernel matching
+//   SMSCHED_TARGET_PATTERNS on SMs [0, SMSCHED_SPLIT_HINT), so the timed loop
+//   shows whether SM-range confinement works.
+
+// CUTLASS leaves __grid_constant__ off under clang, so the kernel copies its
+// Params to local memory and TMA reads the descriptors from there: illegal
+// memory access on every launch. TMA descriptors must stay in param space.
+#ifndef CUTLASS_GRID_CONSTANT
+#define CUTLASS_GRID_CONSTANT __grid_constant__
+#endif
+
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -110,6 +122,12 @@ int main(int argc, char **argv) {
   };
   auto ours = [&]() { Gemm128x128::run(m, n, k, dA, dB, dC, 1.f, 0.f, stream); };
 
+  if (getenv("SPIKE_TWO_STREAMS")) {
+    cudaStream_t other;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking));
+    Gemm128x128::run(m, n, k, dA, dB, dC, 1.f, 0.f, other);
+    CHECK_CUDA(cudaStreamSynchronize(other));
+  }
   cublas();
   ours();
   CHECK_CUDA(cudaStreamSynchronize(stream));
