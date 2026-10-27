@@ -1,0 +1,86 @@
+#!/bin/bash
+# Track S on hpcc: build the sm90 libmycutlass (MORPHX_MYCUTLASS_ARCH=sm90) on the
+# compute node, compare it with the Sm80 library (microbench/build-model) and
+# cuBLAS on the Qwen3-8B linear-layer shapes, then SGLang Qwen3-8B end to end
+# (sm90 vs Sm80 mycutlass vs torch) and one short sm90 run under the runtime.
+# Needs smsched-pass/build, runtime/build (memcpy) and microbench/build-model.
+#   cd <repo> && qsub scripts/baselines/s_sm90_lib.pbs
+#PBS -N mx-s-sm90-lib
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+module purge; module load gnu/gcc-12.3 cuda/13.0
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+export PATH=~/.local/bin:$PATH
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+echo "== host=$(hostname) job=$PBS_JOBID ncpus=${NCPUS:-?} $(date +%T)"
+R=$PWD
+OUT=${OUT:-$HOME/morphx/runs/s-sm90-$PBS_JOBID}
+mkdir -p "$OUT"
+SM90=$R/microbench/build-model-sm90
+SM80=$R/microbench/build-model
+CMP=$OUT/gemm_libs_compare
+HOOK="LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
+
+echo "######## 0. build $(date +%T)"
+[[ -f $SM90/CMakeCache.txt ]] || cmake -S microbench -B $SM90 -DSMSCHED_ENABLE_PASS=ON -DMORPHX_MYCUTLASS_ARCH=sm90 \
+  -DMORPHX_CUDA_ARCH=90a -DMORPHX_SYNC_BACKEND=$MORPHX_SYNC_BACKEND > $OUT/sm90-config.log 2>&1
+( time cmake --build $SM90 --target mycutlass -j ${NCPUS:-12} ) > $OUT/sm90-build.log 2>&1 \
+  || { echo "BUILD FAILED"; grep -E "error" $OUT/sm90-build.log | head; exit 1; }
+grep -E "^real" $OUT/sm90-build.log
+nvcc -O2 -arch=sm_90 -o $CMP microbench/src/gemm_libs_compare.cu -lcublas -ldl
+
+echo "######## 1. sm90 vs Sm80 vs cuBLAS $(date +%T)"
+L=$OUT/cmp; mkdir -p $L
+echo "patched kernels: sm90 $(cuobjdump -symbols $SM90/libmycutlass.so | grep -c '_pk$') sm80 $(cuobjdump -symbols $SM80/libmycutlass.so | grep -c '_pk$')"
+for mk in 6144,4096 4096,4096 24576,4096 4096,12288 151936,4096; do
+  m=${mk%,*}; k=${mk#*,}
+  shapes=""; for t in 1 16 64 128 2048 8192; do shapes="$shapes $m,$t,$k"; done
+  timeout -k 5 60 $CMP compare $SM90,$SM80 $shapes > $L/cmp-$m-$k.txt 2>&1; echo "## m=$m k=$k rc=$?"
+  cat $L/cmp-$m-$k.txt
+done
+echo "## lm_head re-tune, T >= 1024 (persistent grid cap) $(date +%T)"
+timeout -k 5 60 $CMP tune $SM90 151936,1024,4096 151936,2048,4096 151936,4096,4096 151936,8192,4096 > $L/tune-151936-4096-large.csv 2>&1; echo "rc=$?"
+grep -E "FAIL|unsupported|what" $L/tune-151936-4096-large.csv | head -5
+echo "## sm90 library under the runtime (default policy, then whitelisted) $(date +%T)"
+for wl in none GemmUniversal; do
+  timeout -k 5 60 env $HOOK SMSCHED_TARGET_PATTERNS=$wl SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=100000 MORPHX_LAUNCH_STATS=1 \
+    $CMP compare $SM90 4096,16,4096 4096,2048,4096 > $L/rt-$wl.txt 2>&1; echo "-- whitelist=$wl rc=$?"
+  grep -vE "MorphX-debug" $L/rt-$wl.txt
+  grep -oE "\[MorphX-debug\] (assign|profile|bypass-[a-z]+) func=[A-Za-z0-9_]{0,40}" $L/rt-$wl.txt | sort | uniq -c
+done
+
+# SGLang: gcc 13 (sglang jit_kernel fails with gcc 12.3) and its venv
+module purge; module load cuda/13.0
+source /opt/rh/gcc-toolset-13/enable
+source "$HOME/morphx/envs/sglang-stock/bin/activate"
+L=$OUT/sglang; mkdir -p $L
+MODEL=$HOME/morphx/hf/hub/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2
+SMOKE="python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16"
+summ() { grep -E "^\[(poisson|census)\]|SMOKE|GEMM calls|Error|error" "$1" | grep -vE "origin|^\[census\]   [a-z]" | head -n 30; }
+
+echo "######## 2. greedy tokens, sm90 mycutlass vs torch $(date +%T)"
+MYCUTLASS_LIB_DIR=$SM90 timeout -k 10 360 python scripts/sglang/check_mycutlass.py --model $MODEL > $L/check-sm90.log 2>&1; echo "rc=$?"
+grep -E "^\[(check|e2e)\]|worst|Error|error" $L/check-sm90.log | head -n 30
+
+for g in sm90 sm80 torch; do
+  echo "######## 3. smoke_runner gemm=$g $(date +%T)"
+  case $g in
+    sm90) env="MYCUTLASS_LIB_DIR=$SM90"; gemm=mycutlass ;;
+    sm80) env="MYCUTLASS_LIB_DIR=$SM80"; gemm=mycutlass ;;
+    torch) env=""; gemm=torch ;;
+  esac
+  env $env timeout -k 10 360 $SMOKE --gemm $gemm --census-out $L/census-$g.md > $L/smoke-$g.log 2>&1; echo "rc=$?"
+  summ $L/smoke-$g.log
+done
+
+echo "######## 4. sm90 under the MorphX runtime (memcpy), short $(date +%T)"
+env MYCUTLASS_LIB_DIR=$SM90 $HOOK MORPHX_LAUNCH_STATS=1 SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=1000000 timeout -k 10 480 \
+  $SMOKE --gemm mycutlass --num-requests 8 --output-len 32 --census-decode-steps 4 > $L/smoke-sm90-rt.log 2>&1; echo "rc=$?"
+summ $L/smoke-sm90-rt.log
+grep -E "MorphX-stats" $L/smoke-sm90-rt.log
+grep -oE "\[MorphX-debug\] (assign|profile|bypass-[a-z]+) func=[A-Za-z0-9_]{0,30}" $L/smoke-sm90-rt.log | sort | uniq -c | sort -rn | head
+echo "== done $(date +%T)"
