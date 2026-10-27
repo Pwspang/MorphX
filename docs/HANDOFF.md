@@ -175,6 +175,15 @@ locally. hpcc is no longer used.
   have to win back. Consistent with Track J4 on hpcc: on the H200 decode GEMMs slow down when
   they lose SMs, so the split is zero-sum. Results in `logs/20261026-nscc2b/diag-fig13-*`.
 
+- **Split sweep (job 190793, Fig 13 in-4096-out-128 rps 6, 60 s, default CI, gdr):** MorphX
+  places ~20% of its managed launches as CI on `[0, split)`, ~20% as co-runners moved to
+  `[split, 132)`, ~60% on the whole GPU (69–89k managed launches per run; new
+  `morphx_report()` summary). Avg latency per output token falls monotonically as the split
+  widens: 66 → 0.223, 80 → 0.207, 93 → 0.190, 108 → 0.149, 120 → 0.103 s, vs stream 0.067
+  (TTFT 0.18–0.23 vs 0.16). The less MorphX confines prefill, the better; even at 120 it is
+  54% behind stream, so the partition only adds to the overhead here. Results in
+  `logs/20261026-nscc2b/diag-fig13-split-sweep/`.
+
 ### Backlog
 
 - **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
