@@ -193,6 +193,13 @@ locally. hpcc is no longer used.
   0.099 (+7%); here the splits cut TTFT (0.19–0.21 s vs 0.53 no split, 0.47 stream) at the cost
   of per-token latency. Best split for per-token latency is no split at all three configs.
 
+- **Fig 13/14 at the paper's A100 request rates** (jobs 190734/190735, `MORPHX_PD_RPS_SCALE=1`,
+  60 s, all four variants; `logs/20261027-pd-paper-rates/`): the H200 doesn't queue at these
+  rates (avg 0.011–0.022 s/token for every variant, vs up to 0.27 on the A100), so all
+  variants are within a few ms. MorphX beats neither stream nor baseline on any of the 30
+  points: +5–15% per-token latency and +20–35 ms TTFT (e.g. 0.177 vs 0.153 s), i.e. its
+  overhead with nothing to win back. Confirms the H200 needs the ×3 load to reach contention.
+
 ### Backlog
 
 - **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
