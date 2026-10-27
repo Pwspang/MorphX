@@ -1,0 +1,61 @@
+#!/bin/bash
+# nscc2b: Fig 13 stream vs MorphX with pass-built FlashInfer (MORPHX_FLASHINFER_PASS=1)
+# + mycutlass fp16, default MorphX settings (split hint 108, default CI), 60 s per point.
+#   cd ~/scratch/morphx/trackFI
+#   qsub -v CONFIGS="Figure13:in-4096-out-128-rps-6 Figure13:in-4096-out-256-rps-6 Figure13:in-2048-out-256-rps-9" scripts/baselines/n_fig13_fi_pass.pbs
+# Steps (each under its own timeout): build (pass + runtime/build-llm, gdr) unless
+# SKIP_BUILD=1; pre-build the FlashInfer JIT (check_flashinfer_pass.py, also a
+# greedy-token check vs the runtime); then per config stream, MorphX.
+#PBS -N mx13-fi-pass
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+module load cuda/13.0
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+# libmycutlass from the main checkout (read-only), unless given
+export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/scratch/morphx/MorphX/microbench/build-model}
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+export MORPHX_FLASHINFER_PASS=1
+export MAX_JOBS=${NCPUS:-24}
+R=$PWD
+CONFIGS=${CONFIGS:-"Figure13:in-4096-out-128-rps-6 Figure13:in-4096-out-256-rps-6 Figure13:in-2048-out-256-rps-9"}
+VARIANTS=${VARIANTS:-"stream smsched"}
+SPLIT=${SPLIT:-108}
+OUT=${OUT:-$R/logs/20261027-fi-pass/fig13-${PBS_JOBID%%.*}}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+mkdir -p "$OUT"
+HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$R/runtime/build-llm/libcuda.so:$R/runtime/build-llm/libpreload.so"
+echo "== host=$(hostname) job=$PBS_JOBID configs=$CONFIGS variants=$VARIANTS split=$SPLIT out=$OUT $(date +%T)"
+
+if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
+  J=${NCPUS:-24} STEPS="pass runtime" timeout 900 bash scripts/ae/build-nscc2b.sh > "$OUT/build.log" 2>&1
+  echo "-- build rc=$? $(date +%T)"; grep -E "ok|FAILED" "$OUT/build.log"
+fi
+
+# FlashInfer JIT pre-build (cold cache: clang + pass) outside any measured window,
+# then the same check under the runtime: greedy tokens must match.
+timeout 1500 python scripts/sglang/check_flashinfer_pass.py --model "$MODEL" --out "$OUT/pass.pt" > "$OUT/jit-prebuild.log" 2>&1
+echo "-- jit prebuild rc=$? $(grep -E '^\[fi\] (first|runner)' "$OUT/jit-prebuild.log" | tr '\n' ' ') $(date +%T)"
+env $HOOK SMSCHED_LLM_TRACE_LIMIT=400 timeout 600 python scripts/sglang/check_flashinfer_pass.py --model "$MODEL" --out "$OUT/pass-rt.pt" > "$OUT/check-rt.log" 2>&1
+echo "-- runtime check rc=$? $(python scripts/sglang/check_flashinfer_pass.py --compare "$OUT/pass.pt" "$OUT/pass-rt.pt" 2>&1 | grep 'greedy tokens') $(date +%T)"
+grep -E "\[MorphX-llm\] phase=" "$OUT/check-rt.log" | grep -i flashinfer | awk '{print $2}' | sort | uniq -c
+
+for c in $CONFIGS; do
+  for v in $VARIANTS; do
+    args=(python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}"
+          --only-table "${c%%:*}" --only-config "$c" --only-variant "$v" --no-update-latest-link --run-timeout 420
+          --output-dir "$OUT/${c#*:}-$v")
+    [[ $v == smsched ]] && args+=(--override-split-hint "$SPLIT"
+          --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 ${EXTRA_ENV:-}")
+    timeout 600 "${args[@]}" > "$OUT/${c#*:}-$v.log" 2>&1
+    echo "-- ${c#*:} $v rc=$? $(date +%T) $(tail -n +2 "$OUT/${c#*:}-$v"/tables/*.tsv 2>/dev/null | cut -f1-10 | head -n 1)"
+    grep -h "MorphX-profile\] summary" "$OUT/${c#*:}-$v"/logs/pd-online/*/*/*.err 2>/dev/null | sed 's/.*summary /   /'
+  done
+done
+echo "== done $(date +%T)"
