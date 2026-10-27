@@ -46,6 +46,13 @@ from typing import Deque, Dict, List, Optional
 
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # mycutlass_gemm, flashinfer_pass
+import flashinfer_pass  # noqa: E402
+
+# MORPHX_FLASHINFER_PASS=1: FlashInfer's JIT must see clang + the pass before
+# sglang imports flashinfer (its JIT paths are fixed at import time).
+flashinfer_pass.setup_env()
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.moe import initialize_moe_config
@@ -64,7 +71,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # mycutlass_gemm
+flashinfer_pass.patch_backends()
 
 
 @dataclasses.dataclass
