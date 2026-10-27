@@ -344,8 +344,20 @@ clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
   0.131 (9/263), MorphX 0.080 / 0.366 / 0.156 (48/263); 7.5 rps stream 0.149 / 0.214 / 0.142
   (177/399), MorphX 0.268 / 0.332 / 0.174 (116/399); 10 rps stream 0.126 / 0.429 / 0.132.
   Non-monotonic: near the knee the prefill-thread design is bistable (back-to-back prefills
-  starve decode, few requests finish, avg s/token is over finished requests only). Rerun at
-  5 / 6 / 7.5 / 9 rps on another node: job 192663.
+  starve decode, few requests finish, avg s/token is over finished requests only). Reruns
+  on two other nodes (192658 gpu096, 192663 gpu080) are monotonic and agree, so gpu131 was
+  the problem (served fraction in brackets):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 5 | 0.022 / 0.040–0.041 (0.99) | 0.023–0.035 / 0.042–0.099 (0.99) |
+  | 6 | 0.032–0.033 / 0.056–0.058 (0.93) | 0.035–0.039 / 0.061–0.067 (0.93) |
+  | 7.5 | 0.110–0.115 / 0.137–0.142 (0.72–0.73) | 0.123 / 0.148–0.149 (0.71) |
+
+  Extra points: in-2048-out-256 rps 15 (192659): stream 0.056 / 0.078 / TTFT 3.1 (0.63),
+  MorphX 0.059 / 0.080 / 3.5 (0.60). in-4096-out-256 rps 6 (192661): both collapsed (served
+  fraction 0.03; stream 0.040 / 0.216, MorphX 0.041 / 0.211), so 6 rps is already past the
+  knee there and the 7.5 rps result above is the bistable regime too.
   Summaries at the highest rates (managed / CI-limited / moved / full GPU): 2048/256 rps 18
   225373 / 70197 / 56535 / 98641; 4096/256 rps 7.5 51223 / 8927 / 13609 / 28687. Decode
   attention managed (moved): 2048 rps 6 0 of 184320, rps 12 44063 of 52992 (19189), rps 18
