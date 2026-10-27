@@ -358,12 +358,21 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		Builder.CreateAlignedStore(atomicAdd, castStore, Align(4), false);
 		Builder.CreateBr(blockCheckBlock);
 
+		// Word 0 of dynamic smem belongs to the kernel (CUTLASS 3 sm90 kernels keep
+		// tiles or pipeline mbarriers there), so it is only ours between bodies:
+		// block_fin waits for every thread to finish the previous body before
+		// thread 0 writes the id, and the barrier after the load keeps the next
+		// body from writing word 0 before every thread has read the id.
+		auto createBarrier0 = [&]() {
+			CallInst *callBarrier0 = hasBarrier0 ? Builder.CreateCall(barrier0)
+				: Builder.CreateCall(barrier0, {Builder.getInt32(0)});
+			callBarrier0->setTailCallKind(CallInst::TCK_Tail);
+		};
 		Builder.SetInsertPoint(blockCheckBlock);
-		CallInst *callBarrier0 = hasBarrier0 ? Builder.CreateCall(barrier0)
-			: Builder.CreateCall(barrier0, {Builder.getInt32(0)});
-		callBarrier0->setTailCallKind(CallInst::TCK_Tail);
+		createBarrier0();
 		Value *castLoad = Builder.CreateAddrSpaceCast(dynSmem, PointerType::get(ctx, 0));
 		LoadInst *loadBlockId = Builder.CreateAlignedLoad(Type::getInt32Ty(ctx), castLoad, Align(4));
+		createBarrier0();
 		Value *cmpBlockId = Builder.CreateICmpSLT(loadBlockId, nBlocks);
 		Builder.CreateCondBr(cmpBlockId, oEntry, blockRet);
 
@@ -422,6 +431,7 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		RItoErase.clear();
 
 		Builder.SetInsertPoint(blockFin);
+		createBarrier0();
 		Builder.CreateCondBr(cmpThreadZ, blockFinAdd, blockCheckBlock);
 
 		Builder.SetInsertPoint(blockFinAdd);
