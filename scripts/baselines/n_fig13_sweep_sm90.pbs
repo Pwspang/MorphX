@@ -3,7 +3,8 @@
 # pass-built FA2 + sm90 mycutlass (microbench/build-model-sm90, built by n_fig13_fi_sm90.pbs),
 # split 108, default CI, 60 s per point. One length per job; rates = BASES x SCALE (Fig 13
 # rows), then EXTRA "scale:base" pairs; stops after the first rate where both variants are
-# saturated (TTFT avg > SAT_TTFT s, or avg s/token > SAT_X x stream's first-rate avg).
+# saturated (TTFT avg > SAT_TTFT s, avg s/token > SAT_X x stream's first-rate avg, or under 50%
+# of the generated requests served within the run).
 #   qsub -v LEN=in-2048-out-256,SCALE=6,BASES="1 2 3 4 5",EXTRA="12:3 12:4 12:5",PARTS="libcheck sweep" scripts/baselines/n_fig13_sweep_sm90.pbs
 #   qsub -v LEN=in-4096-out-128,SCALE=5,BASES="1 1.5 2 2.5 3",EXTRA="10:2 10:2.5 10:3" scripts/baselines/n_fig13_sweep_sm90.pbs
 #PBS -N mx13-sweep
@@ -60,17 +61,24 @@ if [[ " $PARTS " == *" libcheck "* ]]; then
   echo "== libcheck done $(date +%T)"
 fi
 
-# row <dir>: "avg p99 ttft_avg" of the run's table row (stream or MorphX column)
+# row <dir>: "avg p99 ttft_avg served_fraction" of the run (stream or MorphX column)
 row() {
   python - "$1" <<'EOF'
-import csv, glob, sys
+import csv, glob, re, sys
+vals = ["nan", "nan", "nan"]
 for f in glob.glob(sys.argv[1] + "/tables/*.tsv"):
     r = list(csv.DictReader(open(f), delimiter="\t"))
     if r:
         for v in ("stream", "MorphX"):
             if r[0].get(f"{v}(avg)"):
-                print(r[0][f"{v}(avg)"], r[0][f"{v}(p99)"], r[0][f"{v}(ttft_avg)"]); sys.exit()
-print("nan nan nan")
+                vals = [r[0][f"{v}(avg)"], r[0][f"{v}(p99)"], r[0][f"{v}(ttft_avg)"]]
+# fraction of the generated requests served within the run (the driver's [final] line)
+frac = "nan"
+for f in glob.glob(sys.argv[1] + "/logs/pd-online/*/*/*.log"):
+    m = re.search(r"requests served: (\d+), total time: [\d.]+s, generated: (\d+)", open(f, errors="ignore").read())
+    if m:
+        frac = "%.2f" % (int(m.group(1)) / max(1, int(m.group(2))))
+print(*vals, frac)
 EOF
 }
 
@@ -92,8 +100,8 @@ if [[ " $PARTS " == *" sweep "* ]]; then
             --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1")
       timeout -k 10 420 "${args[@]}" > "$d.log" 2>&1
       rc=$?
-      read -r avg p99 ttft < <(row "$d")
-      echo "-- $LEN rps=$rate $v rc=$rc avg=$avg p99=$p99 ttft=$ttft $(date +%T)"
+      read -r avg p99 ttft served < <(row "$d")
+      echo "-- $LEN rps=$rate $v rc=$rc avg=$avg p99=$p99 ttft=$ttft served_frac=$served $(date +%T)"
       [[ $v == stream && -z $first_stream ]] && first_stream=$avg
       for f in "$d"/logs/pd-online/*/*/*.err; do
         [[ -f $f ]] || continue
@@ -101,7 +109,7 @@ if [[ " $PARTS " == *" sweep "* ]]; then
         grep -h "MorphX-profile\] kernel" "$f" | grep -i "flashinfer" | sed -E 's/.*\] kernel /   fi: /' | cut -c1-170
         grep -hE "Traceback|Error" "$f" | head -3
       done
-      if python -c "import math,sys; a,t,f=float('$avg'),float('$ttft'),float('${first_stream:-nan}'); sys.exit(0 if (t>$SAT_TTFT or a>$SAT_X*f) else 1)" 2>/dev/null; then
+      if python -c "import math,sys; a,t,f,s=float('$avg'),float('$ttft'),float('${first_stream:-nan}'),float('$served'); sys.exit(0 if (t>$SAT_TTFT or a>$SAT_X*f or s<0.5) else 1)" 2>/dev/null; then
         sat=$((sat + 1))
       fi
     done
