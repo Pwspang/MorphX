@@ -232,6 +232,7 @@ int with_profile;
 int profile_log;
 std::atomic<long> gCILimitedLaunches{0};  // CI kernels limited to [0, split) at launch
 std::atomic<long> gSplitMoves{0};         // co-runners moved to [split, nrSM) by schedule_2
+std::atomic<long> gManagedLaunches{0};    // transformed (_pk) launches outside profiling
 int split_hint;
 int llm_trick_mode;
 int llm_trace_limit;
@@ -653,13 +654,23 @@ StreamInfo* registerStream(CUstream stream) {
 
 bool isInitialized = false;
 
+// SMSCHED_PROFILE_LOG=1: how many managed launches ran on [0, split) (CI),
+// were moved to [split, nrSM) next to a CI kernel, or kept the whole GPU.
+// Exported so a host that leaves with os._exit (test-pd-online.py) can call it.
+extern "C" void morphx_report() {
+    static std::atomic<bool> reported{false};
+    if(!profile_log || reported.exchange(true)) return;
+    long managed = gManagedLaunches.load(), ci = gCILimitedLaunches.load(), moved = gSplitMoves.load();
+    fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d nrSM=%d"
+        " managed_launches=%ld ci_limited_launches=%ld split_moves=%ld full_gpu_launches=%ld\n",
+        ci_threshold, ci_saturate, split_hint, gNrSM, managed, ci, moved, std::max(0L, managed - ci - moved));
+    fflush(stderr);
+}
+
 // Ensure the background agent thread is properly joined before process exit
 static void runtimeShutdown() {
     if(!isInitialized) return;
-    if(profile_log) {
-        fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d ci_limited_launches=%ld split_moves=%ld\n",
-            ci_threshold, ci_saturate, split_hint, gCILimitedLaunches.load(), gSplitMoves.load());
-    }
+    morphx_report();
     gAgentRunning.store(false, std::memory_order_relaxed);
     if(agent.joinable()) {
         agent.join();
@@ -1128,6 +1139,9 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         // printf("[smsched] kernel launched: %s, func: %p, grid: (%d, %d, %d), block: (%d, %d, %d), sharedMemBytes: %u, stream: %p, numArgs: %d, occup: %d, agents: %d\n",
         //     launchInfo->name, (void*)f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, numArgs, launchInfo->occup, agents);
         res = real_cuLaunchKernel(f, agents, 1, 1, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, nargs, extra);
+    }
+    if(!profile) {
+        gManagedLaunches.fetch_add(1, std::memory_order_relaxed);
     }
 
     if(profile) {

@@ -1,0 +1,41 @@
+#!/bin/bash
+# nscc2b: sweep MorphX's prefill/decode split on one Fig 13 point and count how
+# its launches were placed (SMSCHED_PROFILE_LOG summary: CI kernels on
+# [0, split), co-runners moved to [split, nrSM), the rest on the whole GPU).
+# Default CI settings; stream once as the reference. 60 s per point.
+#   cd ~/scratch/morphx/MorphX
+#   qsub -v CONFIG=Figure13:in-4096-out-128-rps-6,SPLITS="66 80 93 108 120" scripts/baselines/n_fig13_split_sweep.pbs
+#PBS -N mx13-split-sweep
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+set -uo pipefail
+module load cuda/13.0
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+CONFIG=${CONFIG:-Figure13:in-4096-out-128-rps-6}
+SPLITS=${SPLITS:-66 80 93 108 120}
+BUILD=${BUILD:-build-llm-stats}
+R=$PWD
+OUT=${OUT:-$R/logs/20261026-nscc2b/diag-fig13-split-sweep}
+mkdir -p "$OUT"
+HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/$BUILD/libcuda.so LD_PRELOAD=$R/runtime/$BUILD/libcuda.so:$R/runtime/$BUILD/libpreload.so"
+common=(python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}"
+        --only-table "${CONFIG%%:*}" --only-config "$CONFIG" --no-update-latest-link --run-timeout 300)
+echo "== host=$(hostname) job=$PBS_JOBID config=$CONFIG splits=$SPLITS out=$OUT"
+"${common[@]}" --output-dir "$OUT/stream" --only-variant stream > "$OUT-stream.log" 2>&1
+echo "-- stream rc=$?"
+for sp in $SPLITS; do
+  "${common[@]}" --output-dir "$OUT/split-$sp" --only-variant smsched --override-split-hint "$sp" \
+    --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1" > "$OUT-split-$sp.log" 2>&1
+  echo "-- split $sp rc=$? $(grep -h 'MorphX-profile\] summary' "$OUT"/split-$sp/logs/pd-online/*/*/smsched.err | sed 's/.*summary //')"
+done
+for d in "$OUT"/stream "$OUT"/split-*; do
+  printf '%-10s %s\n' "$(basename "$d")" "$(tail -n +2 "$d"/tables/*.tsv 2>/dev/null | cut -f1-10 | head -n 1)"
+done
+echo "== done $(date +%T)"
