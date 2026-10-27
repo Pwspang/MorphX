@@ -429,6 +429,7 @@ void schedule(KernelInfo *kernels[], int n, int nrSM) {
 }
 
 void agentThread() {
+    morphx_in_agent_thread = true;
     // bind_thread_to_cpu(gCpu.fetch_add(1));
     int nrSM = getNrSM();
     KernelInfo *kernels[MAX_CONCURRENT_STREAMS];

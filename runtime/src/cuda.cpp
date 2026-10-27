@@ -144,7 +144,7 @@ static cuGetProcAddress_v2_func_t real_cuGetProcAddress_v2 = NULL;
             const char* errorStr; \
             cuGetErrorString(result, &errorStr); \
             printf("%s failed with error: %d, %s (at %s:%d)\n", #call, result, errorStr, __FILE__, __LINE__); \
-            exit(-1); \
+            morphx_fatal_exit(-1); \
         } \
     } while (0)
 
@@ -152,7 +152,7 @@ static cuGetProcAddress_v2_func_t real_cuGetProcAddress_v2 = NULL;
     cudaError_t err = (call); \
     if (err != cudaSuccess) { \
         fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
+        morphx_fatal_exit(); \
     } \
 }
 
@@ -778,6 +778,7 @@ void reclaimOnCIFinish(int finishedStream, KernelInfo *finishedKernel, KernelInf
 }
 
 void agentThread() {
+    morphx_in_agent_thread = true;
     bind_thread_to_cpu(gCpu.fetch_add(1));
     int nrSM = getNrSM();
     KernelInfo *kernels[MAX_CONCURRENT_STREAMS], *nexts[MAX_CONCURRENT_STREAMS];

@@ -505,6 +505,7 @@ void schedule_2(KernelInfo *kernels[], KernelInfo *nexts[], int nStreams, int nr
 }
 
 void agentThread() {
+    morphx_in_agent_thread = true;
     bind_thread_to_cpu(gCpu.fetch_add(1));
     int nrSM = getNrSM();
     KernelInfo *kernels[MAX_CONCURRENT_STREAMS], *nexts[MAX_CONCURRENT_STREAMS];
