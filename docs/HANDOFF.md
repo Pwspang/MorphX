@@ -187,6 +187,11 @@ locally. hpcc is no longer used.
   confined, 0 moved): 0.094 s/token avg (p99 0.128, TTFT 0.171) vs stream 0.067 (0.105, 0.164).
   So at this load MorphX's overhead alone costs +40%, and the default split (108) adds another
   ~60% on top (0.149). Results in `logs/20261026-nscc2b/diag-fig13-nosplit-ci2/`.
+  Two more configs (jobs 190846/190847, 60 s): in-2048-out-256 rps 9: nothing is CI (195,918
+  managed launches, 0 confined, 0 moved), MorphX 0.053 vs stream 0.041 s/token (+29%, overhead
+  only). in-4096-out-256 rps 6: split 80 0.128, 108 0.119, 120 0.116, no split 0.106 vs stream
+  0.099 (+7%); here the splits cut TTFT (0.19–0.21 s vs 0.53 no split, 0.47 stream) at the cost
+  of per-token latency. Best split for per-token latency is no split at all three configs.
 
 ### Backlog
 
