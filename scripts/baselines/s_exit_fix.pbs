@@ -1,0 +1,31 @@
+#!/bin/bash
+# hpcc: the runtime exits (rc=1) instead of hanging when a patched kernel faults.
+# Faulting kernel: the sm90 spike built without __grid_constant__ (TMA reads its
+# descriptors from local memory). Before the fix this hung under the runtime with
+# SMSCHED_PROFILE=0. Plus the runtime's own hook and pass tests (memcpy backend).
+#   cd ~/morphx/trackS && qsub scripts/baselines/s_exit_fix.pbs
+#PBS -N mx-exit-fix
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=00:20:00
+#PBS -j oe
+module load gnu/gcc-12.3 cuda/13.0
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-h100.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+R=$PWD
+B=microbench/build-spike
+echo "== host=$(hostname) job=$PBS_JOBID"
+for f in fault pass; do
+  start=$(date +%s)
+  env NEUTRINO_HOOK_DRIVER=$R/runtime/build-mc/libcuda.so LD_PRELOAD=$R/runtime/build-mc/libcuda.so:$R/runtime/build-mc/libpreload.so \
+    SMSCHED_PROFILE=0 timeout 60 $B/sm90_spike-$f 4096 4096 4096 3 > /tmp/exit-$f-$$.log 2>&1
+  echo "-- spike-$f under runtime (profile off): rc=$? in $(( $(date +%s) - start )) s (124 = still hangs)"
+  grep -E "^M=|error|Error" /tmp/exit-$f-$$.log | head -n 3 | sed 's/^/   /'
+done
+for t in run_hook_test run_pass_test; do
+  MORPHX_SYNC_BACKEND=memcpy OUT=${TMPDIR:-/tmp}/$t-$$ timeout 300 bash runtime/test/$t.sh > /tmp/$t-$$.log 2>&1
+  echo "-- $t memcpy: rc=$? $(grep -c 'RESULT: PASS' /tmp/$t-$$.log) PASS, $(grep -c 'RESULT: FAIL' /tmp/$t-$$.log) FAIL"
+done
+echo "== done $(date +%T)"
