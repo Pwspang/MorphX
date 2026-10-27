@@ -175,8 +175,43 @@ locally. hpcc is no longer used.
   have to win back. Consistent with Track J4 on hpcc: on the H200 decode GEMMs slow down when
   they lose SMs, so the split is zero-sum. Results in `logs/20261026-nscc2b/diag-fig13-*`.
 
+- **Split sweep (job 190793, Fig 13 in-4096-out-128 rps 6, 60 s, default CI, gdr):** MorphX
+  places ~20% of its managed launches as CI on `[0, split)`, ~20% as co-runners moved to
+  `[split, 132)`, ~60% on the whole GPU (69–89k managed launches per run; new
+  `morphx_report()` summary). Avg latency per output token falls monotonically as the split
+  widens: 66 → 0.223, 80 → 0.207, 93 → 0.190, 108 → 0.149, 120 → 0.103 s, vs stream 0.067
+  (TTFT 0.18–0.23 vs 0.16). The less MorphX confines prefill, the better; even at 120 it is
+  54% behind stream, so the partition only adds to the overhead here. Results in
+  `logs/20261026-nscc2b/diag-fig13-split-sweep/`.
+  No-split run (job 190815, same point, `MORPHX_CI_THRESHOLD=2`: 92,726 managed launches, 0
+  confined, 0 moved): 0.094 s/token avg (p99 0.128, TTFT 0.171) vs stream 0.067 (0.105, 0.164).
+  So at this load MorphX's overhead alone costs +40%, and the default split (108) adds another
+  ~60% on top (0.149). Results in `logs/20261026-nscc2b/diag-fig13-nosplit-ci2/`.
+  Two more configs (jobs 190846/190847, 60 s): in-2048-out-256 rps 9: nothing is CI (195,918
+  managed launches, 0 confined, 0 moved), MorphX 0.053 vs stream 0.041 s/token (+29%, overhead
+  only). in-4096-out-256 rps 6: split 80 0.128, 108 0.119, 120 0.116, no split 0.106 vs stream
+  0.099 (+7%); here the splits cut TTFT (0.19–0.21 s vs 0.53 no split, 0.47 stream) at the cost
+  of per-token latency. Best split for per-token latency is no split at all three configs.
+
+- **Fig 13/14 at the paper's A100 request rates** (jobs 190734/190735, `MORPHX_PD_RPS_SCALE=1`,
+  60 s, all four variants; `logs/20261027-pd-paper-rates/`): the H200 doesn't queue at these
+  rates (avg 0.011–0.022 s/token for every variant, vs up to 0.27 on the A100), so all
+  variants are within a few ms. MorphX beats neither stream nor baseline on any of the 30
+  points: +5–15% per-token latency and +20–35 ms TTFT (e.g. 0.177 vs 0.153 s), i.e. its
+  overhead with nothing to win back. Confirms the H200 needs the ×3 load to reach contention.
+
 ### Backlog
 
+- **Track S status (2026-10-27, branch `h100-port-s-sm90`, dev on hpcc `~/morphx/trackS`):** one
+  sm_90a CUTLASS 3 GEMM (`KernelTma`, 128×128×64, 1×1×1 cluster) runs correctly through the pass
+  and under the runtime, and SM confinement works (66/33/8 SMs: 1.75/3.4/13.5× of 132). 4096³
+  0.213 ms vs cuBLAS 0.179. Needs `CUTLASS_GRID_CONSTANT=__grid_constant__` (CUTLASS disables it
+  under clang, then TMA reads descriptors from local memory and faults) and `-DNDEBUG` (device
+  asserts serialize WGMMA). The pass now barriers around the dynamic-smem word-0 hand-off (a
+  separate static `__shared__` word would break sm90's 1024-byte smem alignment); kept on the
+  Track S branch, not here, because it changes every pass-built kernel. Runtime fix merged here
+  (`6b194e9`): a fatal error in the agent thread now `_exit`s instead of deadlocking with the
+  main thread's `exit()` (a faulting kernel used to leave the process hung at 0% GPU).
 - **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27, then started the same day as
   Track S (branch `h100-port-s-sm90`). Once the library works, do not re-run every variant
   first: start with a small comparison (e.g. MorphX vs stream at a few Fig 13 points) and only

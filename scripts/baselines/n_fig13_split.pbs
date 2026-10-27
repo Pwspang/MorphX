@@ -25,7 +25,8 @@ if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=
 R=$PWD
 OUT=${OUT:-$R/logs/20261026-nscc2b/diag-fig13-$TAG}
 mkdir -p "$OUT"
-HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$R/runtime/build-llm/libcuda.so:$R/runtime/build-llm/libpreload.so"
+BUILD=${BUILD:-build-llm}
+HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/$BUILD/libcuda.so LD_PRELOAD=$R/runtime/$BUILD/libcuda.so:$R/runtime/$BUILD/libpreload.so"
 cmd=(python scripts/ae/run_pd_colocate_part2.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "${DURATION:-180}"
      --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 ${EXTRA_ENV:-}"
      --only-table Figure13 --only-variant smsched --no-update-latest-link --skip-existing)
