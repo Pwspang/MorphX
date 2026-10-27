@@ -251,6 +251,35 @@ clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
   per (name, grid size) or skipping warm-up launches would make it a managed
   memory-intensive kernel (legacy CI 0.41), the pairing the paper describes.
   Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/check-{192309,192350}`.
+- **Per-grid profiling fix** (`MORPHX_PROFILE_PER_GRID=1`, default off, `cuda-llm.cpp`):
+  profile/CI/short-bypass key = (kernel name, power-of-two grid bucket), interned so
+  `gCI`, `gWaveTime` and the 50 µs check share it; at most `MORPHX_PROFILE_GRID_MAX`
+  (default 6) buckets profiled per name (Fig 13: 53 names, 121 keys). Managed launches
+  cache their CI entry so the agent thread never reads the map. `SMSCHED_PROFILE_LOG=1`
+  now also prints per-kernel counters (`[MorphX-profile] kernel launches=...`).
+  Greedy tokens under the runtime stay identical (384/384) with and without it.
+- **Fig 13 (job 192386, asp2b-gpu092, gdr, 60 s, split 108, pass-built FlashInfer FA2 +
+  mycutlass fp16)**, avg / p99 s per token, TTFT avg s:
+
+  | config | stream | MorphX | MorphX + per-grid | old stock-FlashInfer (FA3) refs |
+  |---|---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.117 / 0.151 / 0.176 | 0.209 / 0.234 / 0.201 | 0.193 / 0.204 / 0.208 | stream 0.067, MorphX 0.149, no-split 0.094 |
+  | in-4096-out-256-rps-6 | 0.108 / 0.126 / 0.531 | 0.128 / 0.136 / 0.199 | 0.120 / 0.130 / 0.312 | stream 0.099, no-split 0.106 |
+  | in-2048-out-256-rps-9 | 0.048 / 0.059 / 0.094 | 0.067 / 0.082 / 1.055 | 0.067 / 0.078 / 0.572 | stream 0.041, MorphX 0.053 |
+
+  Decode attention (paged FA2 kernel) launches, default → per-grid:
+  4096/128: managed 0 → 7955 of 13932 (moved to [108, 132) 7061, short-bypassed 5974);
+  4096/256: 0 → 13283 of 18792 (moved 5427); 2048/256: 0 → 27935 of 35280 (moved 11419).
+  Never CI-limited (it is memory-bound). Summaries (managed / CI-limited / moved):
+  4096/128 84632 / 25940 / 13988 → 99377 / 42984 / 37094; 4096/256 94455 / 28539 /
+  11332 → 119248 / 39321 / 29314; 2048/256 197602 / 0 / 0 → 225592 / 54447 / 58942
+  (per-grid also re-profiles the large-grid prefill GEMMs, which now count as CI at
+  2048 tokens). Per-grid helps MorphX by 0–8% avg and 5–13% p99 but MorphX stays
+  10–65% behind stream. Every variant is slower than with stock FlashInfer: stream
+  +75% at 4096/128. Likely the FA3 → FA2 pin (the ragged prefill kernel is ~2x slower,
+  321 → 657 µs per launch; the pass build itself was +0.9% per prefill step), not
+  confirmed: a stream run with `MORPHX_FLASHINFER_FA2=1` (stock nvcc FA2) would separate
+  the two. Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-192386`.
 - Not done: SGLang `jit_kernel` ops (act_and_mul, rope, qknorm, store_kvcache; ~3%)
   go through tvm-ffi, which hard-codes `$CUDA_HOME/bin/nvcc`; easiest path is a shim
   CUDA_HOME (symlinked toolkit, `bin/nvcc` → the same wrapper) set only for those
