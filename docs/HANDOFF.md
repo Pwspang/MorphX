@@ -177,7 +177,10 @@ locally. hpcc is no longer used.
 
 ### Backlog
 
-- **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
+- **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27, then started the same day as
+  Track S (branch `h100-port-s-sm90`). Once the library works, do not re-run every variant
+  first: start with a small comparison (e.g. MorphX vs stream at a few Fig 13 points) and only
+  re-run full figures if that shows a change worth it. Today's mycutlass is
   Sm80-style CUTLASS 2 (`MmaPipelined`/`MmaMultistage`): vs cuBLAS on the H200, compute-bound
   GEMMs are 1.6–1.8× slower (8192³ 2.32 vs 1.44 ms; Fig 16 M=512 9.68 vs 5.26 ms), small-M
   1.1–1.25×, GEMV the same. Expected gain: prefill/TTFT ~1.3–1.5× for every variant, decode
