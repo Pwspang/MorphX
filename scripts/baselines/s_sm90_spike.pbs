@@ -1,0 +1,33 @@
+#!/bin/bash
+# Track S (sm90 mycutlass): run microbench/build-spike/sm90_spike-{nopass,pass}
+# (CUTLASS 3 WGMMA/TMA GEMM, clang + SMSched pass) against cuBLAS, then the pass
+# build under the MorphX runtime (patched _pk kernel, profiling = SM ranges).
+#   cd ~/scratch/morphx/MorphX && qsub scripts/baselines/s_sm90_spike.pbs
+#PBS -N mx-sm90-spike
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=00:30:00
+#PBS -j oe
+module load cuda/13.0
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+export LD_LIBRARY_PATH=$MORPHX_CUDA_ROOT/../../math_libs/13.0/lib64:$LD_LIBRARY_PATH
+B=microbench/build-spike
+R=$PWD
+HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build/libcuda.so LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
+SHAPES="4096,4096,4096 8192,8192,8192 16,12288,4096 128,12288,4096 2048,12288,4096 2048,4096,4096 4096,24576,4096"
+echo "== host=$(hostname) job=$PBS_JOBID"
+for bin in nopass pass; do
+  echo "######## $bin, no runtime"
+  for s in $SHAPES; do timeout 120 $B/sm90_spike-$bin ${s//,/ } 20 2>&1 | tail -n 1; done
+done
+echo "######## pass, MorphX runtime (gdr)"
+for s in $SHAPES; do
+  env $HOOK SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=6 MORPHX_LAUNCH_STATS=1 timeout 300 $B/sm90_spike-pass ${s//,/ } 20 > /tmp/spike-$$.log 2>&1
+  echo "rc=$? $(grep -E "^M=" /tmp/spike-$$.log)"
+  grep -E "MorphX-debug\] (launch|profile|assign|bypass)" /tmp/spike-$$.log | head -n 3 | cut -c1-200 | sed 's/^/   /'
+  grep -E "MorphX-stats|error|Error|illegal|trap" /tmp/spike-$$.log | head -n 3 | sed 's/^/   /'
+done
+echo "== done $(date +%T)"
