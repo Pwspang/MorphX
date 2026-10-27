@@ -39,7 +39,7 @@ MATH=$MORPHX_CUDA_ROOT/../../math_libs/13.0
 export LD_LIBRARY_PATH=$MATH/lib64:$LD_LIBRARY_PATH
 R=$PWD
 J=${NCPUS:-16}
-SM90=$R/microbench/build-model-sm90
+SM90=${SM90:-$R/microbench/build-model-sm90}
 SM80=${SM80:-$R/microbench/build-model}
 CMP=$OUT/gemm_libs_compare
 echo "== host=$(hostname) job=$PBS_JOBID part=$PART ncpus=$J head=$(git log --oneline -1 | cut -c1-60) $(date +%T)"
@@ -104,13 +104,14 @@ if [[ " $PART " == *" sglang "* ]]; then
   HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build/libcuda.so LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
   summ() { grep -E "^\[(poisson|census)\]|SMOKE|GEMM calls|MorphX-stats|Error|error" "$1" | grep -vE "origin|^\[census\]   [a-zA-Z]" | head -n 30; }
   tokens() { grep -E "^\[e2e\] (prefill|greedy|prompt)|worst|Error|error" "$1" | cut -c1-200 | head -n 12; }
-  for lib in sm90 sm80; do
+  # SGLANG_CHECK / SGLANG_GEMMS / SGLANG_RT=0 trim the run (e.g. an A/B of two sm90 builds via SM80=)
+  for lib in ${SGLANG_CHECK-sm90 sm80}; do
     [[ $lib == sm90 ]] && dir=$SM90 || dir=$SM80
     echo "######## greedy tokens, $lib mycutlass vs torch $(date +%T)"
     MYCUTLASS_LIB_DIR=$dir timeout -k 10 360 python scripts/sglang/check_mycutlass.py --model "$MODEL" > "$L/check-$lib.log" 2>&1; echo "rc=$?"
     tokens "$L/check-$lib.log"
   done
-  for g in sm90 sm80 torch; do
+  for g in ${SGLANG_GEMMS-sm90 sm80 torch}; do
     echo "######## smoke_runner gemm=$g $(date +%T)"
     case $g in
       sm90) env="MYCUTLASS_LIB_DIR=$SM90"; gemm=mycutlass ;;
@@ -120,6 +121,7 @@ if [[ " $PART " == *" sglang "* ]]; then
     env $env timeout -k 10 360 $SMOKE --gemm $gemm --census-out "$L/census-$g.md" > "$L/smoke-$g.log" 2>&1; echo "rc=$?"
     summ "$L/smoke-$g.log"
   done
+  if [[ "${SGLANG_RT:-1}" == 1 ]]; then
   echo "######## sm90 under the MorphX runtime (gdr): short smoke run, then greedy tokens $(date +%T)"
   env MYCUTLASS_LIB_DIR=$SM90 $HOOK MORPHX_LAUNCH_STATS=1 SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=1000000 timeout -k 10 480 \
     $SMOKE --gemm mycutlass --num-requests 8 --output-len 32 --census-decode-steps 4 > "$L/smoke-sm90-rt.log" 2>&1; echo "rc=$?"
@@ -128,5 +130,6 @@ if [[ " $PART " == *" sglang "* ]]; then
   env MYCUTLASS_LIB_DIR=$SM90 $HOOK MORPHX_LAUNCH_STATS=1 timeout -k 10 480 \
     python scripts/sglang/check_mycutlass.py --model "$MODEL" > "$L/check-sm90-rt.log" 2>&1; echo "rc=$?"
   tokens "$L/check-sm90-rt.log"; grep -E "MorphX-stats" "$L/check-sm90-rt.log"
+  fi
   echo "== sglang done $(date +%T)"
 fi

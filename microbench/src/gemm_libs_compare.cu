@@ -5,7 +5,8 @@
 //   nvcc -O2 -arch=sm_90 -o gemm_libs_compare microbench/src/gemm_libs_compare.cu -lcublas -ldl
 //
 //   gemm_libs_compare compare <dir1>[,<dir2>...] m,n,k [m,n,k ...]
-//       one line per shape: cuBLAS ms, then ms / max error / PASS|FAIL per library
+//       one line per shape: cuBLAS ms, then ms / max error / PASS|FAIL / host us
+//       per call per library
 //   gemm_libs_compare tune <sm90 dir> m,n,k [m,n,k ...]
 //       CSV, every config of the sm90 build (myCutlassSm90Run) on every shape
 #include <cublas_v2.h>
@@ -13,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,7 +133,7 @@ int main(int argc, char **argv) {
     printf("m,n,k,config,name,ms,max_err,max_ref,status,cublas_ms\n");
   } else {
     printf("%-22s %10s", "m,n,k", "cuBLAS_ms");
-    for (auto &d : dirs) printf(" | %-40s", d.substr(d.find_last_of('/') + 1).c_str());
+    for (auto &d : dirs) printf(" | %-52s", d.substr(d.find_last_of('/') + 1).c_str());
     printf("\n");
   }
   fflush(stdout);
@@ -178,11 +180,16 @@ int main(int argc, char **argv) {
         float err, ref;
         check(p, &err, &ref);
         float ms = time_ms([&] { hgemm(p.m, p.n, p.k, p.a, p.m, p.b, p.k, p.c, p.m, 1.f, 0.f, gStream); });
+        // host cost of one call: issue 50 without waiting (the queue absorbs them)
+        auto h0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 50; ++i) hgemm(p.m, p.n, p.k, p.a, p.m, p.b, p.k, p.c, p.m, 1.f, 0.f, gStream);
+        double host_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - h0).count() / 50;
+        CHECK_CUDA(cudaStreamSynchronize(gStream));
         char cfg[64] = "";
         if (select && name) snprintf(cfg, sizeof(cfg), " %s", name(select(p.m, p.n, p.k)));
         char cell[128];
-        snprintf(cell, sizeof(cell), "%.4f err=%.3g %s%s", ms, err, ok(err, ref) ? "PASS" : "FAIL", cfg);
-        printf(" | %-40s", cell);
+        snprintf(cell, sizeof(cell), "%.4f err=%.3g %s host=%.1fus%s", ms, err, ok(err, ref) ? "PASS" : "FAIL", host_us, cfg);
+        printf(" | %-52s", cell);
       }
       printf("\n");
       fflush(stdout);

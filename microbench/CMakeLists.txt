@@ -75,6 +75,9 @@ if(MORPHX_MYCUTLASS_ARCH STREQUAL "sm90")
         # device asserts make ptxas serialize the wgmma pipeline (C7510)
         NDEBUG
         CUTLASS_GRID_CONSTANT=__grid_constant__
+        # call cuTensorMapEncodeTiled directly instead of looking it up with
+        # cudaGetDriverEntryPoint for every TMA descriptor of every GEMM call
+        CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1
         # CUTLASS sees CUDA 12.4 (see cmake/morphx.cmake); CUDA 13 keeps the _v12000 typedefs
         PFN_cuTensorMapEncodeTiled=PFN_cuTensorMapEncodeTiled_v12000
         PFN_cuTensorMapEncodeIm2col=PFN_cuTensorMapEncodeIm2col_v12000)
