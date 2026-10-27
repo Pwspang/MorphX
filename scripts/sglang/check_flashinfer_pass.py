@@ -57,12 +57,40 @@ def compare(a_path, b_path):
     return 0 if exact == len(a["tokens"]) else 1
 
 
+def bench(runner, torch, reps=3, nreq=16, in_len=2048, out_len=64):
+    import statistics
+
+    pre, dec = [], []
+    for rep in range(reps):
+        for i in range(nreq):
+            ids = [(i * 7919 + j * 31 + rep) % 30000 + 100 for j in range(in_len)]
+            runner.add_request(f"b{rep}-{i}", ids, max_tokens=out_len, min_tokens=out_len)
+        while runner.has_unfinished_requests():
+            np_before = runner.num_prefill_steps
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            runner.step()
+            torch.cuda.synchronize()
+            dt = (time.perf_counter() - t) * 1e3
+            if rep == 0:
+                continue  # warm-up round
+            (pre if runner.num_prefill_steps != np_before else dec).append(dt)
+    print(f"[bench] prefill step (4 x {in_len} tokens): median {statistics.median(pre):.2f} ms "
+          f"(n={len(pre)}, min {min(pre):.2f})", flush=True)
+    full = dec[: len(dec) // 2]  # first half: all {nreq} requests still decoding
+    print(f"[bench] decode step (batch {nreq}, ctx {in_len}+): median {statistics.median(full):.3f} ms "
+          f"(n={len(full)}, min {min(full):.3f})", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model")
     ap.add_argument("--out")
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--compare", nargs=2)
+    ap.add_argument("--bench", action="store_true",
+                    help="also time prefill/decode steps: 16 requests x 2048 tokens (4 prefill steps of 8192 "
+                         "tokens), then decode at batch 16")
     args = ap.parse_args()
     if args.compare:
         return compare(*args.compare)
@@ -114,6 +142,8 @@ def main():
         s = torch.randn(4, 8, dtype=torch.float32, device="cuda")
         merge_state(v, s, v, s)
     torch.cuda.synchronize()
+    if args.bench:
+        bench(runner, torch)
     for i, t in enumerate(ts + tl):
         print(f"[fi] prompt {i}: {tok.decode(t)[:70]!r}", flush=True)
     if args.out:

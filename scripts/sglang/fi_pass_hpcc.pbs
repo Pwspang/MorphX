@@ -1,0 +1,101 @@
+#!/bin/bash
+# Pass-built FlashInfer (MORPHX_FLASHINFER_PASS=1) on hpcc: build, correctness,
+# step times and a Fig 13-like kernel census.
+#   cd ~/morphx/trackFI && qsub -v PARTS="build check bench census" scripts/sglang/fi_pass_hpcc.pbs
+# Parts:
+#   build   smsched-pass/build and runtime/build-llm (USE_CUDA_LLM=ON, memcpy)
+#   check   greedy tokens: stock (auto = FA3 ragged prefill), stock FA2, pass, pass + runtime
+#   bench   prefill/decode step times, stock vs stock FA2 vs pass (no runtime)
+#   census  Fig 13-like run (in-4096-out-128, 18 req/s): nsys GPU time per kernel
+#           (stream variant) + MorphX first-wave/CI profile log (smsched variant)
+#PBS -N mx-fi-pass
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:30:00
+#PBS -j oe
+set -uo pipefail
+module purge
+module load gnu/gcc-12.3 cuda/13.0
+# sglang jit_kernel (tvm-ffi/nvcc at run time) fails to parse with gcc 12.3; gcc 13 works
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "${PBS_O_WORKDIR:-$PWD}"
+export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/MorphX/microbench/build-model}
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+R=$PWD
+PARTS=${PARTS:-"build check bench census"}
+OUT=${OUT:-$HOME/morphx/runs/fi/${PBS_JOBID:-manual}}
+MODEL=${MODEL:-$HOME/morphx/hf/hub/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+J=${NCPUS:-12}
+export MAX_JOBS=$J
+mkdir -p "$OUT"
+HOOK_LIBS="$R/runtime/build-llm/libcuda.so:$R/runtime/build-llm/libpreload.so"
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+echo "== host=$(hostname) job=${PBS_JOBID:-manual} parts=$PARTS out=$OUT clang=$MORPHX_LLVM_ROOT mycutlass=$MYCUTLASS_LIB_DIR"
+
+if [[ " $PARTS " == *" build "* ]]; then
+  echo "== build $(date +%T)"
+  rm -rf smsched-pass/build runtime/build-llm
+  { cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR="$MORPHX_LLVM_ROOT/lib/cmake/llvm" && cmake --build smsched-pass/build -j "$J"; } > "$OUT/build-pass.log" 2>&1
+  echo "pass rc=$?"
+  { cmake -S runtime -B runtime/build-llm -DUSE_CUDA_LLM=ON -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" && cmake --build runtime/build-llm -j "$J"; } > "$OUT/build-rt.log" 2>&1
+  echo "runtime rc=$?"
+fi
+
+if [[ " $PARTS " == *" check "* ]]; then
+  echo "== check $(date +%T)"
+  timeout 900 $CHECK --out "$OUT/stock.pt" > "$OUT/check-stock.log" 2>&1; echo "stock rc=$?"
+  MORPHX_FLASHINFER_FA2=1 timeout 900 $CHECK --out "$OUT/stockfa2.pt" > "$OUT/check-stockfa2.log" 2>&1; echo "stock-fa2 rc=$?"
+  # cold pass-built JIT cache: the first generation includes the clang build
+  MORPHX_FI_CLANG_LOG="$OUT/clang-cmds.log" MORPHX_FLASHINFER_PASS=1 timeout 1800 $CHECK --out "$OUT/pass.pt" > "$OUT/check-pass.log" 2>&1; echo "pass rc=$?"
+  grep -E "^\[fi\] (first|runner)" "$OUT/check-pass.log"
+  MORPHX_FLASHINFER_PASS=1 SMSCHED_LLM_TRACE_LIMIT=400 SMSCHED_PROFILE_LOG=1 NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$HOOK_LIBS \
+    timeout 900 $CHECK --out "$OUT/pass-rt.pt" > "$OUT/check-pass-rt.log" 2>&1; echo "pass+runtime rc=$?"
+  for p in "stock stockfa2" "stock pass" "stockfa2 pass" "pass pass-rt" "stockfa2 pass-rt"; do
+    set -- $p; $CHECK --compare "$OUT/$1.pt" "$OUT/$2.pt" 2>&1 | grep "^\[cmp\]"
+  done
+  echo "-- FlashInfer kernels under the runtime (first launch per phase)"
+  grep -E "\[MorphX-llm\] phase=" "$OUT/check-pass-rt.log" | grep -i flashinfer | sed -E 's/grid=.* name=/name=/' | cut -c1-200 | sort | uniq -c
+  grep -E "\[MorphX-llm\] phase=" "$OUT/check-pass-rt.log" | awk '{print $2}' | sort | uniq -c
+fi
+
+if [[ " $PARTS " == *" bench "* ]]; then
+  echo "== bench $(date +%T)"
+  for cfg in stock stockfa2 pass; do
+    e=; [[ $cfg == stockfa2 ]] && e="MORPHX_FLASHINFER_FA2=1"; [[ $cfg == pass ]] && e="MORPHX_FLASHINFER_PASS=1"
+    env $e timeout 900 $CHECK --bench --max-tokens 4 > "$OUT/bench-$cfg.log" 2>&1
+    echo "$cfg rc=$? $(grep '^\[bench\]' "$OUT/bench-$cfg.log" | tr '\n' ' ')"
+  done
+fi
+
+if [[ " $PARTS " == *" census "* ]]; then
+  echo "== census $(date +%T)"
+  CRPS=${CENSUS_RPS:-18}; CIN=${CENSUS_IN:-4096}; COUT=${CENSUS_OUT:-128}; CDUR=${CENSUS_DUR:-40}
+  mkdir -p "$OUT/census"
+  python - <<EOF
+import json; json.dump({"time": $CDUR, "model": "llama-3-8b", "type": "poisson", "rps": $CRPS, "input_length": $CIN, "output_length": $COUT}, open("$OUT/census/cfg.json", "w"))
+EOF
+  for fi in stock pass; do
+    e=; [[ $fi == pass ]] && e="MORPHX_FLASHINFER_PASS=1"
+    # stream variant (prefill thread, no runtime) under nsys: GPU time per kernel
+    env $e VLLM_PREFILL_THREAD=1 timeout 900 /usr/local/cuda-13.0/bin/nsys profile -t cuda --cuda-graph-trace=node -o "$OUT/census/stream-$fi" -f true \
+      python scripts/test-pd-online.py "$OUT/census/cfg.json" > "$OUT/census/stream-$fi.log" 2> "$OUT/census/stream-$fi.err"
+    echo "nsys $fi rc=$? $(grep '^\[final\]' "$OUT/census/stream-$fi.log" | tr '\n' ' ' | cut -c1-300)"
+    /usr/local/cuda-13.0/bin/nsys export -t sqlite -o "$OUT/census/stream-$fi.sqlite" -f true "$OUT/census/stream-$fi.nsys-rep" > /dev/null 2>&1
+  done
+  # MorphX (smsched variant, default CI, split 108) with the profile log: first wave, CI per kernel
+  for fi in stock pass; do
+    e=; [[ $fi == pass ]] && e="MORPHX_FLASHINFER_PASS=1"
+    env $e VLLM_PREFILL_THREAD=1 SMSCHED_SPLIT_HINT=108 SMSCHED_LLM_TRICK_MODE=0 SMSCHED_PROFILE_LOG=1 SMSCHED_LLM_TRACE_LIMIT=400 \
+      NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$HOOK_LIBS timeout 900 \
+      python scripts/test-pd-online.py "$OUT/census/cfg.json" > "$OUT/census/morphx-$fi.log" 2> "$OUT/census/morphx-$fi.err"
+    echo "morphx $fi rc=$? $(grep '^\[final\]' "$OUT/census/morphx-$fi.log" | tr '\n' ' ' | cut -c1-300)"
+    grep -E "\[MorphX-profile\] summary" "$OUT/census/morphx-$fi.err"
+  done
+  python scripts/sglang/fi_census.py "$OUT/census" > "$OUT/census/census.md" 2>&1; echo "census rc=$?"
+  cat "$OUT/census/census.md"
+fi
+echo "== done $(date +%T)"
