@@ -202,6 +202,16 @@ locally. hpcc is no longer used.
 
 ### Backlog
 
+- **Track S status (2026-10-27, branch `h100-port-s-sm90`, dev on hpcc `~/morphx/trackS`):** one
+  sm_90a CUTLASS 3 GEMM (`KernelTma`, 128×128×64, 1×1×1 cluster) runs correctly through the pass
+  and under the runtime, and SM confinement works (66/33/8 SMs: 1.75/3.4/13.5× of 132). 4096³
+  0.213 ms vs cuBLAS 0.179. Needs `CUTLASS_GRID_CONSTANT=__grid_constant__` (CUTLASS disables it
+  under clang, then TMA reads descriptors from local memory and faults) and `-DNDEBUG` (device
+  asserts serialize WGMMA). The pass now barriers around the dynamic-smem word-0 hand-off (a
+  separate static `__shared__` word would break sm90's 1024-byte smem alignment); kept on the
+  Track S branch, not here, because it changes every pass-built kernel. Runtime fix merged here
+  (`6b194e9`): a fatal error in the agent thread now `_exit`s instead of deadlocking with the
+  main thread's `exit()` (a faulting kernel used to leave the process hung at 0% GPU).
 - **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
   Sm80-style CUTLASS 2 (`MmaPipelined`/`MmaMultistage`): vs cuBLAS on the H200, compute-bound
   GEMMs are 1.6–1.8× slower (8192³ 2.32 vs 1.44 ms; Fig 16 M=512 9.68 vs 5.26 ms), small-M
