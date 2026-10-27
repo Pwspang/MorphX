@@ -4,7 +4,7 @@
 # [0, split), co-runners moved to [split, nrSM), the rest on the whole GPU).
 # Default CI settings; stream once as the reference. 60 s per point.
 #   cd ~/scratch/morphx/MorphX
-#   qsub -v CONFIG=Figure13:in-4096-out-128-rps-6,SPLITS="66 80 93 108 120" scripts/baselines/n_fig13_split_sweep.pbs
+#   qsub -v CONFIG=Figure13:in-4096-out-128-rps-6,SPLITS="66 80 93 108 120 nosplit" scripts/baselines/n_fig13_split_sweep.pbs
 #PBS -N mx13-split-sweep
 #PBS -P 12004493
 #PBS -q normal
@@ -31,8 +31,11 @@ echo "== host=$(hostname) job=$PBS_JOBID config=$CONFIG splits=$SPLITS out=$OUT"
 "${common[@]}" --output-dir "$OUT/stream" --only-variant stream > "$OUT-stream.log" 2>&1
 echo "-- stream rc=$?"
 for sp in $SPLITS; do
-  "${common[@]}" --output-dir "$OUT/split-$sp" --only-variant smsched --override-split-hint "$sp" \
-    --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1" > "$OUT-split-$sp.log" 2>&1
+  # "nosplit": no kernel ever counts as CI, so MorphX never partitions.
+  extra=; hint=$sp
+  [[ $sp == nosplit ]] && { extra="MORPHX_CI_THRESHOLD=2"; hint=108; }
+  "${common[@]}" --output-dir "$OUT/split-$sp" --only-variant smsched --override-split-hint "$hint" \
+    --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 $extra" > "$OUT-split-$sp.log" 2>&1
   echo "-- split $sp rc=$? $(grep -h 'MorphX-profile\] summary' "$OUT"/split-$sp/logs/pd-online/*/*/smsched.err | sed 's/.*summary //')"
 done
 for d in "$OUT"/stream "$OUT"/split-*; do
