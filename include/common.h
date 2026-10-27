@@ -26,6 +26,23 @@
 #include <pthread.h>
 #include <sched.h>
 #include <boost/lockfree/queue.hpp>
+#include <unistd.h>
+
+// Set at the top of each runtime's agentThread(). A fatal error there must not
+// call exit(): the main thread may already be inside exit(), running the atexit
+// handler that joins the agent, and the two then wait on each other forever (a
+// faulting kernel left the process hung at 0% GPU instead of exiting).
+inline thread_local bool morphx_in_agent_thread = false;
+
+[[noreturn]] inline void morphx_fatal_exit(int code = EXIT_FAILURE) {
+    if(morphx_in_agent_thread) {
+        fflush(stdout);
+        fflush(stderr);
+        std::cerr.flush();
+        _exit(code);
+    }
+    exit(code);
+}
 
 #define CHECK_CUDA_ERROR(call) \
     do { \
@@ -34,7 +51,7 @@
             std::cerr << "CUDA error in " << __FILE__ << " at line " << __LINE__ << ": " \
                       << cudaGetErrorString(err) << std::endl; \
             assert(0); \
-            exit(EXIT_FAILURE); \
+            morphx_fatal_exit(); \
         } \
     } while (0)
 
@@ -46,7 +63,7 @@
             cuGetErrorName(err, &err_name); \
             std::cerr << "CUDA error in " << __FILE__ << " at line " << __LINE__ << ": " \
                       << err_name << std::endl; \
-            exit(EXIT_FAILURE); \
+            morphx_fatal_exit(); \
         } \
     } while (0)
 
@@ -57,7 +74,7 @@
             auto cuda_err = cudaGetLastError(); \
             std::cerr << "CUBLAS error in " << __FILE__ << " at line " << __LINE__ << ": " \
                       << cudaGetErrorString(cuda_err) << std::endl; \
-            exit(EXIT_FAILURE); \
+            morphx_fatal_exit(); \
         } \
     } while (0)
 
