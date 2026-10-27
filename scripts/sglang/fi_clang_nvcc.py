@@ -139,6 +139,8 @@ def main():
     # define __CUDACC_VER_*; claim 12.4 so CUTLASS/cute take their tensor-core
     # paths without nvcc-only __nv_atomic_* builtins.
     cmd += ["-D__CUDACC_VER_MAJOR__=12", "-D__CUDACC_VER_MINOR__=4", "-Wno-unused-command-line-argument"]
+    # host-side ::min/::max that nvcc's math headers provide (see the header)
+    cmd += ["-include", os.path.join(REPO, "scripts", "sglang", "fi_clang_compat.h")]
     if os.environ.get("MORPHX_FI_CLANG_NOPASS", "0") != "1":
         so = os.environ.get("SMSCHED_PASS_SO", os.path.join(REPO, "smsched-pass", "build", "libsmsched.so"))
         if not os.path.exists(so):
