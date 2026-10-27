@@ -19,8 +19,11 @@ Env:
   MORPHX_FI_CLANG_LOG  append each translated command line to this file
 """
 
+import hashlib
 import os
+import re
 import shlex
+import shutil
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +45,56 @@ def gencode_arch(value):
         if part.startswith("sm_"):
             archs.append(part)
     return archs
+
+
+# FlashInfer calls member templates of dependent objects without the `template`
+# disambiguator (smem.load_128b_async<fill_mode>(...), vec_cast<T, U>::cast<8>(...)).
+# nvcc's EDG front end accepts that; clang (correctly) doesn't. The wrapper
+# compiles against a copy of FlashInfer's include/ with the keyword added, put
+# ahead of the original on the include path. Semantics are unchanged.
+TEMPLATE_MEMBER_NAMES = ("load_128b_async", "get_permuted_offset", "cast")
+PATCH_VERSION = "1"
+
+
+def _template_names():
+    extra = tuple(n for n in os.environ.get("MORPHX_FI_TEMPLATE_NAMES", "").split(",") if n)
+    return TEMPLATE_MEMBER_NAMES + extra
+
+
+def patch_source(text):
+    names = "|".join(_template_names())
+    # obj.name<  obj->name<  Type<..>::name<   (unless already `template name<`)
+    return re.sub(r"(\.|->|>::)(" + names + r")<", r"\1template \2<", text)
+
+
+def patched_include(orig):
+    """Copy <orig>/flashinfer with patch_source applied, once per (orig, rules); return the copy's root."""
+    key = hashlib.sha1(f"{os.path.realpath(orig)}|{PATCH_VERSION}|{','.join(_template_names())}".encode()).hexdigest()[:12]
+    base = os.environ.get("FLASHINFER_WORKSPACE_BASE", os.path.join(REPO, "smsched-pass", "build"))
+    dst = os.path.join(base, f"include-patched-{key}")
+    if os.path.isdir(dst):
+        return dst
+    tmp = f"{dst}.tmp{os.getpid()}"
+    shutil.copytree(os.path.join(orig, "flashinfer"), os.path.join(tmp, "flashinfer"))
+    changed = 0
+    for root, _, files in os.walk(tmp):
+        for f in files:
+            if f.endswith((".cuh", ".h", ".hpp", ".inc")):
+                path = os.path.join(root, f)
+                with open(path) as fh:
+                    text = fh.read()
+                new = patch_source(text)
+                if new != text:
+                    changed += 1
+                    with open(path, "w") as fh:
+                        fh.write(new)
+    with open(os.path.join(tmp, "PATCHED_FROM"), "w") as fh:
+        fh.write(f"{orig}\n{changed} files patched by scripts/sglang/fi_clang_nvcc.py\n")
+    try:
+        os.rename(tmp, dst)  # parallel compiles: the first rename wins
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return dst
 
 
 def translate(argv):
@@ -146,6 +199,12 @@ def main():
         if not os.path.exists(so):
             die(f"pass plugin {so} not found (build smsched-pass or set SMSCHED_PASS_SO)")
         cmd += [f"-fplugin={so}", f"-fpass-plugin={so}", "-mllvm", "-smsched-smem-handoff-barriers=1"]
+    for i, a in enumerate(args[:-1]):
+        inc = args[i + 1]
+        if a == "-isystem" and os.path.basename(os.path.normpath(inc)) == "include" \
+                and os.path.isdir(os.path.join(inc, "flashinfer")):
+            cmd += ["-I", patched_include(inc)]
+            break
     cmd += args
     cmd += shlex.split(os.environ.get("MORPHX_FI_CLANG_EXTRA", ""))
     log = os.environ.get("MORPHX_FI_CLANG_LOG")
