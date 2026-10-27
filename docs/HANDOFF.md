@@ -200,6 +200,62 @@ locally. hpcc is no longer used.
   points: +5–15% per-token latency and +20–35 ms TTFT (e.g. 0.177 vs 0.153 s), i.e. its
   overhead with nothing to win back. Confirms the H200 needs the ×3 load to reach contention.
 
+### Pass-built FlashInfer (branch `h100-port-flashinfer-pass`, 2026-10-27, nscc2b)
+
+`MORPHX_FLASHINFER_PASS=1` (default off) builds SGLang's FlashInfer attention with
+clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
+- How: FlashInfer 0.6.8.post1 JIT-builds its attention ops with ninja + nvcc into
+  `~/.cache/flashinfer/<ver>/90a/cached_ops` (`batch_prefill_*` = FA2 ragged/paged
+  + merge-states, `*_sm90` = FA3, `cascade`); no jit-cache/AOT package is installed and
+  `flashinfer-cubin` only holds trtllm-gen cubins SGLang doesn't use here.
+  `scripts/sglang/flashinfer_pass.py` (called by `runner.py` before sglang imports
+  flashinfer) sets `FLASHINFER_NVCC=scripts/sglang/fi_clang_nvcc.py` and a separate
+  workspace (`smsched-pass/build/flashinfer-ws`), refuses a jit-cache package, and pins
+  every prefill/decode wrapper to FA2 (SGLang's ragged prefill otherwise picks Hopper
+  FA3: warp-specialized/TMA/setmaxnreg, not supported by the pass; the A100 ran FA2).
+  `fi_clang_nvcc.py` translates nvcc flags to clang CUDA mode (same flags as the
+  microbench pass build, `sm_90a`, `-use_fast_math` → ftz + approx transcendentals,
+  not `-ffast-math`), force-includes `fi_clang_compat.h` (host `::min/::max`, which
+  nvcc provides) and compiles against a patched copy of FlashInfer's `include/` that
+  adds the `template` disambiguator on 29 dependent member-template calls. The pass
+  gets `-smsched-smem-handoff-barriers` (new, opt-in; Track S's barriers around the
+  dynamic-smem word-0 block-id hand-off, since FlashInfer writes smem from its first
+  instructions); mycutlass builds are unchanged. Cold JIT build ~10 s (24 CPUs).
+- Correctness (Qwen3-8B fp16, mycutlass, 8 prompts incl. two ~3k-token ones, 48
+  tokens; job 192350): pass-built FA2 vs stock nvcc FA2: logits bitwise identical,
+  384/384 tokens; + MorphX runtime (gdr): bitwise identical; vs stock default (FA3
+  ragged prefill): 384/384 tokens identical, logits max |diff| 0.047. Model-free kernel
+  test (`fi_kernel_test.py`, job 192309): ragged / paged-extend / tensor-core decode with
+  split-KV bitwise identical to stock FA2, with and without the runtime. Under the
+  runtime all FlashInfer kernels launch as `_pk` (140 clones in 2 modules); only
+  `create_flashinfer_kv_indices_triton` (Triton) and CuTe-DSL RMSNorm stay unpatched.
+- Step times, no runtime (4 x 2048-token prefill / decode batch 16, ctx 2048):
+  stock (FA3 ragged) 296.8 / 9.44 ms, stock FA2 299.5 / 9.71 ms, pass-built FA2
+  302.1 / 9.63 ms: +0.9% prefill vs stock FA2, +1.8% vs stock; decode within noise.
+  In the Fig 13 census run the FA2 ragged prefill averages 657 µs vs FA3 321 µs
+  per launch (11.4% vs 5.9% of GPU time), the decode kernel 445 vs 433 µs (+3%).
+- Fig 13 census (in-4096-out-128 at 18 req/s, 40 s, `n_fi_pass_check.pbs` part
+  census; nsys on the stream variant, MorphX profile log at split 108):
+
+  | | stock FlashInfer | pass-built FlashInfer |
+  |---|---:|---:|
+  | pass-built kernels launched | 7 (mycutlass) | 10 (+ ragged prefill, paged decode, merge-states) |
+  | first wave >= 50 µs (managed) | 7 | 8 (+ ragged prefill 162 µs, CI 1.0) |
+  | GPU time in pass-built kernels | 79.7% | **94.1%** |
+  | GPU time in managed kernels | 78.3% | **84.9%** (paper: 5 kernels, 85%) |
+  | GPU time in CI kernels (on [0, split)) | 37.4% | 46.5% |
+
+  Gap: the decode attention kernel (paged FA2, 7.8% of GPU time, 445 µs/launch) is
+  pass-built but **short-bypassed**: the runtime profiles each kernel name once, at
+  its first launch, which is a small warm-up batch (first wave 19 µs < 50 µs). Profiling
+  per (name, grid size) or skipping warm-up launches would make it a managed
+  memory-intensive kernel (legacy CI 0.41), the pairing the paper describes.
+  Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/check-{192309,192350}`.
+- Not done: SGLang `jit_kernel` ops (act_and_mul, rope, qknorm, store_kvcache; ~3%)
+  go through tvm-ffi, which hard-codes `$CUDA_HOME/bin/nvcc`; easiest path is a shim
+  CUDA_HOME (symlinked toolkit, `bin/nvcc` → the same wrapper) set only for those
+  builds. CuTe-DSL RMSNorm (1.6%) stays uncontrolled.
+
 ### Backlog
 
 - **Track S status (2026-10-27, branch `h100-port-s-sm90`, dev on hpcc `~/morphx/trackS`):** one
