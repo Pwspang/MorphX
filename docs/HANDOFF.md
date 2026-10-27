@@ -183,6 +183,10 @@ locally. hpcc is no longer used.
   (TTFT 0.18–0.23 vs 0.16). The less MorphX confines prefill, the better; even at 120 it is
   54% behind stream, so the partition only adds to the overhead here. Results in
   `logs/20261026-nscc2b/diag-fig13-split-sweep/`.
+  No-split run (job 190815, same point, `MORPHX_CI_THRESHOLD=2`: 92,726 managed launches, 0
+  confined, 0 moved): 0.094 s/token avg (p99 0.128, TTFT 0.171) vs stream 0.067 (0.105, 0.164).
+  So at this load MorphX's overhead alone costs +40%, and the default split (108) adds another
+  ~60% on top (0.149). Results in `logs/20261026-nscc2b/diag-fig13-nosplit-ci2/`.
 
 ### Backlog
 
