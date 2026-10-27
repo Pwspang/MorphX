@@ -162,3 +162,18 @@ locally. hpcc is no longer used.
   saturation MorphX 14.2 ms/token vs stream 53.3 (A100: 28.2 vs 116.5) with 65% of stream's
   GGNN throughput (A100: 73%); MorphX ≈ stream at light load. **New issue:** lithos breaks from
   GGNN 0.8 req/s up (LLM latency 70–3800 ms/token, throughput capped ~0.94).
+
+### Backlog
+
+- **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
+  Sm80-style CUTLASS 2 (`MmaPipelined`/`MmaMultistage`): vs cuBLAS on the H200, compute-bound
+  GEMMs are 1.6–1.8× slower (8192³ 2.32 vs 1.44 ms; Fig 16 M=512 9.68 vs 5.26 ms), small-M
+  1.1–1.25×, GEMV the same. Expected gain: prefill/TTFT ~1.3–1.5× for every variant, decode
+  ~10%; fairer "MorphX on Hopper" comparison. Not needed to classify prefill vs decode: the
+  `occ` CI score already separates them with the current kernels (Fig 13 profile log, job
+  190334: prefill 0.61–1.0, decode 0). Cost: days. CUTLASS 3 Hopper kernels use clusters,
+  TMA and a persistent tile scheduler, which clash with the pass's agent transform and the
+  runtime's SM-range confinement; likely route is cluster 1×1, non-persistent variants built
+  through the pass, then re-validate and re-run Fig 13/14 (all variants, since all use
+  mycutlass). Cheap first step if revisited: SGLang prefill/decode times with the LLM's GEMMs
+  on cuBLAS vs mycutlass (~10 min, upper bound of the gain).
