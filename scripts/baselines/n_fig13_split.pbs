@@ -1,0 +1,37 @@
+#!/bin/bash
+# nscc2b: Fig 13 MorphX diagnostics (gdr). Does MorphX split prefill/decode on the
+# H200, and does a forced split help now that the per-launch cost is lower?
+# MorphX variant only; the other variants come from the main run (same node
+# type, same 180 s points).
+#   cd ~/scratch/morphx/MorphX
+#   # 1. default CI, profile log (which kernels count as CI, does a split happen)
+#   qsub -v TAG=profile,CONFIGS="Figure13:in-2048-out-256-rps-9 Figure13:in-4096-out-128-rps-6 Figure13:in-4096-out-256-rps-6" scripts/baselines/n_fig13_split.pbs
+#   # 2. forced split (Track J4's least harmful settings)
+#   qsub -v TAG=occ06-split108,SPLIT=108,EXTRA_ENV="MORPHX_CI_MODE=occ MORPHX_CI_THRESHOLD=0.6 MORPHX_CI_SATURATE=0.6" scripts/baselines/n_fig13_split.pbs
+#PBS -N mx-fig13-split
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=24:ngpus=1:mem=200gb
+#PBS -l walltime=02:30:00
+#PBS -j oe
+set -uo pipefail
+: "${TAG:?set TAG}"
+module load cuda/13.0
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+R=$PWD
+OUT=${OUT:-$R/logs/20261026-nscc2b/diag-fig13-$TAG}
+mkdir -p "$OUT"
+HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build-llm/libcuda.so LD_PRELOAD=$R/runtime/build-llm/libcuda.so:$R/runtime/build-llm/libpreload.so"
+cmd=(python scripts/ae/run_pd_colocate_part2.py --output-dir "$OUT" --python "$MORPHX_PYTHON" --duration "${DURATION:-180}"
+     --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 ${EXTRA_ENV:-}"
+     --only-table Figure13 --only-variant smsched --no-update-latest-link --skip-existing)
+[[ -n "${SPLIT:-}" ]] && cmd+=(--override-split-hint "$SPLIT")
+for c in ${CONFIGS:-}; do cmd+=(--only-config "$c"); done
+echo "== host=$(hostname) job=$PBS_JOBID tag=$TAG out=$OUT"
+echo "\$ ${cmd[*]}"
+"${cmd[@]}"
+echo "== done rc=$? $(date +%T)"
