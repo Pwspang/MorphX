@@ -24,6 +24,8 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <array>
+#include <vector>
 #include <unistd.h>
 #include <cstdlib>
 #include <boost/lockfree/queue.hpp>
@@ -181,6 +183,14 @@ struct KernelInfo {
     int h_maxSM;
 
     int isScheduled;
+
+    std::atomic<float>* ci;   // &gCI[name] once profiled: the agent thread reads this, never the map
+    struct KernelStats* stats; // per-kernel counters (SMSCHED_PROFILE_LOG=1), else nullptr
+};
+
+// SMSCHED_PROFILE_LOG=1: per kernel name (not per profile key), what the runtime did with its launches.
+struct KernelStats {
+    std::atomic<long> launches{0}, shortBypass{0}, profiled{0}, managed{0}, ciLimited{0}, moved{0};
 };
 
 struct StreamInfo {
@@ -265,6 +275,51 @@ std::unordered_map<CUstream, std::pair<int, int>> gSuggestSM;
 // std::unordered_map<const char *, std::vector<std::pair<int, float>>> gProfileData; // TODO: thread unsafe
 std::unordered_map<const char *, std::atomic<float>> gCI;
 std::unordered_map<const char *, std::atomic<float>> gWaveTime;
+
+// MORPHX_PROFILE_PER_GRID=1 (default off): profile, classify (CI) and short-bypass per
+// (kernel name, grid-size bucket) instead of per name. Per name, the first launch decides
+// for the whole run; LLM kernels whose first launch is a small warm-up batch (e.g. the
+// decode attention kernel) are then short-bypassed forever. Buckets are powers of two of
+// the logical grid size; at most MORPHX_PROFILE_GRID_MAX (default 6) buckets get their own
+// profile per name, later ones reuse the nearest profiled bucket, so the profiling cost
+// stays bounded. The key is an interned "<name>#g<bucket>" string, so gCI, gWaveTime and
+// the short-kernel check share it, and hasPattern() on it still matches the name.
+int profile_per_grid = 0;
+int profile_grid_max = 6;
+std::unordered_map<const char *, std::array<const char *, 33>> gGridKeys; // launch thread only
+std::unordered_map<const char *, KernelStats*> gKernelStats;              // launch thread only
+
+const char* profileKey(const char* name, int gridSize) {
+    if(!profile_per_grid) return name;
+    int b = gridSize <= 1 ? 0 : 32 - __builtin_clz((unsigned)(gridSize - 1)); // ceil(log2)
+    auto it = gGridKeys.find(name);
+    if(it == gGridKeys.end()) {
+        std::array<const char *, 33> none;
+        none.fill(nullptr);
+        it = gGridKeys.emplace(name, none).first;
+    }
+    auto &keys = it->second;
+    if(keys[b]) return keys[b];
+    int used = 0, nearest = -1;
+    for(int i = 0; i <= 32; ++i) {
+        if(!keys[i]) continue;
+        ++used;
+        if(nearest < 0 || std::abs(i - b) < std::abs(nearest - b)) nearest = i;
+    }
+    if(used >= profile_grid_max && nearest >= 0) return keys[nearest];
+    char suffix[24];
+    snprintf(suffix, sizeof(suffix), "#g%u", 1u << std::min(b, 31));
+    std::string key = std::string(name) + suffix;
+    keys[b] = strdup(key.c_str());
+    return keys[b];
+}
+
+KernelStats* kernelStats(const char* name) {
+    if(!profile_log) return nullptr;
+    auto &st = gKernelStats[name];
+    if(!st) st = new KernelStats();
+    return st;
+}
 
 void generateProfileWaves(int nrSM, KernelInfo *info, std::vector<int> &profileWaves, int fixMin = -1, int fixMax = -1) {
     if(fixMin != -1) {
@@ -454,7 +509,7 @@ void profileThread(KernelInfo *launchInfo, std::vector<int> &profileWaves) {
 }
 
 bool isCI(KernelInfo *info) {
-    float CI = gCI[info->name].load();
+    float CI = info->ci ? info->ci->load() : gCI[info->name].load();
     if(CI >= ci_threshold) return true;
     return false;
 }
@@ -552,11 +607,13 @@ void schedule_2(KernelInfo *kernels[], KernelInfo *nexts[], int nStreams, int nr
                     writeSM(kernels[j], split_hint, nrSM);
                     kernels[j]->isScheduled = 1;
                     gSplitMoves.fetch_add(1, std::memory_order_relaxed);
+                    if(kernels[j]->stats) kernels[j]->stats->moved.fetch_add(1, std::memory_order_relaxed);
                 }
                 if(j != i && nexts[j] && !nexts[j]->isScheduled) {
                     writeSM(nexts[j], split_hint, nrSM);
                     nexts[j]->isScheduled = 1;
                     gSplitMoves.fetch_add(1, std::memory_order_relaxed);
+                    if(nexts[j]->stats) nexts[j]->stats->moved.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -665,6 +722,22 @@ extern "C" void morphx_report() {
     fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d nrSM=%d"
         " managed_launches=%ld ci_limited_launches=%ld split_moves=%ld full_gpu_launches=%ld\n",
         ci_threshold, ci_saturate, split_hint, gNrSM, managed, ci, moved, std::max(0L, managed - ci - moved));
+    if(profile_per_grid) {
+        size_t keys = 0;
+        for(auto &kv : gGridKeys) for(auto k : kv.second) keys += k != nullptr;
+        fprintf(stderr, "[MorphX-profile] per-grid profiling: %zu names, %zu (name, grid bucket) keys, max %d per name\n",
+            gGridKeys.size(), keys, profile_grid_max);
+    }
+    // Per kernel: patched (_pk) kernels and anything with managed launches, by managed count.
+    std::vector<std::pair<const char*, KernelStats*>> rows(gKernelStats.begin(), gKernelStats.end());
+    std::sort(rows.begin(), rows.end(), [](auto &a, auto &b) { return a.second->managed.load() > b.second->managed.load(); });
+    for(auto &r : rows) {
+        KernelStats *s = r.second;
+        if(s->managed.load() == 0 && s->profiled.load() == 0) continue;
+        fprintf(stderr, "[MorphX-profile] kernel launches=%ld short_bypass=%ld profiled=%ld managed=%ld ci_limited=%ld moved=%ld name=%.140s\n",
+            s->launches.load(), s->shortBypass.load(), s->profiled.load(), s->managed.load(), s->ciLimited.load(),
+            s->moved.load(), r.first);
+    }
     fflush(stderr);
 }
 
@@ -835,6 +908,11 @@ static void ld_init(void) {
     llm_trick_mode = getenv_int("SMSCHED_LLM_TRICK_MODE", 0);
     llm_trace_limit = getenv_int("SMSCHED_LLM_TRACE_LIMIT", 0);
     llm_trace_prints.store(0);
+    profile_per_grid = getenv_int("MORPHX_PROFILE_PER_GRID", 0);
+    profile_grid_max = std::max(1, std::min(33, getenv_int("MORPHX_PROFILE_GRID_MAX", 6)));
+    // Profiles are inserted while the agent thread runs; keep the maps from rehashing.
+    gCI.reserve(4096);
+    gWaveTime.reserve(4096);
     // fprintf(stderr, "[smsched] with_profile=%d, split_hint=%d\n", with_profile, split_hint);
     common_init(); // init common modules
     // load hooked function of Neutrino
@@ -1013,8 +1091,13 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
         return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
     }
 
-    if ((gWaveTime.count(funcName) && gWaveTime[funcName].load() < 50.0)
+    // Profile key: the name, or (name, grid bucket) with MORPHX_PROFILE_PER_GRID=1.
+    const char* profKey = profileKey(funcName, gridSize);
+    KernelStats* kstats = kernelStats(funcName);
+    if(kstats) kstats->launches.fetch_add(1, std::memory_order_relaxed);
+    if ((gWaveTime.count(profKey) && gWaveTime[profKey].load() < 50.0)
         && !(keepShortTargetKernelsMode() && isTargetLLMKernel(funcName))) {
+        if(kstats) kstats->shortBypass.fetch_add(1, std::memory_order_relaxed);
         traceLLMKernel("short-bypass", funcName, gridSize, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream);
         launchMutex.unlock();
         return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
@@ -1070,8 +1153,10 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     KernelInfo *launchInfo = new KernelInfo;
     launchInfo->func = f;
     launchInfo->stream = hStream;
-    launchInfo->name = funcName;
+    launchInfo->name = profKey;
     launchInfo->isScheduled = 0;
+    launchInfo->ci = nullptr;
+    launchInfo->stats = kstats;
     CU_CHECK(real_cuOccupancyMaxActiveBlocksPerMultiprocessor(&launchInfo->occup, f, blockSize, sharedMemBytes));
     assert(launchInfo->occup > 0);
     std::vector<size_t> argSizes;
@@ -1143,6 +1228,10 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
     if(!profile) {
         gManagedLaunches.fetch_add(1, std::memory_order_relaxed);
+        if(kstats) kstats->managed.fetch_add(1, std::memory_order_relaxed);
+        if(gCI.count(launchInfo->name)) launchInfo->ci = &gCI[launchInfo->name];
+    } else if(kstats) {
+        kstats->profiled.fetch_add(1, std::memory_order_relaxed);
     }
 
     if(profile) {
@@ -1166,6 +1255,7 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
             writeSM(launchInfo, 0, split_hint);
             launchInfo->isScheduled = 1;
             gCILimitedLaunches.fetch_add(1, std::memory_order_relaxed);
+            if(kstats) kstats->ciLimited.fetch_add(1, std::memory_order_relaxed);
         }
         // if(strstr(launchInfo->name, "redLoadIteratorMixedINS1S_1")) {
         //     writeSM(launchInfo, 0, split_hint);
