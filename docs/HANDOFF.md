@@ -163,6 +163,18 @@ locally. hpcc is no longer used.
   GGNN throughput (A100: 73%); MorphX ≈ stream at light load. **New issue:** lithos breaks from
   GGNN 0.8 req/s up (LLM latency 70–3800 ms/token, throughput capped ~0.94).
 
+- **Q6 (Fig 13, does a split help on the H200 with gdr?): no.** Profile log (job 190334):
+  decode GEMMs are never CI; with the default score only the largest 4096-token prefill GEMM
+  reaches the 0.9 cut-off (2048-token prompts: none), while `occ` separates prefill 0.61–1.0
+  from decode 0. Forcing the split (jobs 190335 `occ` 0.6 + split 108; 190336 `occ` 0.5 +
+  `SMSCHED_LLM_TRICK_MODE=16` + split 66, all 15 Fig 13 points, MorphX only) never beats stream:
+  e.g. in-2048-out-256 rps 9 stream 0.068 vs MorphX 0.088 / 0.098 / 0.085 (default / occ108 /
+  occ66); in-4096-out-128 rps 9 stream 0.181 vs 0.219 / 0.199 / 0.249. MorphX does beat
+  baseline and chunked at in-4096-out-128 rps 7.5–9 (prefill thread). At light load MorphX is
+  still +10–20% over stream (per-launch cost on ~145 LLM GEMMs per step), which a split would
+  have to win back. Consistent with Track J4 on hpcc: on the H200 decode GEMMs slow down when
+  they lose SMs, so the split is zero-sum. Results in `logs/20261026-nscc2b/diag-fig13-*`.
+
 ### Backlog
 
 - **Hopper-native (sm90) mycutlass GEMMs.** Deferred 2026-10-27. Today's mycutlass is
