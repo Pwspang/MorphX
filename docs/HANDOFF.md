@@ -312,6 +312,48 @@ clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
   4096/256 24191 of 41508 (moved 7048), 2048/256 3311 of 116928 (moved 725); default: 0 everywhere.
   The ragged prefill kernel is managed and CI-limited on every launch at 4096 tokens.
   Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-sm90-192442`.
+- **Sm80 vs sm90 library check (job 192556, `mycutlass_libcheck.py`)**: the two processes
+  map different files (Sm80 `MorphX/microbench/build-model/libmycutlass.so` 4.99 MB sha1
+  e1df95db…, sm90 `trackFI/microbench/build-model-sm90/libmycutlass.so` 1.46 MB sha1
+  3c6eb1b4…), yet `y = x W^T` is bitwise identical on all 24 Qwen3-8B shapes (T = 1…8192,
+  incl. lm_head 151936 x 2048), and both have the same max |err| vs fp32 as cuBLAS (0.002–
+  0.004); `check_mycutlass.py` gives identical per-layer error ratios (1.01) and e2e numbers
+  for both. Explanation: both kernels accumulate fp16 products in fp32 in the same
+  sequential k = 16 tensor-core steps over K (no split-K, one CTA per output tile), so the
+  arithmetic, not the code, is the same; the kernels differ (Sm80 `cutlass::Kernel` mma.sync
+  vs CUTLASS 3 `device_kernel<GemmUniversal>` WGMMA under the runtime) and sm90 is ~3x faster.
+- **Rate sweep to saturation (sm90 mycutlass + pass FA2, stream vs MorphX + per-grid, 60 s,
+  `n_fig13_sweep_sm90.pbs`)**, avg / p99 s per token / TTFT avg s (served / generated requests):
+
+  in-2048-out-256 (job 192556, asp2b-gpu182):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 6 | 0.012 / 0.025 / 0.058 (295/317) | 0.012 / 0.015 / 0.069 (295/317) |
+  | 12 | 0.038 / 0.047 / 0.090 (526/683) | 0.044 / 0.051 / 0.278 (516/683) |
+  | 18 | 0.066 / 0.104 / 5.81 (558/1049) | 0.070 / 0.101 / 6.03 (521/1049) |
+
+  in-4096-out-256 (job 192558, asp2b-gpu092):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 5 | 0.027 / 0.038 / 0.135 (248/263) | 0.029 / 0.040 / 0.151 (244/263) |
+  | 7.5 | 0.177 / 0.204 / 0.136 (50/399) | **0.109 / 0.161** / 0.318 (118/399) |
+
+  in-4096-out-128 (job 192557, asp2b-gpu131, stopped early): 5 rps stream 0.172 / 0.404 /
+  0.131 (9/263), MorphX 0.080 / 0.366 / 0.156 (48/263); 7.5 rps stream 0.149 / 0.214 / 0.142
+  (177/399), MorphX 0.268 / 0.332 / 0.174 (116/399); 10 rps stream 0.126 / 0.429 / 0.132.
+  Non-monotonic: near the knee the prefill-thread design is bistable (back-to-back prefills
+  starve decode, few requests finish, avg s/token is over finished requests only). Rerun at
+  5 / 6 / 7.5 / 9 rps on another node: job 192663.
+  Summaries at the highest rates (managed / CI-limited / moved / full GPU): 2048/256 rps 18
+  225373 / 70197 / 56535 / 98641; 4096/256 rps 7.5 51223 / 8927 / 13609 / 28687. Decode
+  attention managed (moved): 2048 rps 6 0 of 184320, rps 12 44063 of 52992 (19189), rps 18
+  43523 of 47412 (18914); 4096/256 rps 5 0 of 84420, rps 7.5 11123 of 18216 (5464).
+  MorphX beats stream only in saturation at 4096/256 (avg -38%, p99 -21%, 2.4x the finished
+  requests, TTFT 2.3x worse) and on p99 at light load (2048 rps 6: 0.015 vs 0.025); at the
+  knee (2048 rps 12) it is +16% avg and 3x TTFT. Logs:
+  `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/sweep-<len>-<job>`.
 - Not done: SGLang `jit_kernel` ops (act_and_mul, rope, qknorm, store_kvcache; ~3%)
   go through tvm-ffi, which hard-codes `$CUDA_HOME/bin/nvcc`; easiest path is a shim
   CUDA_HOME (symlinked toolkit, `bin/nvcc` → the same wrapper) set only for those
