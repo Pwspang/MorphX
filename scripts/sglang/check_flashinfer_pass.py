@@ -144,6 +144,9 @@ def main():
     torch.cuda.synchronize()
     if args.bench:
         bench(runner, torch)
+    mapped = sorted({line.split()[-1] for line in open("/proc/self/maps") if "libmycutlass" in line})
+    print(f"[fi] libmycutlass mapped: {mapped} (MYCUTLASS_LIB_DIR={os.environ.get('MYCUTLASS_LIB_DIR', '-')}) "
+          f"GEMM calls: {mycutlass_gemm.stats()}", flush=True)
     for i, t in enumerate(ts + tl):
         print(f"[fi] prompt {i}: {tok.decode(t)[:70]!r}", flush=True)
     if args.out:
