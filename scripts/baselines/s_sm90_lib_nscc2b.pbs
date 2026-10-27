@@ -1,0 +1,132 @@
+#!/bin/bash
+# Track S on nscc2b (gdr): the sm90 libmycutlass (MORPHX_MYCUTLASS_ARCH=sm90)
+# next to the Sm80 one, from a separate checkout (~/scratch/morphx/trackS).
+#   PART="build gemm" (default), on a GPU node: the CPU-only nodes have no CUDA.
+#   build  pass, runtime/build (gdr), microbench/build-model-sm90, the
+#          gemm_libs_compare tool (+ microbench/build-model, the Sm80 library,
+#          with SM80_BUILD=1; otherwise SM80 points at an existing Sm80 build)
+#   gemm   correctness + timing, sm90 vs Sm80 vs cuBLAS on the Qwen3-8B
+#          linear-layer shapes, every sm90 config on lm_head prefill, and
+#          patched launches of the sm90 library under the runtime
+#   sglang Qwen3-8B fp16 end to end, no runtime: greedy tokens vs torch for both
+#          libraries (check_mycutlass.py), smoke_runner with torch / Sm80 / sm90;
+#          then a short sm90 run and the token check under the runtime (gdr)
+#   cd ~/scratch/morphx/trackS && qsub scripts/baselines/s_sm90_lib_nscc2b.pbs
+#   qsub -v PART=sglang,SM80=... scripts/baselines/s_sm90_lib_nscc2b.pbs
+#PBS -N mx-s-sm90-lib
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=00:40:00
+#PBS -j oe
+set -uo pipefail
+PART=${PART:-build gemm}
+OUT=${OUT:-$HOME/scratch/morphx/runs/s-sm90-lib}
+mkdir -p "$OUT"
+# PBS spools stdout until the end; tee it so a stuck job can be inspected
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T)"
+# batch shells may lack the module function
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0 cmake/4.3.4
+[[ -n "${CUDA_HOME:-}" ]] || { echo "module load cuda/13.0 failed"; exit 1; }
+echo "== modules loaded $(date +%T)"
+cd "$PBS_O_WORKDIR"
+source scripts/ae/env-nscc2b.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+# HPC SDK layout: cuBLAS lives in math_libs, not in the CUDA toolkit dir
+MATH=$MORPHX_CUDA_ROOT/../../math_libs/13.0
+export LD_LIBRARY_PATH=$MATH/lib64:$LD_LIBRARY_PATH
+R=$PWD
+J=${NCPUS:-16}
+SM90=$R/microbench/build-model-sm90
+SM80=${SM80:-$R/microbench/build-model}
+CMP=$OUT/gemm_libs_compare
+echo "== host=$(hostname) job=$PBS_JOBID part=$PART ncpus=$J head=$(git log --oneline -1 | cut -c1-60) $(date +%T)"
+
+if [[ " $PART " == *" build "* ]]; then
+  step() {  # name timeout cmd...
+    local name=$1 t=$2; shift 2
+    echo "-- $name $(date +%T)"
+    if ! timeout -k 10 "$t" "$@" > "$OUT/build-$name.log" 2>&1; then
+      echo "FAILED: $name"; grep -E "error" "$OUT/build-$name.log" | head -20; tail -5 "$OUT/build-$name.log"; exit 1
+    fi
+  }
+  step pass-config 300 cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR="$MORPHX_LLVM_ROOT/lib/cmake/llvm"
+  step pass 600 cmake --build smsched-pass/build -j "$J"
+  step runtime-config 300 cmake -S runtime -B runtime/build -DUSE_CUDA_LLM=OFF -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+  step runtime 600 cmake --build runtime/build -j "$J"
+  echo "runtime gdr imports: $(nm -D --undefined-only runtime/build/libcuda.so | grep -cw gdr_open)"
+  step sm90-config 300 cmake -S microbench -B "$SM90" -DSMSCHED_ENABLE_PASS=ON -DSMSCHED_LLVM_ROOT="$MORPHX_LLVM_ROOT" \
+    -DMORPHX_MYCUTLASS_ARCH=sm90 -DMORPHX_CUDA_ARCH=90a -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+  step sm90 1200 cmake --build "$SM90" --target mycutlass -j "$J"
+  if [[ "${SM80_BUILD:-0}" == 1 ]]; then
+    step sm80-config 300 cmake -S microbench -B "$SM80" -DSMSCHED_ENABLE_PASS=ON -DSMSCHED_LLVM_ROOT="$MORPHX_LLVM_ROOT" \
+      -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+    step sm80 2400 cmake --build "$SM80" --target mycutlass -j "$J"
+  fi
+  step compare-tool 300 nvcc -O2 -arch=sm_90 -I"$MATH/include" -o "$CMP" microbench/src/gemm_libs_compare.cu -L"$MATH/lib64" -lcublas -ldl
+  echo "patched kernels: sm90 $(cuobjdump -symbols $SM90/libmycutlass.so | grep -c '_pk$') sm80 $(cuobjdump -symbols $SM80/libmycutlass.so | grep -c '_pk$')"
+  grep -c "C75[0-9][0-9]" "$OUT/build-sm90.log" | sed 's/^/ptxas wgmma serialization warnings (sm90): /'
+  echo "== build done $(date +%T)"
+fi
+
+if [[ " $PART " == *" gemm "* ]]; then
+  nvidia-smi --query-gpu=name,driver_version,clocks.max.sm --format=csv,noheader
+  L=$OUT/gemm-$PBS_JOBID; mkdir -p "$L"
+  echo "######## sm90 vs Sm80 libmycutlass vs cuBLAS (ms, max |err| vs cuBLAS fp32-accumulate, sm90 config) $(date +%T)"
+  for mk in 6144,4096 4096,4096 24576,4096 4096,12288 151936,4096; do
+    m=${mk%,*}; k=${mk#*,}
+    shapes=""; for t in 1 16 64 128 2048 8192; do shapes="$shapes $m,$t,$k"; done
+    timeout -k 5 60 "$CMP" compare "$SM90,$SM80" $shapes > "$L/cmp-$m-$k.txt" 2>&1; echo "## m=$m k=$k rc=$?"
+    cat "$L/cmp-$m-$k.txt"
+  done
+  echo "######## every sm90 config on lm_head prefill $(date +%T)"
+  timeout -k 5 60 "$CMP" tune "$SM90" 151936,2048,4096 151936,8192,4096 > "$L/tune-lm_head.csv" 2>&1; echo "rc=$?"
+  cut -d, -f2,5,6,9,10 "$L/tune-lm_head.csv"
+  HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build/libcuda.so LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
+  echo "######## sm90 library under the runtime (gdr): default policy, then every launch patched $(date +%T)"
+  for wl in none GemmUniversal; do
+    timeout -k 5 60 env $HOOK SMSCHED_TARGET_PATTERNS=$wl SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=100000 MORPHX_LAUNCH_STATS=1 \
+      "$CMP" compare "$SM90" 4096,16,4096 4096,2048,4096 151936,2048,4096 > "$L/rt-$wl.txt" 2>&1; echo "-- whitelist=$wl rc=$?"
+    grep -vE "MorphX-debug" "$L/rt-$wl.txt"
+    grep -oE "\[MorphX-debug\] (assign|profile|bypass-[a-z]+) func=[A-Za-z0-9_]{0,24}" "$L/rt-$wl.txt" | sort | uniq -c
+  done
+  echo "== gemm done $(date +%T)"
+fi
+
+if [[ " $PART " == *" sglang "* ]]; then
+  source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+  export MORPHX_PYTHON="$(command -v python)"
+  L=$OUT/sglang-$PBS_JOBID; mkdir -p "$L"
+  MODEL=$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2
+  SMOKE="python scripts/sglang/smoke_runner.py --model $MODEL --dtype float16"
+  HOOK="NEUTRINO_HOOK_DRIVER=$R/runtime/build/libcuda.so LD_PRELOAD=$R/runtime/build/libcuda.so:$R/runtime/build/libpreload.so"
+  summ() { grep -E "^\[(poisson|census)\]|SMOKE|GEMM calls|MorphX-stats|Error|error" "$1" | grep -vE "origin|^\[census\]   [a-zA-Z]" | head -n 30; }
+  tokens() { grep -E "^\[e2e\] (prefill|greedy|prompt)|worst|Error|error" "$1" | cut -c1-200 | head -n 12; }
+  for lib in sm90 sm80; do
+    [[ $lib == sm90 ]] && dir=$SM90 || dir=$SM80
+    echo "######## greedy tokens, $lib mycutlass vs torch $(date +%T)"
+    MYCUTLASS_LIB_DIR=$dir timeout -k 10 360 python scripts/sglang/check_mycutlass.py --model "$MODEL" > "$L/check-$lib.log" 2>&1; echo "rc=$?"
+    tokens "$L/check-$lib.log"
+  done
+  for g in sm90 sm80 torch; do
+    echo "######## smoke_runner gemm=$g $(date +%T)"
+    case $g in
+      sm90) env="MYCUTLASS_LIB_DIR=$SM90"; gemm=mycutlass ;;
+      sm80) env="MYCUTLASS_LIB_DIR=$SM80"; gemm=mycutlass ;;
+      torch) env=""; gemm=torch ;;
+    esac
+    env $env timeout -k 10 360 $SMOKE --gemm $gemm --census-out "$L/census-$g.md" > "$L/smoke-$g.log" 2>&1; echo "rc=$?"
+    summ "$L/smoke-$g.log"
+  done
+  echo "######## sm90 under the MorphX runtime (gdr): short smoke run, then greedy tokens $(date +%T)"
+  env MYCUTLASS_LIB_DIR=$SM90 $HOOK MORPHX_LAUNCH_STATS=1 SMSCHED_DEBUG=1 SMSCHED_DEBUG_LIMIT=1000000 timeout -k 10 480 \
+    $SMOKE --gemm mycutlass --num-requests 8 --output-len 32 --census-decode-steps 4 > "$L/smoke-sm90-rt.log" 2>&1; echo "rc=$?"
+  summ "$L/smoke-sm90-rt.log"
+  grep -oE "\[MorphX-debug\] (assign|profile|bypass-[a-z]+) func=[A-Za-z0-9_]{0,24}" "$L/smoke-sm90-rt.log" | sort | uniq -c | sort -rn | head -8
+  env MYCUTLASS_LIB_DIR=$SM90 $HOOK MORPHX_LAUNCH_STATS=1 timeout -k 10 480 \
+    python scripts/sglang/check_mycutlass.py --model "$MODEL" > "$L/check-sm90-rt.log" 2>&1; echo "rc=$?"
+  tokens "$L/check-sm90-rt.log"; grep -E "MorphX-stats" "$L/check-sm90-rt.log"
+  echo "== sglang done $(date +%T)"
+fi
