@@ -60,6 +60,12 @@ def exit_after_flush_if_morphx_preloaded():
         return
     sys.stdout.flush()
     sys.stderr.flush()
+    # os._exit skips the runtime's atexit summary; ask for it explicitly.
+    try:
+        import ctypes
+        ctypes.CDLL(None).morphx_report()
+    except (OSError, AttributeError):
+        pass
     os._exit(0)
 
 model_paths = {
