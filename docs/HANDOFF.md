@@ -503,6 +503,37 @@ kernels (`MORPHX_SHORT_BYPASS_TOTAL`) needs a decision before Fig 13/14 runs. Th
 FA3 slowdown (6–37% per kernel, ~1% per prefill step) is unexplained. No Fig 13/14 run with
 this stack yet; nothing was run on nscc2b (down).
 
+
+#### On nscc2b, threshold tuning and Fig 13/14 (2026-10-28, gdr)
+
+- **Build and checks** (job 196219, `fa3_checks.pbs` with `ENV_SCRIPT=scripts/ae/env-nscc2b.sh`):
+  - FA3 kernels are bitwise identical to stock, with and without the runtime.
+  - Qwen3-8B: 384/384 tokens identical, including with all managed launches on 66 SMs.
+- **nscc2b job-script needs** (fixed in 1c224e4, 8308474, 73280a9):
+  - no `module purge`, which drops gcc-native/14 and leaves system gcc 11 (clashes with the
+    runtime's C11 atomics);
+  - `cuda/13.0` and `cmake/4.3.4` loaded on separate lines (system cmake 3.x can't drive
+    clang CUDA);
+  - nsys from the HPC SDK.
+  - Delete stale `CMakeCache.txt` files from a failed configure.
+- **Threshold census** (job 196378, stream, nsys):
+  - Pass-built kernels are ~90% of GPU time.
+  - 80% of GPU time is in pass-built launches of at least 36 µs (in-2048-out-256, 9 req/s) or
+    49 µs (in-4096-out-128, 6 req/s), judged by whole-kernel duration.
+  - Chosen: `MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=35`.
+- **Check** (job 196395):
+  - Estimated managed share 73–87% at 35 µs, 69–79% at 50 µs whole-kernel, ~6% with the
+    default first-wave rule.
+  - Tokens identical.
+  - Decode step +12.5% and prefill +6% over no runtime (prefill +16% with split 108).
+- **Fig 13/14** (jobs 196338–196401; results in the main checkout's
+  `docs/pd-investigation/FIGURES.md`):
+  - MorphX at 35 µs is behind stream at 28/30 points (4–40%).
+  - Stream with high-priority decode (`MORPHX_DECODE_STREAM_PRIORITY=-5`) is the best series,
+    up to 47% faster than stream.
+- **Defaults are unchanged** (50 µs, first wave). Turning on the tuned threshold made MorphX
+  slower in Fig 13/14.
+
 ### Backlog
 
 - **Track S status (2026-10-27, branch `h100-port-s-sm90`, dev on hpcc `~/morphx/trackS`):** one
