@@ -257,6 +257,11 @@ class SglangRunner:
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._kv_event: Optional[torch.cuda.Event] = None
+        # Reused per stream: creating a CUDA event (or any driver call) can stall behind
+        # the other thread's blocking sync, see _wait_stream().
+        self._kv_events: Dict[int, torch.cuda.Event] = {}
+        self._sync_events: Dict[int, torch.cuda.Event] = {}
+        self._host_bufs: Dict[int, torch.Tensor] = {}
         self._num_running = 0  # len(self.running.reqs), readable from the prefill thread
         self._chunk_state: Optional[_ReqState] = None
         self._prefill_worker: Optional[threading.Thread] = None
@@ -405,9 +410,40 @@ class SglangRunner:
             try:
                 yield
             finally:
-                event = torch.cuda.Event()
+                # A later wait_event sees the latest record, so reusing the stream's event
+                # only ever orders more work, never less.
+                event = self._kv_events.get(stream.cuda_stream)
+                if event is None:
+                    event = self._kv_events[stream.cuda_stream] = torch.cuda.Event()
                 event.record(stream)
                 self._kv_event = event
+
+    def _wait_stream(self, stream: torch.cuda.Stream) -> None:
+        """Wait on the CPU for the work queued on `stream`, without a blocking driver call.
+
+        A blocking sync in one thread (tolist(), stream.synchronize()) holds up driver
+        calls from the other thread until it returns: with the prefill thread, decode
+        sat in cudaEventCreate for the whole prefill forward (nsys, 2026-10-28). Poll a
+        reused event instead; the sleep also releases the GIL."""
+        event = self._sync_events.get(stream.cuda_stream)
+        if event is None:
+            event = self._sync_events[stream.cuda_stream] = torch.cuda.Event()
+        event.record(stream)
+        while not event.query():
+            time.sleep(50e-6)
+
+    def _to_list(self, t: torch.Tensor) -> list:
+        """t.tolist() for a small 1-D GPU tensor on the current stream, via a reused
+        pinned buffer and _wait_stream() instead of a blocking pageable copy."""
+        stream = torch.cuda.current_stream()
+        n = t.numel()
+        buf = self._host_bufs.get(stream.cuda_stream)
+        if buf is None or buf.numel() < n or buf.dtype != t.dtype:
+            buf = self._host_bufs[stream.cuda_stream] = torch.empty(max(n, 512), dtype=t.dtype, pin_memory=True)
+        host = buf[:n]
+        host.copy_(t.reshape(-1), non_blocking=True)
+        self._wait_stream(stream)
+        return host.tolist()
 
     def _admit(self) -> List[_ReqState]:
         """Pop waiting requests that fit (call with the lock held)."""
@@ -456,7 +492,7 @@ class SglangRunner:
                 batch.prepare_for_extend()
             next_token_ids = self._forward(batch, attn_backend)
             batch.output_ids = next_token_ids
-            next_ids = next_token_ids.tolist()  # waits for this stream only
+            next_ids = self._to_list(next_token_ids)  # waits for this stream only
             self.num_prefill_steps += 1
             outputs = self._process_tokens(batch, next_ids, ["first"] * len(next_ids))
             batch.filter_batch()
@@ -486,7 +522,7 @@ class SglangRunner:
                 batch.prepare_for_decode()
             next_token_ids = self._forward(batch)
             batch.output_ids = next_token_ids
-            next_ids = next_token_ids.tolist()
+            next_ids = self._to_list(next_token_ids)
             self.num_decode_steps += 1
             outputs = self._process_tokens(batch, next_ids, ["decode"] * len(next_ids))
             batch.filter_batch()
@@ -599,7 +635,7 @@ class SglangRunner:
             # The merged-away prefill tensors were allocated on the prefill stream;
             # don't let the caching allocator hand them back out before the merge
             # kernels on this stream have read them.
-            self.stream.synchronize()
+            self._wait_stream(self.stream)
         return outputs
 
     # ------------------------------------------------------- chunked prefill
@@ -658,7 +694,7 @@ class SglangRunner:
                     kinds += ["decode"] * len(running.reqs)
             next_token_ids = self._forward(batch)
             batch.output_ids = next_token_ids
-            next_ids = next_token_ids.tolist()
+            next_ids = self._to_list(next_token_ids)
             self.num_prefill_steps += 1
             outputs = self._process_tokens(batch, next_ids, kinds)
             batch.filter_batch(chunked_req_to_exclude=partial.req if partial else None)
