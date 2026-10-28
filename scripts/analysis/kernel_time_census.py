@@ -41,10 +41,12 @@ def load(path, skip_before=None):
     return rows
 
 
-def census(rows, target, thresholds):
+def census(rows, target, thresholds, managed_re=None):
     durs = sorted((d for d, *_ in rows), reverse=True)
     total = sum(durs)
     n = len(durs)
+    # pass-built (MorphX-manageable) launches, longest first
+    mdurs = sorted((d for d, sn, dn, g in rows if managed_re and managed_re.search(sn)), reverse=True)
     # T for the target share: walk launches from the longest down
     acc, t_star = 0.0, 0.0
     for d in durs:
@@ -60,17 +62,29 @@ def census(rows, target, thresholds):
         sel = [d for d in durs if d >= t]
         kinds = sum(1 for v in keys.values() if max(v) >= t)
         names = len({k[0] for k, v in keys.items() if max(v) >= t})
-        return sum(sel) / total, len(sel) / n, kinds, names
+        msel = [d for d in mdurs if d >= t]
+        return sum(sel) / total, len(sel) / n, kinds, names, sum(msel) / total, len(msel) / n
 
     print(f"launches {n}, total kernel time {total / 1e3:.1f} ms, distinct kernels (name+grid) {len(keys)}, "
           f"names {len({k[0] for k in keys})}")
-    print(f"T for {target:.0%} of GPU time: {t_star:.1f} us")
-    print(f"| T (us) | GPU time >= T | launches >= T | kernels (name+grid) >= T | names >= T |")
-    print("|---:|---:|---:|---:|---:|")
+    if managed_re:
+        print(f"pass-built (manageable) kernels: {sum(mdurs) / total:.1%} of GPU time, {len(mdurs) / n:.1%} of launches")
+        acc, tm = 0.0, None
+        for d in mdurs:
+            acc += d
+            if acc >= target * total:
+                tm = d
+                break
+        print(f"T for {target:.0%} of GPU time in pass-built launches >= T: "
+              + (f"{tm:.1f} us" if tm is not None else "unreachable (pass-built total is below the target)"))
+    print(f"T for {target:.0%} of GPU time (all launches): {t_star:.1f} us")
+    print(f"| T (us) | GPU time >= T | launches >= T | kernels (name+grid) >= T | names >= T "
+          f"| pass-built GPU time >= T | pass-built launches >= T |")
+    print("|---:|---:|---:|---:|---:|---:|---:|")
     for t in sorted(set(thresholds + [round(t_star, 1)]), reverse=True):
-        g, l, k, nm = at(t)
+        g, l, k, nm, mg, ml = at(t)
         mark = " (target)" if abs(t - round(t_star, 1)) < 1e-9 else ""
-        print(f"| {t:g}{mark} | {g:.1%} | {l:.1%} | {k} | {nm} |")
+        print(f"| {t:g}{mark} | {g:.1%} | {l:.1%} | {k} | {nm} | {mg:.1%} | {ml:.1%} |")
     # kernels around T, by median duration
     med = sorted(((statistics.median(v), len(v), sum(v), k) for k, v in keys.items()), key=lambda x: x[0])
     below = [m for m in med if m[0] < t_star][-6:]
@@ -93,17 +107,22 @@ def main():
     ap.add_argument("--target", type=float, default=0.8)
     ap.add_argument("--thresholds", default="100,50,30,20,15,10,5,2")
     ap.add_argument("--skip-before", help="drop launches before the first kernel whose name contains this")
+    ap.add_argument("--managed", default=r"^(_ZN7cutlass|PrefillWithKVCacheKernel|BatchPrefillWith|BatchDecodeWith|"
+                                           r"PersistentVariableLengthMergeStates|MergeState)",
+                    help="regex on the kernel short name: pass-built kernels MorphX can manage "
+                         "(default: mycutlass + pass-built FlashInfer)")
     args = ap.parse_args()
     ths = [float(x) for x in args.thresholds.split(",")]
+    managed_re = re.compile(args.managed) if args.managed else None
     allrows = []
     for p in args.sqlite:
         print(f"== {p}")
         rows = load(p, args.skip_before)
         allrows += rows
-        census(rows, args.target, ths)
+        census(rows, args.target, ths, managed_re)
     if len(args.sqlite) > 1:
         print("== all traces together")
-        census(allrows, args.target, ths)
+        census(allrows, args.target, ths, managed_re)
 
 
 if __name__ == "__main__":
