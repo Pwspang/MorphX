@@ -37,6 +37,8 @@ source "${ENV_SCRIPT:-scripts/ae/env-h100.sh}"   # defaults: sm90 mycutlass
 export MORPHX_PYTHON="$(command -v python)" MORPHX_FLASHINFER_PASS=1 MORPHX_LLM_GEMM=mycutlass
 if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
 PARTS=${PARTS:-trace}
+# nsys: on PATH on hpcc; nscc2b has it only in the HPC SDK
+NSYS=${NSYS:-$(command -v nsys || echo /opt/nvidia/hpc_sdk/Linux_x86_64/25.11/compilers/bin/nsys)}
 T=${T:-}
 DUR=${DUR:-30}
 POINTS=${POINTS:-"4096:128:6 2048:256:9"}
@@ -60,11 +62,11 @@ fi
 if [[ " $PARTS " == *" trace "* ]]; then
   for p in $POINTS; do
     IFS=: read -r in out rps <<< "$p"; tag=in-$in-out-$out-rps-$rps; c=$(cfg "$in" "$out" "$rps")
-    VLLM_PREFILL_THREAD=1 timeout -k 10 400 nsys profile -t cuda -o "$OUT/$tag" -f true \
+    VLLM_PREFILL_THREAD=1 timeout -k 10 400 "$NSYS" profile -t cuda -o "$OUT/$tag" -f true \
       python scripts/test-pd-online.py "$c" > "$OUT/$tag.log" 2> "$OUT/$tag.err"
     echo "-- trace $tag rc=$? $(date +%T) $(grep -h '^\[final\] Average' "$OUT/$tag.log" | tr '\n' ' ')"
     grep -hE "Traceback|Error" "$OUT/$tag.err" | head -3
-    timeout 600 nsys export -t sqlite -o "$OUT/$tag.sqlite" -f true "$OUT/$tag.nsys-rep" > /dev/null 2>&1; echo "   export rc=$?"
+    timeout 600 "$NSYS" export -t sqlite -o "$OUT/$tag.sqlite" -f true "$OUT/$tag.nsys-rep" > /dev/null 2>&1; echo "   export rc=$?"
   done
   timeout 600 python -I scripts/analysis/kernel_time_census.py "$OUT"/*.sqlite --skip-before PrefillWithKVCacheKernel \
     | tee "$OUT/census.txt"
