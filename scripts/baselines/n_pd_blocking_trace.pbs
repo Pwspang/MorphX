@@ -1,0 +1,55 @@
+#!/bin/bash
+# nscc2b, one node: short nsys traces of the Fig 13 *Stream* variant (prefill thread, no
+# runtime) at a sane load, for scripts/analysis/nsys_pd_blocking.py (decode queueing delay
+# behind prefill = the most MorphX could win back in PD co-location).
+#   in-4096-out-128, 6 req/s, 30 s:
+#     sm90   sm90 mycutlass (CUTLASS 3) + pass-built FA2   (job 192442 part 2 stream setup)
+#     sm80   Sm80 mycutlass + stock FlashInfer (FA3 ragged)  (no-split job 190815's stream setup)
+# Run from a trackFI checkout that has microbench/build-model-sm90 and the pass FA2 JIT cache:
+#   cd ~/scratch/morphx/trackFI && qsub -v ANALYSIS=<path to nsys_pd_blocking.py> <this file>
+# Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
+#PBS -N mx-pd-block
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=00:20:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261028-pd-blocking/trace-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+source scripts/ae/env-nscc2b.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+unset MORPHX_FLASHINFER_PASS MORPHX_FLASHINFER_FA2
+export FLASHINFER_WORKSPACE_BASE=$R/smsched-pass/fi-ws-stock
+NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.11/compilers/bin/nsys}
+SM80=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
+SM90=${SM90:-$R/microbench/build-model-sm90}
+VARIANTS=${VARIANTS:-"sm90 sm80"}
+ANALYSIS=${ANALYSIS:-$R/scripts/analysis/nsys_pd_blocking.py}
+RPS=${RPS:-6}; DUR=${DUR:-30}
+python -c "import json; json.dump({'time': $DUR, 'model': 'llama-3-8b', 'type': 'poisson', 'rps': $RPS, 'input_length': 4096, 'output_length': 128}, open('$OUT/cfg.json', 'w'))"
+echo "== host=$(hostname) job=${PBS_JOBID:-} head=$(git log --oneline -1 | cut -c1-60) variants=$VARIANTS rps=$RPS dur=$DUR"
+nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,power.draw --format=csv,noheader
+
+for v in $VARIANTS; do
+  case $v in
+    sm90) e="MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1" ;;
+    sm80) e="MYCUTLASS_LIB_DIR=$SM80" ;;
+    *) echo "unknown variant $v"; continue ;;
+  esac
+  echo "-- trace $v $(date +%T) ($e)"
+  env $e VLLM_PREFILL_THREAD=1 timeout -k 10 300 "$NSYS" profile -t cuda -o "$OUT/stream-$v" -f true \
+    python scripts/test-pd-online.py "$OUT/cfg.json" > "$OUT/stream-$v.log" 2> "$OUT/stream-$v.err"
+  echo "nsys $v rc=$? $(date +%T) $(grep '^\[final\]' "$OUT/stream-$v.log" | grep -E 'TBT|served|first token' | tr '\n' ' ' | cut -c1-300)"
+  timeout 300 "$NSYS" export -t sqlite -o "$OUT/stream-$v.sqlite" -f true "$OUT/stream-$v.nsys-rep" > /dev/null 2>&1
+  echo "export $v rc=$? $(date +%T)"
+done
+[[ -f $ANALYSIS ]] && timeout 300 python -I "$ANALYSIS" "$OUT"/stream-*.sqlite --out "$OUT/analysis" 2>&1
+echo "== done $(date +%T)"
