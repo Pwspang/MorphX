@@ -7,28 +7,29 @@ workspace, so the attention kernels get `_pk` clones that the MorphX runtime
 can confine to SM ranges. The stock nvcc cache (~/.cache/flashinfer) is never
 touched.
 
-It also pins every FlashInfer prefill/decode wrapper to the FA2 backend: on
-sm_90 FlashInfer otherwise picks the Hopper FA3 kernels for SGLang's ragged
-prefill (warp-specialized, TMA, setmaxnreg), which the pass's persistent-agent
-transform doesn't support. FA2 is what the paper's A100 ran.
+Default (since 2026-10-28, branch fa3-pass): FA3. No FA2 pin, so SGLang gets
+what it picks on Hopper: FA3 for the ragged prefill
+(`BatchPrefillWithRaggedKVCacheWrapper(backend="auto")`); its paged prefill and
+decode wrappers are hard-coded to FA2 in SGLang and stay FA2. The FA3 module is
+built with clang + the pass too, as a non-persistent, re-entrant variant (one
+CTA per work tile instead of one per SM; fi_clang_nvcc.py FA3_NP_PATCHES), in
+its own workspace. MORPHX_FA3_PERSISTENT=1 keeps FlashInfer's persistent
+scheduler (grid = number of SMs; for comparison only).
+
+Legacy setup (what the H200 runs used before 2026-10-28): MORPHX_LEGACY_SM80_FA2=1
+(or MORPHX_FLASHINFER_FA3=0) pins every FlashInfer prefill/decode wrapper to the
+FA2 backend, as the paper's A100 ran; MORPHX_LEGACY_SM80_FA2=1 also makes
+scripts/ae/env-h100.sh default MYCUTLASS_LIB_DIR to the Sm80 library.
 MORPHX_FLASHINFER_FA2=1 applies only the FA2 pin (stock nvcc build), to
 separate the FA3 -> FA2 change from the compiler/pass change.
 
-MORPHX_FLASHINFER_FA3=1 (opt-in, with MORPHX_FLASHINFER_PASS=1) drops the FA2
-pin, so SGLang gets what it picks on Hopper: FA3 for the ragged prefill
-(`BatchPrefillWithRaggedKVCacheWrapper(backend="auto")`); its paged prefill and
-decode wrappers are hard-coded to FA2 in SGLang and stay FA2. The FA3 module is
-then built with clang + the pass too, as a non-persistent variant (one CTA per
-work tile instead of one per SM; fi_clang_nvcc.py FA3_NP_PATCHES), in its own
-workspace. MORPHX_FA3_PERSISTENT=1 keeps FlashInfer's persistent scheduler
-(grid = number of SMs; for comparison only).
-
 Env:
   MORPHX_FLASHINFER_PASS=1        enable (needs MORPHX_LLVM_ROOT and the built pass)
-  MORPHX_FLASHINFER_PASS_CACHE    JIT workspace base (default <repo>/smsched-pass/build/flashinfer-ws[-fa3|-fa3p])
+  MORPHX_FLASHINFER_PASS_CACHE    JIT workspace base (default <repo>/smsched-pass/build/flashinfer-ws[-fa3|-fa3p]-<hash>)
   MORPHX_FI_CLANG_NOPASS=1        clang without the pass (own workspace)
   MORPHX_FLASHINFER_FA2=1         FA2 pin only, stock nvcc kernels
-  MORPHX_FLASHINFER_FA3=1         no FA2 pin; pass-built non-persistent FA3 for the ragged prefill
+  MORPHX_FLASHINFER_FA3=0         with the pass: FA2 pin instead of FA3 (default 1)
+  MORPHX_LEGACY_SM80_FA2=1        legacy setup: FA2 pin (and the Sm80 GEMM library in env-h100.sh)
   MORPHX_FA3_PERSISTENT=1         with FA3: keep the persistent tile scheduler
 
 Call setup_env() before anything imports flashinfer (it fixes the JIT paths at
@@ -55,9 +56,15 @@ def enabled() -> bool:
     return _flag("MORPHX_FLASHINFER_PASS")
 
 
+def legacy() -> bool:
+    """MORPHX_LEGACY_SM80_FA2=1: the pre-2026-10-28 setup (Sm80 GEMMs + pass-built FA2)."""
+    return _flag("MORPHX_LEGACY_SM80_FA2")
+
+
 def fa3() -> bool:
-    """Pass-built FA3 for the ragged prefill (no FA2 pin)."""
-    return enabled() and _flag("MORPHX_FLASHINFER_FA3")
+    """Pass-built FA3 for the ragged prefill (no FA2 pin). Default with the pass."""
+    off = os.environ.get("MORPHX_FLASHINFER_FA3", "1").strip().lower() in ("0", "false", "no", "off")
+    return enabled() and not legacy() and not off
 
 
 def fa3_persistent() -> bool:
@@ -146,7 +153,7 @@ def patch_backends() -> None:
         assert str(jit_env.FLASHINFER_JIT_DIR).startswith(workspace_base()), jit_env.FLASHINFER_JIT_DIR
 
     if fa3():
-        logger.info("FlashInfer: no FA2 pin (MORPHX_FLASHINFER_FA3=1): ragged prefill auto -> FA3 on sm90")
+        logger.info("FlashInfer: no FA2 pin (default; MORPHX_LEGACY_SM80_FA2=1 pins FA2): ragged prefill -> FA3")
         return
     for cls in (prefill.BatchPrefillWithRaggedKVCacheWrapper, prefill.BatchPrefillWithPagedKVCacheWrapper,
                 decode.BatchDecodeWithPagedKVCacheWrapper):

@@ -6,7 +6,7 @@ as in check_flashinfer_pass.py (one process per configuration):
 
   stock nvcc FA3:      python fi_fa3_bench.py --backend fa3
   stock nvcc FA2:      python fi_fa3_bench.py --backend fa2
-  pass-built FA2:      MORPHX_FLASHINFER_PASS=1 python fi_fa3_bench.py --backend fa2
+  pass-built FA2:      MORPHX_FLASHINFER_PASS=1 MORPHX_LEGACY_SM80_FA2=1 python fi_fa3_bench.py --backend fa2
   pass-built FA3 (non-persistent):
                        MORPHX_FLASHINFER_PASS=1 MORPHX_FLASHINFER_FA3=1 python fi_fa3_bench.py --backend fa3
   ... persistent:      + MORPHX_FA3_PERSISTENT=1

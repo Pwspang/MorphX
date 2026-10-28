@@ -414,6 +414,17 @@ def build_common_tools(include_model: bool, *, python_bin: str, prefix: str = "[
                 model_args.append(f"-DSMSCHED_LLVM_ROOT={morphx_env.env_path('MORPHX_LLVM_ROOT')}")
             run_command(["cmake", "-S", str(microbench), "-B", str(model_build), *model_args], prefix=prefix, quiet=True)
         run_command(["cmake", "--build", str(model_build), "--target", "bench", "-j"], prefix=prefix, quiet=True)
+        # Hopper: the LLM's default GEMM library since 2026-10-28 is the sm90 one
+        # (scripts/ae/env-h100.sh MYCUTLASS_LIB_DIR); MORPHX_LEGACY_SM80_FA2=1 keeps build-model.
+        if os.environ.get("MORPHX_CUDA_ARCH", "").startswith("90") and os.environ.get("MORPHX_LEGACY_SM80_FA2") != "1":
+            sm90_build = microbench / "build-model-sm90"
+            if not sm90_build.is_dir():
+                sm90_args = ["-DSMSCHED_ENABLE_PASS=ON", "-DMORPHX_MYCUTLASS_ARCH=sm90", "-DMORPHX_CUDA_ARCH=90a",
+                             *morphx_cmake_args()]
+                if os.environ.get("MORPHX_LLVM_ROOT"):
+                    sm90_args.append(f"-DSMSCHED_LLVM_ROOT={morphx_env.env_path('MORPHX_LLVM_ROOT')}")
+                run_command(["cmake", "-S", str(microbench), "-B", str(sm90_build), *sm90_args], prefix=prefix, quiet=True)
+            run_command(["cmake", "--build", str(sm90_build), "--target", "mycutlass", "-j"], prefix=prefix, quiet=True)
 
     nvbit_mem_trace = REPO_ROOT / "nvbit-tutorial" / "tools" / "mem_trace"
     if nvbit_mem_trace.is_dir():

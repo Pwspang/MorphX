@@ -2,9 +2,13 @@
 # nscc2b, one node: Fig 13/14 rerun after the runner stall fix (runner-stall-fix branch),
 # one table and one input/output length per job: baseline, stream and MorphX at every rate
 # of that row set (H200 rates = paper x MORPHX_PD_RPS_SCALE from env-h100.sh, i.e. x3).
-# Sm80 mycutlass fp16 + pass-built FA2; MorphX with per-grid profiling and each row's
+# Default (2026-10-28): sm90 mycutlass fp16 (microbench/build-model-sm90 in this checkout) +
+# pass-built FA3 prefill / FA2 decode; MORPHX_LEGACY_SM80_FA2=1 (qsub -v) gives the earlier
+# Sm80 mycutlass fp16 + pass-built FA2 setup. MorphX with per-grid profiling and each row's
 # default split (paper's A100 hints scaled to 132 SMs: 76 -> 93, 88 -> 108). 60 s per point.
 #   cd ~/scratch/morphx/trackFI && qsub -v TABLE=Figure13,LEN=in-2048-out-256 <this file>
+# SMS_EXTRA adds MorphX env, e.g. SMS_EXTRA=MORPHX_SHORT_BYPASS_TOTAL=1 so the non-persistent
+# FA3 prefill is managed instead of short-bypassed (docs/HANDOFF.md, "FA3 through the pass").
 # Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
 #PBS -N mx1314-fix
 #PBS -P 12004493
@@ -27,20 +31,24 @@ source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
 source scripts/ae/env-nscc2b.sh
 export MORPHX_PYTHON="$(command -v python)"
 if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
-SM80=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
-export MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_PASS=1
+if [[ "${MORPHX_LEGACY_SM80_FA2:-0}" == 1 ]]; then
+  LIB=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
+else
+  LIB=${SM90:-$R/microbench/build-model-sm90}
+fi
+export MYCUTLASS_LIB_DIR=$LIB MORPHX_FLASHINFER_PASS=1
 RTB=$R/runtime/build-llm
 HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpreload.so"
 VARIANTS=${VARIANTS:-"baseline stream smsched"}
 grep -q "_wait_stream" scripts/sglang/runner.py || { echo "runner.py lacks the stall fix"; exit 1; }
-[[ -f $SM80/libmycutlass.so && -f $RTB/libcuda.so ]] || { echo "missing Sm80 lib or runtime"; exit 1; }
-echo "== host=$(hostname) job=${PBS_JOBID:-} table=$TABLE len=$LEN variants=$VARIANTS pd_scale=$MORPHX_PD_RPS_SCALE"
+[[ -f $LIB/libmycutlass.so && -f $RTB/libcuda.so ]] || { echo "missing $LIB/libmycutlass.so or runtime"; exit 1; }
+echo "== host=$(hostname) job=${PBS_JOBID:-} table=$TABLE len=$LEN variants=$VARIANTS pd_scale=$MORPHX_PD_RPS_SCALE lib=$LIB legacy=${MORPHX_LEGACY_SM80_FA2:-0}"
 
 vargs=()
 for v in $VARIANTS; do vargs+=(--only-variant "$v"); done
 timeout -k 10 2300 python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}" \
   --only-table "$TABLE" --only-config "$TABLE:$LEN-rps-*" "${vargs[@]}" --no-update-latest-link --run-timeout 300 \
-  --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1" \
+  --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1${SMS_EXTRA:+ $SMS_EXTRA}" \
   --output-dir "$OUT/run" > "$OUT/run.log" 2>&1
 echo "== run rc=$? $(date +%T)"
 cat "$OUT"/run/tables/*.tsv 2>/dev/null | cut -f1-14

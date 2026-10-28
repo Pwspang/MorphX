@@ -1,6 +1,7 @@
 #!/bin/bash
 # nscc2b: Fig 13 request-rate sweep to saturation, stream vs MorphX + MORPHX_PROFILE_PER_GRID=1,
-# pass-built FA2 + sm90 mycutlass (microbench/build-model-sm90, built by n_fig13_fi_sm90.pbs),
+# pass-built FlashInfer + sm90 mycutlass (microbench/build-model-sm90, built by n_fig13_fi_sm90.pbs;
+# FA2 in jobs 192556-192663, FA3 prefill since the 2026-10-28 default change: MORPHX_LEGACY_SM80_FA2=1 for FA2),
 # split 108, default CI, 60 s per point. One length per job; rates = BASES x SCALE (Fig 13
 # rows), then EXTRA "scale:base" pairs; stops after the first rate where both variants are
 # saturated (TTFT avg > SAT_TTFT s, avg s/token > SAT_X x stream's first-rate avg, or under 50%

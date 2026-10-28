@@ -1,7 +1,8 @@
 #!/bin/bash
 # nscc2b, one node: (1) FlashInfer cost check, stream only, Sm80 mycutlass fp16:
 # stock nvcc default (FA3 ragged prefill) vs stock nvcc FA2 vs pass-built FA2;
-# (2) sm90 mycutlass (CUTLASS 3 WGMMA/TMA, pass-built) + pass-built FA2: stream vs
+# (2) sm90 mycutlass (CUTLASS 3 WGMMA/TMA, pass-built) + pass-built FlashInfer (FA2 in job
+# 192442; FA3 prefill since the 2026-10-28 default change, qsub -v MORPHX_LEGACY_SM80_FA2=1 for FA2): stream vs
 # MorphX + MORPHX_PROFILE_PER_GRID=1 vs MorphX, split 108, default CI. 60 s per point.
 #   cd ~/scratch/morphx/trackFI && qsub scripts/baselines/n_fig13_fi_sm90.pbs
 #   PARTS="fa sm90" (default); SM90_VARIANTS="stream smsched-grid smsched"
@@ -77,7 +78,8 @@ if [[ " $PARTS " == *" fa "* ]]; then
   for c in $CONFIGS; do
     run stream-stock "$c" stream MYCUTLASS_LIB_DIR=$SM80
     run stream-stockfa2 "$c" stream MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_FA2=1
-    run stream-pass "$c" stream MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_PASS=1
+    # pass-built FA2 (the 2026-10-27 study): the legacy setup since FA3 became the default
+    run stream-pass "$c" stream MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_PASS=1 MORPHX_LEGACY_SM80_FA2=1
   done
 fi
 

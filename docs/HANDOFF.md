@@ -1,5 +1,16 @@
 # MorphX H100/H200 port: handoff
 
+> **Default change (2026-10-28, branch `fa3-pass`): the LLM now runs sm90 mycutlass GEMMs
+> + pass-built FA3.** `scripts/ae/env-h100.sh` (and so `env-nscc2b.sh`) defaults
+> `MYCUTLASS_LIB_DIR` to `<repo>/microbench/build-model-sm90` (build it: `build-nscc2b.sh`
+> step `microbench`, `run_all.py`, or `fa3_checks.pbs` part `build`), and
+> `MORPHX_FLASHINFER_PASS=1` no longer pins FlashInfer to FA2: SGLang's ragged prefill runs
+> pass-built non-persistent FA3 (paged prefill and decode stay FA2, as in stock SGLang).
+> **Legacy setup** (all H200 results before this date: Sm80 mycutlass + pass-built FA2):
+> `MORPHX_LEGACY_SM80_FA2=1` (`qsub -v MORPHX_LEGACY_SM80_FA2=1 ...` for the job scripts).
+> Under the runtime, the FA3 prefill is only managed with `MORPHX_SHORT_BYPASS_TOTAL=1`
+> (opt-in, not default; see "FA3 through the pass" in section 9).
+
 Snapshot: 2026-10-26. Everything is stopped: no PBS jobs, transfers, agents or
 watchers are running for MorphX on hpcc or nscc2b. The full engineering record
 is [docs/h100-port-plan.md](h100-port-plan.md); this file says where things are
@@ -379,10 +390,16 @@ the MorphX runtime, together with the sm90 mycutlass GEMMs. Dev checkout
 dev jobs 95784 / 95790 (`scripts/baselines/fa3_dev.pbs`, a holder that runs step scripts
 from `devq/`). All checks in one job: `scripts/baselines/fa3_checks.pbs`.
 
-**How to enable.** `MORPHX_FLASHINFER_PASS=1 MORPHX_FLASHINFER_FA3=1` plus
-`MYCUTLASS_LIB_DIR=<repo>/microbench/build-model-sm90`.
+**How to enable.** Default since the second commit on `fa3-pass` (see the note at the top):
+`MORPHX_FLASHINFER_PASS=1` with `env-h100.sh` gives sm90 mycutlass + pass-built FA3. Before
+that commit (and to be explicit): `MORPHX_FLASHINFER_PASS=1 MORPHX_FLASHINFER_FA3=1
+MYCUTLASS_LIB_DIR=<repo>/microbench/build-model-sm90`. Legacy Sm80 + FA2:
+`MORPHX_LEGACY_SM80_FA2=1` (or `MORPHX_FLASHINFER_FA3=0` for FA2 with any library).
 Under the runtime also `MORPHX_SHORT_BYPASS_TOTAL=1`, or the FA3 prefill is short-bypassed
 (below). `MORPHX_FA3_PERSISTENT=1` keeps FlashInfer's persistent scheduler (comparison only).
+Flip check (job 95784 step 070): default `MORPHX_FLASHINFER_PASS=1` → `pass-fa3`, kernels
+bitwise identical to stock nvcc; `MORPHX_LEGACY_SM80_FA2=1` → `pass-fa2` in the old
+workspace, identical to stock FA2 except merge_state (4.9e-4, IEEE div in the FA2 build, as before).
 What SGLang then runs: the ragged prefill (`BatchPrefillWithRaggedKVCacheWrapper`,
 `backend="auto"`) picks FA3 on sm90; SGLang hard-codes `fa2` for its paged prefill
 (extend with a prefix) and decode wrappers, so those stay FA2 (pass-built), as in stock SGLang.

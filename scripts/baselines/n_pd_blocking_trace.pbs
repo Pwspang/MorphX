@@ -3,14 +3,16 @@
 # runtime) at a sane load, for scripts/analysis/nsys_pd_blocking.py (decode queueing delay
 # behind prefill = the most MorphX could win back in PD co-location).
 #   in-4096-out-128, 6 req/s, 30 s:
-#     sm90   sm90 mycutlass (CUTLASS 3) + pass-built FA2   (job 192442 part 2 stream setup)
+#     sm90   sm90 mycutlass (CUTLASS 3) + pass-built FlashInfer: FA3 prefill / FA2 decode, the
+#            default since 2026-10-28 (job 192442 part 2 and job 194398 used pass-built FA2:
+#            qsub -v MORPHX_LEGACY_SM80_FA2=1 for that FlashInfer setup; the GEMM library stays $SM90)
 #     sm80   Sm80 mycutlass + stock FlashInfer (FA3 ragged)  (no-split job 190815's stream setup)
 #   <kernels>-hipri  the same with decode on a high-priority stream (MORPHX_DECODE_STREAM_PRIORITY)
 #   <kernels>-mx     MorphX (runtime/build-llm, split 108, default CI); sm90-mx adds per-grid
 #                    profiling (job 192442's smsched-grid)
 #   sm80-mxnosplit   MorphX with MORPHX_CI_THRESHOLD=2: nothing confined (job 190815)
 #   e.g. VARIANTS="sm80 sm80-hipri sm80-mxnosplit sm80-mx sm90 sm90-hipri sm90-mx"
-# Run from a trackFI checkout that has microbench/build-model-sm90 and the pass FA2 JIT cache:
+# Run from a checkout that has microbench/build-model-sm90 (pass FlashInfer JIT builds on first use):
 #   cd ~/scratch/morphx/trackFI && qsub -v ANALYSIS=<path to nsys_pd_blocking.py> <this file>
 # Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
 #PBS -N mx-pd-block
