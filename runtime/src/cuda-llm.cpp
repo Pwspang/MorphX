@@ -243,6 +243,12 @@ int profile_log;
 std::atomic<long> gCILimitedLaunches{0};  // CI kernels limited to [0, split) at launch
 std::atomic<long> gSplitMoves{0};         // co-runners moved to [split, nrSM) by schedule_2
 std::atomic<long> gManagedLaunches{0};    // transformed (_pk) launches outside profiling
+// Estimated kernel time (the profile's gWaveTime value per launch, ns) of managed and of
+// short-bypassed launches; with MORPHX_SHORT_BYPASS_TOTAL=1 that value is the whole
+// kernel's estimate, so est_managed_share approximates the managed share of GPU time
+// (kernels the runtime never profiles, e.g. at::native, are not counted).
+std::atomic<long long> gEstManagedNs{0};
+std::atomic<long long> gEstBypassNs{0};
 int split_hint;
 int llm_trick_mode;
 int llm_trace_limit;
@@ -287,6 +293,9 @@ std::unordered_map<const char *, std::atomic<float>> gWaveTime;
 int profile_per_grid = 0;
 int profile_grid_max = 6;
 int short_bypass_total = 0;  // MORPHX_SHORT_BYPASS_TOTAL, see generateProfileResult
+// MORPHX_SHORT_KERNEL_US: kernels whose profiled time (first wave, or whole-kernel
+// estimate with MORPHX_SHORT_BYPASS_TOTAL=1) is below this run unmanaged. Default 50 us.
+float short_kernel_us = 50.0f;
 std::unordered_map<const char *, std::array<const char *, 33>> gGridKeys; // launch thread only
 std::unordered_map<const char *, KernelStats*> gKernelStats;              // launch thread only
 
@@ -412,7 +421,7 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
     }
     float tm = profileResult[0].second;
     float t0 = profileResult.back().second;
-    // The 50 us short-kernel bypass compares this value. Default: the first profile
+    // The short-kernel bypass (MORPHX_SHORT_KERNEL_US, default 50) compares this value. Default: the first profile
     // wave's time. MORPHX_SHORT_BYPASS_TOTAL=1: that wave scaled to the whole grid,
     // i.e. the kernel's estimated run time; kernels made of many short blocks (the
     // non-persistent FA3 prefill: ~16 us per 132-block wave, ~300 us per launch) are
@@ -728,9 +737,14 @@ extern "C" void morphx_report() {
     static std::atomic<bool> reported{false};
     if(!profile_log || reported.exchange(true)) return;
     long managed = gManagedLaunches.load(), ci = gCILimitedLaunches.load(), moved = gSplitMoves.load();
+    double estM = gEstManagedNs.load() / 1e6, estB = gEstBypassNs.load() / 1e6;  // ms
     fprintf(stderr, "[MorphX-profile] summary ci_threshold=%.3f ci_saturate=%.3f split=%d nrSM=%d"
-        " managed_launches=%ld ci_limited_launches=%ld split_moves=%ld full_gpu_launches=%ld\n",
-        ci_threshold, ci_saturate, split_hint, gNrSM, managed, ci, moved, std::max(0L, managed - ci - moved));
+        " short_kernel_us=%.1f short_bypass_total=%d"
+        " managed_launches=%ld ci_limited_launches=%ld split_moves=%ld full_gpu_launches=%ld"
+        " est_managed_ms=%.1f est_bypass_ms=%.1f est_managed_share=%.3f\n",
+        ci_threshold, ci_saturate, split_hint, gNrSM, short_kernel_us, short_bypass_total,
+        managed, ci, moved, std::max(0L, managed - ci - moved),
+        estM, estB, estM + estB > 0 ? estM / (estM + estB) : 0.0);
     if(profile_per_grid) {
         size_t keys = 0;
         for(auto &kv : gGridKeys) for(auto k : kv.second) keys += k != nullptr;
@@ -920,6 +934,7 @@ static void ld_init(void) {
     profile_per_grid = getenv_int("MORPHX_PROFILE_PER_GRID", 0);
     profile_grid_max = std::max(1, std::min(33, getenv_int("MORPHX_PROFILE_GRID_MAX", 6)));
     short_bypass_total = getenv_int("MORPHX_SHORT_BYPASS_TOTAL", 0);
+    if(const char *v = std::getenv("MORPHX_SHORT_KERNEL_US")) short_kernel_us = std::strtof(v, nullptr);
     // Profiles are inserted while the agent thread runs; keep the maps from rehashing.
     gCI.reserve(4096);
     gWaveTime.reserve(4096);
@@ -1105,9 +1120,10 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     const char* profKey = profileKey(funcName, gridSize);
     KernelStats* kstats = kernelStats(funcName);
     if(kstats) kstats->launches.fetch_add(1, std::memory_order_relaxed);
-    if ((gWaveTime.count(profKey) && gWaveTime[profKey].load() < 50.0)
+    if ((gWaveTime.count(profKey) && gWaveTime[profKey].load() < short_kernel_us)
         && !(keepShortTargetKernelsMode() && isTargetLLMKernel(funcName))) {
         if(kstats) kstats->shortBypass.fetch_add(1, std::memory_order_relaxed);
+        gEstBypassNs.fetch_add((long long)(gWaveTime[profKey].load() * 1000.0), std::memory_order_relaxed);
         traceLLMKernel("short-bypass", funcName, gridSize, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream);
         launchMutex.unlock();
         return real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, kernelParams, extra);
@@ -1238,6 +1254,8 @@ CUresult cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDi
     }
     if(!profile) {
         gManagedLaunches.fetch_add(1, std::memory_order_relaxed);
+        if(gWaveTime.count(launchInfo->name))
+            gEstManagedNs.fetch_add((long long)(gWaveTime[launchInfo->name].load() * 1000.0), std::memory_order_relaxed);
         if(kstats) kstats->managed.fetch_add(1, std::memory_order_relaxed);
         if(gCI.count(launchInfo->name)) launchInfo->ci = &gCI[launchInfo->name];
     } else if(kstats) {

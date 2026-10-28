@@ -1,0 +1,105 @@
+#!/bin/bash
+# Short-kernel threshold for the default setup (sm90 mycutlass + pass-built FA3), hpcc.
+#   cd ~/morphx/trackFA3 && qsub -v PARTS="trace" scripts/baselines/fa3_short_census.pbs
+#   qsub -v PARTS="runtime steps",T=<us> scripts/baselines/fa3_short_census.pbs
+# Parts (every step under a timeout; log tee'd to $OUT/job.log):
+#   trace    nsys -t cuda of the Fig 13 *Stream* variant (prefill thread, no runtime), 30 s:
+#            in-4096-out-128 at 6 req/s and in-2048-out-256 at 9 req/s; SQLite export, then
+#            scripts/analysis/kernel_time_census.py (GPU-time share above each threshold; the T
+#            for 80%)
+#   runtime  the same two points under MorphX (runtime/build-llm, per-grid profiling, split 108),
+#            MORPHX_SHORT_BYPASS_TOTAL=1 with MORPHX_SHORT_KERNEL_US=50 and =T: runtime counters
+#            (managed launches, est_managed_share); greedy tokens at T vs no runtime
+#   steps    check_flashinfer_pass --bench step times: no runtime, and the runtime at 50 us
+#            (first wave, the plain default), 50 us whole-kernel, T whole-kernel; no split / split 108
+#PBS -N fa3-short
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/fa3/short-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job.log") 2>&1
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module purge; module load cuda/13.0 gnu/gcc-12.3 2>/dev/null
+[[ -f /opt/rh/gcc-toolset-13/enable ]] && source /opt/rh/gcc-toolset-13/enable
+source "${MORPHX_VENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$R"
+unset MYCUTLASS_LIB_DIR MORPHX_LEGACY_SM80_FA2 MORPHX_FLASHINFER_FA3
+source "${ENV_SCRIPT:-scripts/ae/env-h100.sh}"   # defaults: sm90 mycutlass
+export MORPHX_PYTHON="$(command -v python)" MORPHX_FLASHINFER_PASS=1 MORPHX_LLM_GEMM=mycutlass
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-trace}
+T=${T:-}
+DUR=${DUR:-30}
+POINTS=${POINTS:-"4096:128:6 2048:256:9"}
+L=$R/runtime/build-llm
+MX="NEUTRINO_HOOK_DRIVER=$L/libcuda.so LD_PRELOAD=$L/libcuda.so:$L/libpreload.so SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1 SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+echo "== $(hostname) job=${PBS_JOBID:-} $(date +%T) head=$(git log --oneline -1 | cut -c1-60) parts=$PARTS T=$T lib=$MYCUTLASS_LIB_DIR"
+
+cfg() {  # in out rps -> json path
+  local f=$OUT/cfg-$1-$2-$3.json
+  python -c "import json; json.dump({'time': $DUR, 'model': 'llama-3-8b', 'type': 'poisson', 'rps': $3, 'input_length': $1, 'output_length': $2}, open('$f', 'w'))"
+  echo "$f"
+}
+
+if [[ " $PARTS " == *" rtbuild "* ]]; then  # rebuild runtime/build-llm (MORPHX_SHORT_KERNEL_US)
+  timeout -k 10 600 cmake --build runtime/build-llm -j "${NCPUS:-12}" > "$OUT/rtbuild.log" 2>&1 || { echo "runtime build FAILED"; tail "$OUT/rtbuild.log"; exit 1; }
+  echo "-- runtime/build-llm rebuilt $(date +%T)"
+fi
+
+if [[ " $PARTS " == *" trace "* ]]; then
+  for p in $POINTS; do
+    IFS=: read -r in out rps <<< "$p"; tag=in-$in-out-$out-rps-$rps; c=$(cfg "$in" "$out" "$rps")
+    VLLM_PREFILL_THREAD=1 timeout -k 10 400 nsys profile -t cuda -o "$OUT/$tag" -f true \
+      python scripts/test-pd-online.py "$c" > "$OUT/$tag.log" 2> "$OUT/$tag.err"
+    echo "-- trace $tag rc=$? $(date +%T) $(grep -h '^\[final\] Average' "$OUT/$tag.log" | tr '\n' ' ')"
+    grep -hE "Traceback|Error" "$OUT/$tag.err" | head -3
+    timeout 600 nsys export -t sqlite -o "$OUT/$tag.sqlite" -f true "$OUT/$tag.nsys-rep" > /dev/null 2>&1; echo "   export rc=$?"
+  done
+  timeout 600 python -I scripts/analysis/kernel_time_census.py "$OUT"/*.sqlite --skip-before PrefillWithKVCacheKernel \
+    | tee "$OUT/census.txt"
+fi
+
+if [[ " $PARTS " == *" runtime "* ]]; then
+  : "${T:?set T=<us> for the runtime part}"
+  for p in $POINTS; do
+    IFS=: read -r in out rps <<< "$p"; tag=in-$in-out-$out-rps-$rps; c=$(cfg "$in" "$out" "$rps")
+    for us in 50 "$T"; do
+      env $MX SMSCHED_SPLIT_HINT=108 MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=$us VLLM_PREFILL_THREAD=1 \
+        timeout -k 10 400 python scripts/test-pd-online.py "$c" > "$OUT/rt-$tag-$us.log" 2> "$OUT/rt-$tag-$us.err"
+      echo "-- runtime $tag T=$us rc=$? $(grep -h '^\[final\] Average' "$OUT/rt-$tag-$us.log" | tr '\n' ' ')"
+      grep -h "MorphX-profile\] summary" "$OUT/rt-$tag-$us.err" | sed 's/.*summary /   /'
+      grep -hE "Traceback|illegal|Error" "$OUT/rt-$tag-$us.err" | head -3
+    done
+  done
+  timeout -k 10 600 $CHECK --out "$OUT/tok-none.pt" > "$OUT/tok-none.log" 2>&1; echo "-- tokens, no runtime rc=$?"
+  for split in 132 108; do
+    env $MX SMSCHED_SPLIT_HINT=$split MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=$T timeout -k 10 600 $CHECK --out "$OUT/tok-T-$split.pt" > "$OUT/tok-T-$split.log" 2>&1
+    echo "-- tokens, runtime T=$T split=$split rc=$? $(grep -h 'MorphX-profile\] summary' "$OUT/tok-T-$split.log" | sed 's/.*summary //')"
+    $CHECK --compare "$OUT/tok-none.pt" "$OUT/tok-T-$split.pt" | grep greedy
+  done
+fi
+
+if [[ " $PARTS " == *" steps "* ]]; then
+  : "${T:?set T=<us> for the steps part}"
+  run() { local tag=$1; shift
+    env "$@" timeout -k 10 600 $CHECK --bench --out "$OUT/st-$tag.pt" > "$OUT/st-$tag.log" 2>&1
+    echo "-- $tag rc=$? $(grep '^\[bench\]' "$OUT/st-$tag.log" | sed -E 's/\(n=.*//' | tr '\n' ' ')"
+    grep -h "MorphX-profile\] summary" "$OUT/st-$tag.log" | sed 's/.*summary /   /'
+  }
+  run none
+  for s in nosplit split108; do
+    e="SMSCHED_SPLIT_HINT=108"; [[ $s == nosplit ]] && e="$e MORPHX_CI_THRESHOLD=2"
+    run "wave50-$s" $MX $e
+    run "total50-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1
+    run "totalT-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=$T
+  done
+  for t in wave50-nosplit totalT-nosplit totalT-split108; do $CHECK --compare "$OUT/st-none.pt" "$OUT/st-$t.pt" | grep greedy; done
+fi
+echo "== done $(date +%T)"
