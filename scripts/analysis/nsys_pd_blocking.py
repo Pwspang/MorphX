@@ -91,24 +91,29 @@ class Trace:
         for sid, ks in self.kernels.items():
             ks.sort(key=lambda k: k["start"])
             self.ops[sid].extend(ks)
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         for table, kind in (("CUPTI_ACTIVITY_KIND_MEMCPY", "memcpy"), ("CUPTI_ACTIVITY_KIND_MEMSET", "memset")):
+            if table not in tables:  # nsys omits activity tables with no rows
+                continue
             for s, e, sid, corr in db.execute(f"SELECT start, end, streamId, correlationId FROM {table}"):
                 self.ops[sid].append(dict(start=s, end=e, corr=corr, kind=kind))
         for sid in self.ops:
             self.ops[sid].sort(key=lambda o: o["start"])
         # event records: (eventId, eventSyncId) -> (recording stream, record correlationId)
         self.records = {(ev, sync): (sid, corr) for sid, corr, ev, sync in db.execute(
-            "SELECT streamId, correlationId, eventId, eventSyncId FROM CUPTI_ACTIVITY_KIND_CUDA_EVENT")}
+            "SELECT streamId, correlationId, eventId, eventSyncId FROM CUPTI_ACTIVITY_KIND_CUDA_EVENT")
+            } if "CUPTI_ACTIVITY_KIND_CUDA_EVENT" in tables else {}
         # stream waits: waiting stream -> [(correlationId, eventId, eventSyncId)]
         self.waits = collections.defaultdict(list)
         for sid, corr, ev, sync in db.execute(
                 "SELECT streamId, correlationId, eventId, eventSyncId FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION "
-                "WHERE syncType = 2 AND eventId != 4294967295"):
+                "WHERE syncType = 2 AND eventId != 4294967295") if "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION" in tables else ():
             self.waits[sid].append((corr, ev, sync))
         for sid in self.waits:
             self.waits[sid].sort()
         self.thread_names = dict(db.execute(
-            "SELECT t.globalTid, s.value FROM ThreadNames t JOIN StringIds s ON s.id = t.nameId"))
+            "SELECT t.globalTid, s.value FROM ThreadNames t JOIN StringIds s ON s.id = t.nameId")
+            ) if "ThreadNames" in tables else {}
         db.close()
 
     # ------------------------------------------------------------------ helpers
