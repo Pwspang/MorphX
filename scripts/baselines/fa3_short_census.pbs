@@ -24,7 +24,11 @@ OUT=${OUT:-$R/logs/fa3/short-${PBS_JOBID%%.*}}
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/job.log") 2>&1
 type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
-module purge; module load cuda/13.0 gnu/gcc-12.3 2>/dev/null
+# nscc2b: keep the default modules (gcc-native/14; a purge falls back to the system gcc 11, whose
+# <atomic> clashes with the runtime's C11 atomics) and load cuda on its own line (Lmod drops a whole
+# `module load` line when one module, e.g. gnu/gcc-12.3, doesn't exist there).
+if [[ "${ENV_SCRIPT:-}" == *env-nscc2b.sh ]]; then module load cuda/13.0
+else module purge; module load cuda/13.0; module load gnu/gcc-12.3 2>/dev/null || true; fi
 [[ -f /opt/rh/gcc-toolset-13/enable ]] && source /opt/rh/gcc-toolset-13/enable
 source "${MORPHX_VENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
 cd "$R"
