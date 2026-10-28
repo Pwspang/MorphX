@@ -27,7 +27,7 @@ type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
 # nscc2b: keep the default modules (gcc-native/14; a purge falls back to the system gcc 11, whose
 # <atomic> clashes with the runtime's C11 atomics) and load cuda on its own line (Lmod drops a whole
 # `module load` line when one module, e.g. gnu/gcc-12.3, doesn't exist there).
-if [[ "${ENV_SCRIPT:-}" == *env-nscc2b.sh ]]; then module load cuda/13.0
+if [[ "${ENV_SCRIPT:-}" == *env-nscc2b.sh ]]; then module load cuda/13.0; module load cmake/4.3.4  # system cmake 3.x cannot drive clang as the CUDA compiler
 else module purge; module load cuda/13.0; module load gnu/gcc-12.3 2>/dev/null || true; fi
 [[ -f /opt/rh/gcc-toolset-13/enable ]] && source /opt/rh/gcc-toolset-13/enable  # SGLang's tvm-ffi JIT
 source "${MORPHX_VENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
