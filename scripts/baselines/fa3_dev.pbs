@@ -1,0 +1,49 @@
+#!/bin/bash
+# hpcc dev holder for the FA3 pass work (branch fa3-pass): keeps one GPU and runs
+# step scripts dropped into $Q (default <repo>/devq) one at a time, each under its
+# own timeout, so builds and checks don't requeue between steps.
+#   cd ~/morphx/trackFA3 && qsub scripts/baselines/fa3_dev.pbs
+#   echo 'timeout 600 python ...' > devq/010-name.sh      # picked up within 5 s
+#   devq/010-name.log (output), devq/010-name.rc (exit code) when done
+#   touch devq/stop                                       # end the job
+# Exits after IDLE seconds (default 900) without a new step. Environment as the
+# hpcc SGLang jobs: cuda/13.0, gcc-toolset-13, ~/morphx/envs/sglang-stock, env-h100.sh.
+#PBS -N fa3-dev
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+Q=${Q:-$R/devq}
+IDLE=${IDLE:-900}
+mkdir -p "$Q"
+module purge; module load cuda/13.0 gnu/gcc-12.3
+# gcc-toolset-13 (SGLang's tvm-ffi JIT) ahead on PATH; gcc 12.3's libstdc++ stays on
+# LD_LIBRARY_PATH because ~/morphx/llvm's clang needs GLIBCXX_3.4.30
+source /opt/rh/gcc-toolset-13/enable
+source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$R"
+source scripts/ae/env-h100.sh
+export MORPHX_PYTHON="$(command -v python)" MAX_JOBS=${NCPUS:-12}
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+echo "== fa3-dev $(hostname) job=${PBS_JOBID:-} $(date +%T) head=$(git log --oneline -1 | cut -c1-60)" | tee "$Q/holder.log"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | tee -a "$Q/holder.log"
+last=$(date +%s)
+while [[ ! -f $Q/stop ]]; do
+  next=$(ls "$Q"/*.sh 2>/dev/null | sort | head -n 1)
+  if [[ -z $next ]]; then
+    (( $(date +%s) - last > IDLE )) && { echo "idle, exiting $(date +%T)" | tee -a "$Q/holder.log"; break; }
+    sleep 5; continue
+  fi
+  base=${next%.sh}
+  mv "$next" "$base.run"
+  echo "-- start $(basename "$base") $(date +%T)" | tee -a "$Q/holder.log"
+  bash "$base.run" > "$base.log" 2>&1
+  rc=$?
+  echo "$rc" > "$base.rc"
+  echo "-- end $(basename "$base") rc=$rc $(date +%T)" | tee -a "$Q/holder.log"
+  last=$(date +%s)
+done
+echo "== fa3-dev done $(date +%T)" | tee -a "$Q/holder.log"

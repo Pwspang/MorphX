@@ -77,6 +77,7 @@ def run_tests(stream):
     q, k, v = rnd(sum(lens), HQ, D), rnd(sum(lens), HKV, D), rnd(sum(lens), HKV, D)
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, "NHD")
     w.plan(qo, qo, HQ, HKV, D, causal=True, q_data_type=torch.float16)
+    print(f"[fi-test] ragged prefill backend: {getattr(w, '_backend', '?')}", flush=True)
     o = w.run(q, k, v)
     ref = torch.cat([ref_attn(q[a:b], k[a:b], v[a:b], True) for a, b in zip(qo[:-1].tolist(), qo[1:].tolist())])
     out["ragged"], errs["ragged"] = o, (o.float() - ref).abs().max().item()
@@ -149,7 +150,7 @@ def main():
     flashinfer_pass.patch_backends()
     from flashinfer.jit import env as jit_env
 
-    cfg = ("pass" if flashinfer_pass.enabled() else "stock") + ("-fa2" if flashinfer_pass.fa2_only() else "-auto") + \
+    cfg = flashinfer_pass.config_name() + \
         ("-runtime" if "libcuda.so" in os.environ.get("LD_PRELOAD", "") else "")
     print(f"[fi-test] config={cfg} jit_dir={jit_env.FLASHINFER_JIT_DIR}", flush=True)
     stream = torch.cuda.Stream()
@@ -170,6 +171,7 @@ def main():
     if args.out:
         torch.save({"cfg": cfg, "out": {k: v.cpu() for k, v in out.items()}}, args.out)
     print("[fi-test] " + ("PASS" if ok else "FAIL"), flush=True)
+    flashinfer_pass.runtime_report()
     sys.stdout.flush()
     os._exit(0 if ok else 1)
 

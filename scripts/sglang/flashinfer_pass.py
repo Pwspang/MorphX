@@ -14,11 +14,22 @@ transform doesn't support. FA2 is what the paper's A100 ran.
 MORPHX_FLASHINFER_FA2=1 applies only the FA2 pin (stock nvcc build), to
 separate the FA3 -> FA2 change from the compiler/pass change.
 
+MORPHX_FLASHINFER_FA3=1 (opt-in, with MORPHX_FLASHINFER_PASS=1) drops the FA2
+pin, so SGLang gets what it picks on Hopper: FA3 for the ragged prefill
+(`BatchPrefillWithRaggedKVCacheWrapper(backend="auto")`); its paged prefill and
+decode wrappers are hard-coded to FA2 in SGLang and stay FA2. The FA3 module is
+then built with clang + the pass too, as a non-persistent variant (one CTA per
+work tile instead of one per SM; fi_clang_nvcc.py FA3_NP_PATCHES), in its own
+workspace. MORPHX_FA3_PERSISTENT=1 keeps FlashInfer's persistent scheduler
+(grid = number of SMs; for comparison only).
+
 Env:
   MORPHX_FLASHINFER_PASS=1        enable (needs MORPHX_LLVM_ROOT and the built pass)
-  MORPHX_FLASHINFER_PASS_CACHE    JIT workspace base (default <repo>/smsched-pass/build/flashinfer-ws)
+  MORPHX_FLASHINFER_PASS_CACHE    JIT workspace base (default <repo>/smsched-pass/build/flashinfer-ws[-fa3|-fa3p])
   MORPHX_FI_CLANG_NOPASS=1        clang without the pass (own workspace)
   MORPHX_FLASHINFER_FA2=1         FA2 pin only, stock nvcc kernels
+  MORPHX_FLASHINFER_FA3=1         no FA2 pin; pass-built non-persistent FA3 for the ragged prefill
+  MORPHX_FA3_PERSISTENT=1         with FA3: keep the persistent tile scheduler
 
 Call setup_env() before anything imports flashinfer (it fixes the JIT paths at
 import time), then patch_backends() once flashinfer is importable.
@@ -44,14 +55,39 @@ def enabled() -> bool:
     return _flag("MORPHX_FLASHINFER_PASS")
 
 
+def fa3() -> bool:
+    """Pass-built FA3 for the ragged prefill (no FA2 pin)."""
+    return enabled() and _flag("MORPHX_FLASHINFER_FA3")
+
+
+def fa3_persistent() -> bool:
+    return fa3() and _flag("MORPHX_FA3_PERSISTENT")
+
+
 def fa2_only() -> bool:
-    return enabled() or _flag("MORPHX_FLASHINFER_FA2")
+    return (enabled() and not fa3()) or _flag("MORPHX_FLASHINFER_FA2")
 
 
 def workspace_base() -> str:
-    default = os.path.join(_REPO, "smsched-pass", "build",
-                           "flashinfer-ws-nopass" if _flag("MORPHX_FI_CLANG_NOPASS") else "flashinfer-ws")
+    name = "flashinfer-ws-nopass" if _flag("MORPHX_FI_CLANG_NOPASS") else "flashinfer-ws"
+    if fa3():
+        # FA3 objects differ between the variants; FA2 modules are rebuilt per workspace (~10 s).
+        # Flags the wrapper adds are invisible to ninja, so key the workspace on the wrapper.
+        import hashlib
+        with open(os.path.join(_HERE, "fi_clang_nvcc.py"), "rb") as f:
+            tag = hashlib.sha1(f.read()).hexdigest()[:8]
+        name += ("-fa3p-" if fa3_persistent() else "-fa3-") + tag
+    default = os.path.join(_REPO, "smsched-pass", "build", name)
     return os.path.abspath(os.environ.get("MORPHX_FLASHINFER_PASS_CACHE", default))
+
+
+def config_name() -> str:
+    """Short tag for logs and dumps: stock|pass, fa2|auto|fa3|fa3p."""
+    if fa3():
+        att = "fa3p" if fa3_persistent() else "fa3"
+    else:
+        att = "fa2" if fa2_only() else "auto"
+    return ("pass" if enabled() else "stock") + "-" + att
 
 
 def setup_env() -> None:
@@ -68,6 +104,9 @@ def setup_env() -> None:
     os.makedirs(base, exist_ok=True)
     os.environ["FLASHINFER_WORKSPACE_BASE"] = base
     os.environ["FLASHINFER_NVCC"] = os.path.join(_HERE, "fi_clang_nvcc.py")
+    os.environ["MORPHX_FI_FA3_NONPERSISTENT"] = "1" if fa3() and not fa3_persistent() else "0"
+    # FA3 mode: nvcc's fast-math div/sqrt too, so the build matches stock nvcc bit for bit
+    os.environ["MORPHX_FI_NVCC_DIV"] = "1" if fa3() else "0"
     # Host-only sources and the .so link stay with the host compiler; every
     # .cu (kernels and the tvm-ffi bindings) goes through the wrapper.
     if os.environ.get("FLASHINFER_JIT_VERBOSE") is None:
@@ -75,12 +114,25 @@ def setup_env() -> None:
     so = os.environ.get("SMSCHED_PASS_SO", os.path.join(_REPO, "smsched-pass", "build", "libsmsched.so"))
     if not _flag("MORPHX_FI_CLANG_NOPASS") and not os.path.exists(so):
         raise RuntimeError(f"MORPHX_FLASHINFER_PASS=1 but the pass plugin {so} is missing")
-    logger.info("FlashInfer JIT: clang + SMSched pass, workspace %s", base)
+    logger.info("FlashInfer JIT: clang + SMSched pass (%s), workspace %s", config_name(), base)
+
+
+def runtime_report() -> None:
+    """Print the MorphX runtime's [MorphX-profile] summary (os._exit skips its atexit hook)."""
+    if "libcuda.so" not in os.environ.get("LD_PRELOAD", ""):
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        import ctypes
+        ctypes.CDLL(None).morphx_report()
+    except (OSError, AttributeError):
+        pass  # runtimes without the report (cuda.cpp)
 
 
 def patch_backends() -> None:
     """Pin FlashInfer's prefill/decode wrappers to FA2 (see module docstring)."""
-    if not fa2_only():
+    if not (fa2_only() or fa3()):
         return
     import flashinfer  # noqa: F401
     from flashinfer import decode, prefill
@@ -93,6 +145,9 @@ def patch_backends() -> None:
         jit_env.FLASHINFER_AOT_DIR = jit_env.FLASHINFER_WORKSPACE_DIR / "no-aot"
         assert str(jit_env.FLASHINFER_JIT_DIR).startswith(workspace_base()), jit_env.FLASHINFER_JIT_DIR
 
+    if fa3():
+        logger.info("FlashInfer: no FA2 pin (MORPHX_FLASHINFER_FA3=1): ragged prefill auto -> FA3 on sm90")
+        return
     for cls in (prefill.BatchPrefillWithRaggedKVCacheWrapper, prefill.BatchPrefillWithPagedKVCacheWrapper,
                 decode.BatchDecodeWithPagedKVCacheWrapper):
         init = cls.__init__

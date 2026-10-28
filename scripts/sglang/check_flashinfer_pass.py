@@ -103,7 +103,7 @@ def main():
 
     from flashinfer.jit import env as jit_env
 
-    cfg = ("pass" if flashinfer_pass.enabled() else "stock") + ("-fa2" if flashinfer_pass.fa2_only() else "-auto") + \
+    cfg = flashinfer_pass.config_name() + \
         ("-runtime" if "libcuda.so" in os.environ.get("LD_PRELOAD", "") else "")
     print(f"[fi] config={cfg} jit_dir={jit_env.FLASHINFER_JIT_DIR} nvcc={os.environ.get('FLASHINFER_NVCC', '-')}", flush=True)
     t0 = time.time()
@@ -157,6 +157,7 @@ def main():
             out["logits_long"] = ll
         torch.save(out, args.out)
         print(f"[fi] wrote {args.out}", flush=True)
+    flashinfer_pass.runtime_report()
     sys.stdout.flush()
     os._exit(0)  # SGLang's background threads can hang interpreter shutdown
 
