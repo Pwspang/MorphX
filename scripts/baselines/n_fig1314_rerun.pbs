@@ -7,8 +7,10 @@
 # Sm80 mycutlass fp16 + pass-built FA2 setup. MorphX with per-grid profiling and each row's
 # default split (paper's A100 hints scaled to 132 SMs: 76 -> 93, 88 -> 108). 60 s per point.
 #   cd ~/scratch/morphx/trackFI && qsub -v TABLE=Figure13,LEN=in-2048-out-256 <this file>
-# SMS_EXTRA adds MorphX env, e.g. SMS_EXTRA=MORPHX_SHORT_BYPASS_TOTAL=1 so the non-persistent
-# FA3 prefill is managed instead of short-bypassed (docs/HANDOFF.md, "FA3 through the pass").
+# SMS_EXTRA adds MorphX env. On sm90 the runtime's short-kernel default is 35 us whole-kernel
+# (MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=35), so the non-persistent FA3 prefill is
+# managed; SMS_EXTRA="MORPHX_SHORT_BYPASS_TOTAL=0 MORPHX_SHORT_KERNEL_US=50" gives the paper's
+# 50 us first-wave rule (docs/HANDOFF.md, "FA3 through the pass").
 # MORPHX_SGLANG_ATTENTION=fa3 (qsub -v, with VARIANTS="baseline stream"): stock SGLang's Hopper
 # attention (sgl-kernel FA3 for prefill and decode, prebuilt), as a reference; GEMMs unchanged.
 # Every step under a timeout; log tee'd live to $OUT/job-<id>.log.

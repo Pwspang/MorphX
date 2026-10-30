@@ -102,8 +102,8 @@ if [[ " $PARTS " == *" steps "* ]]; then
   run none
   for s in nosplit split108; do
     e="SMSCHED_SPLIT_HINT=108"; [[ $s == nosplit ]] && e="$e MORPHX_CI_THRESHOLD=2"
-    run "wave50-$s" $MX $e
-    run "total50-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1
+    run "wave50-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=0 MORPHX_SHORT_KERNEL_US=50
+    run "total50-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=50
     run "totalT-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=$T
   done
   for t in wave50-nosplit totalT-nosplit totalT-split108; do $CHECK --compare "$OUT/st-none.pt" "$OUT/st-$t.pt" | grep greedy; done

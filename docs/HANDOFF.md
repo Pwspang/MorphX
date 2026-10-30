@@ -585,8 +585,11 @@ this stack yet; nothing was run on nscc2b (down).
   - MorphX at 35 µs is behind stream at 28/30 points (4–40%).
   - Stream with high-priority decode (`MORPHX_DECODE_STREAM_PRIORITY=-5`) is the best series,
     up to 47% faster than stream.
-- **Defaults are unchanged** (50 µs, first wave). Turning on the tuned threshold made MorphX
-  slower in Fig 13/14.
+- **Default since 2026-10-30: 35 µs whole-kernel on sm90+** (`cuda-llm.cpp`, chosen per GPU in
+  `getNrSM()`; before sm90 it stays 50 µs first wave). Env vars still override; the paper's rule
+  on Hopper is `MORPHX_SHORT_BYPASS_TOTAL=0 MORPHX_SHORT_KERNEL_US=50`. In Fig 13/14 the 35 µs
+  setting made MorphX slower than the 50 µs rule (row 18 in `docs/pd-investigation/README.md`).
+  `cuda.cpp` (Fig 10–12, 15, 16) still has its fixed 50 µs first-wave check.
 
 ### Backlog
 

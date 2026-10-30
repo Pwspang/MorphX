@@ -255,6 +255,12 @@ int llm_trace_limit;
 std::atomic<int> llm_trace_prints{0};
 std::unordered_map<std::string, int> llm_trace_seen;
 
+int short_bypass_total = -1;  // MORPHX_SHORT_BYPASS_TOTAL, see generateProfileResult
+// MORPHX_SHORT_KERNEL_US: kernels whose profiled time (first wave, or whole-kernel
+// estimate with MORPHX_SHORT_BYPASS_TOTAL=1) is below this run unmanaged. Unset (-1):
+// set per GPU in getNrSM(), 35 us whole-kernel on sm90+, 50 us first wave before.
+float short_kernel_us = -1.0f;
+
 int gNrSM;
 inline int getNrSM() {
     if(gNrSM == 0) {
@@ -264,6 +270,12 @@ inline int getNrSM() {
         if(split_hint == 0) { // SMSCHED_SPLIT_HINT unset
             split_hint = scaleSplitHint(60, gNrSM);
         }
+        // Short-kernel bypass defaults. Hopper's kernels mostly have first waves under
+        // 50 us, so the paper's rule manages ~6% of GPU time there; judging the
+        // whole-kernel estimate at 35 us manages 73-87% (census job 196378).
+        bool hopper = prop.major >= 9;
+        if(short_bypass_total < 0) short_bypass_total = hopper ? 1 : 0;
+        if(short_kernel_us < 0) short_kernel_us = hopper ? 35.0f : 50.0f;
     }
     return gNrSM;
 }
@@ -292,10 +304,6 @@ std::unordered_map<const char *, std::atomic<float>> gWaveTime;
 // the short-kernel check share it, and hasPattern() on it still matches the name.
 int profile_per_grid = 0;
 int profile_grid_max = 6;
-int short_bypass_total = 0;  // MORPHX_SHORT_BYPASS_TOTAL, see generateProfileResult
-// MORPHX_SHORT_KERNEL_US: kernels whose profiled time (first wave, or whole-kernel
-// estimate with MORPHX_SHORT_BYPASS_TOTAL=1) is below this run unmanaged. Default 50 us.
-float short_kernel_us = 50.0f;
 std::unordered_map<const char *, std::array<const char *, 33>> gGridKeys; // launch thread only
 std::unordered_map<const char *, KernelStats*> gKernelStats;              // launch thread only
 
@@ -421,13 +429,14 @@ void generateProfileResult(KernelInfo *info, std::vector<int> &profileWaves, std
     }
     float tm = profileResult[0].second;
     float t0 = profileResult.back().second;
-    // The short-kernel bypass (MORPHX_SHORT_KERNEL_US, default 50) compares this value. Default: the first profile
-    // wave's time. MORPHX_SHORT_BYPASS_TOTAL=1: that wave scaled to the whole grid,
+    // The short-kernel bypass (MORPHX_SHORT_KERNEL_US) compares this value. Before sm90: the first profile
+    // wave's time. MORPHX_SHORT_BYPASS_TOTAL=1 (sm90+ default): that wave scaled to the whole grid,
     // i.e. the kernel's estimated run time; kernels made of many short blocks (the
     // non-persistent FA3 prefill: ~16 us per 132-block wave, ~300 us per launch) are
     // then managed instead of bypassed.
     float waveUs = tm / 1000.0;
-    if(short_bypass_total && profileWaves[0] > 0)
+    getNrSM();  // resolves the short-kernel defaults
+    if(short_bypass_total > 0 && profileWaves[0] > 0)
         waveUs *= (float)info->gridSize / (float)profileWaves[0];
     gWaveTime[info->name].store(waveUs);
     // legacy (A100 default): last wave vs the first wave scaled up to all SMs.
@@ -933,7 +942,7 @@ static void ld_init(void) {
     llm_trace_prints.store(0);
     profile_per_grid = getenv_int("MORPHX_PROFILE_PER_GRID", 0);
     profile_grid_max = std::max(1, std::min(33, getenv_int("MORPHX_PROFILE_GRID_MAX", 6)));
-    short_bypass_total = getenv_int("MORPHX_SHORT_BYPASS_TOTAL", 0);
+    short_bypass_total = getenv_int("MORPHX_SHORT_BYPASS_TOTAL", -1);
     if(const char *v = std::getenv("MORPHX_SHORT_KERNEL_US")) short_kernel_us = std::strtof(v, nullptr);
     // Profiles are inserted while the agent thread runs; keep the maps from rehashing.
     gCI.reserve(4096);

@@ -102,10 +102,11 @@ verification are in ../HOPPER_PD_ANALYSIS.md, under *Correction and fix*.
   native (sm90 + FA3) MorphX.
 - Attention follows stock SGLang's FlashInfer choices: FA3 for ragged prefill, FA2 for paged
   prefill and decode.
-- Caveat: with sm90 GEMMs most kernels fall under MorphX's 50 µs short-kernel cutoff (default,
-  first-wave rule), so MorphX manages few launches. The tuned setting
-  `MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=35` manages 73–87% of GPU time but made
-  MorphX slower in Fig 13/14 (row 18), so it stays opt-in.
+- Short-kernel threshold: under the paper's 50 µs first-wave rule most sm90 kernels are
+  bypassed (~6% of GPU time managed). Since 2026-10-30 the LLM runtime (`cuda-llm.cpp`)
+  defaults on sm90+ to 35 µs judged on whole-kernel time, which manages 73–87%. In Fig 13/14
+  this made MorphX slower than the 50 µs rule (row 18). `MORPHX_SHORT_BYPASS_TOTAL=0
+  MORPHX_SHORT_KERNEL_US=50` restores the paper's rule.
 
 - **Overload test (Sm80, H200 and A100):** run stream vs MorphX at loads matching the paper's (stream TTFT in seconds, 50–60% of requests served), 3 repeats × 180 s, ~1.5–2 GPU-hours per GPU. The paper's wins are all in that regime; our runs so far were lighter.
 
