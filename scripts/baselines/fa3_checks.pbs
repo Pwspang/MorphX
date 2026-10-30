@@ -1,0 +1,123 @@
+#!/bin/bash
+# Pass-built FA3 (MORPHX_FLASHINFER_FA3, branch fa3-pass): the M1-M4 checks of docs/HANDOFF.md
+# ("FA3 through the pass") in one job. hpcc defaults (gpu_free, memcpy runtime); on nscc2b
+# use -P 12004493 -q normal and source env-nscc2b.sh (ENV_SCRIPT=scripts/ae/env-nscc2b.sh).
+#   cd <checkout> && qsub -v PARTS="build kernels tokens bench steps" scripts/baselines/fa3_checks.pbs
+# Parts:
+#   build    pass, runtime/build (cuda.cpp) + runtime/build-llm (cuda-llm.cpp), microbench/build-model-sm90
+#   kernels  fi_kernel_test: stock nvcc vs pass-built FA3, then pass FA3 under the LLM runtime (bitwise)
+#   tokens   Qwen3-8B greedy tokens/logits: stock FA3 vs pass FA3 (no runtime, runtime, runtime all on 66 SMs)
+#   bench    fi_fa3_bench: ragged prefill, stock FA3/FA2, pass FA2/FA3/FA3-persistent, alone and under
+#            MorphX (runtime/build, whitelisted target) on 132 SMs and confined to 108 / 66 SMs
+#   steps    check_flashinfer_pass --bench step times: Sm80+FA2, sm90+FA3 stock/pass, with the runtime
+#            (no split, split 108; MORPHX_SHORT_BYPASS_TOTAL=1 so the FA3 prefill is managed)
+# SM80 = an existing Sm80 libmycutlass build dir (for the legacy rows of "steps").
+#PBS -N fa3-checks
+#PBS -P fs_ccds_dmitrii.ustiugov
+#PBS -q gpu_free
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/fa3/checks-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job.log") 2>&1
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+# nscc2b: keep the default modules (gcc-native/14; a purge falls back to the system gcc 11, whose
+# <atomic> clashes with the runtime's C11 atomics) and load cuda on its own line (Lmod drops a whole
+# `module load` line when one module, e.g. gnu/gcc-12.3, doesn't exist there).
+if [[ "${ENV_SCRIPT:-}" == *env-nscc2b.sh ]]; then module load cuda/13.0; module load cmake/4.3.4  # system cmake 3.x cannot drive clang as the CUDA compiler
+else module purge; module load cuda/13.0; module load gnu/gcc-12.3 2>/dev/null || true; fi
+[[ -f /opt/rh/gcc-toolset-13/enable ]] && source /opt/rh/gcc-toolset-13/enable  # SGLang's tvm-ffi JIT
+source "${MORPHX_VENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
+cd "$R"
+source "${ENV_SCRIPT:-scripts/ae/env-h100.sh}"
+export MORPHX_PYTHON="$(command -v python)" MAX_JOBS=${NCPUS:-12} MORPHX_LLM_GEMM=mycutlass
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+PARTS=${PARTS:-"kernels tokens bench steps"}
+SM80=${SM80:-$HOME/MorphX/microbench/build-model}
+SM90=$R/microbench/build-model-sm90
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+STOCK_WS=FLASHINFER_WORKSPACE_BASE=$R/smsched-pass/fi-ws-stock   # stock nvcc JIT, not ~/.cache
+FA3="MORPHX_FLASHINFER_PASS=1 MORPHX_FLASHINFER_FA3=1 MORPHX_LEGACY_SM80_FA2=0"
+LEGACY="MORPHX_FLASHINFER_PASS=1 MORPHX_LEGACY_SM80_FA2=1"
+L=$R/runtime/build-llm; C=$R/runtime/build
+LLMRT="NEUTRINO_HOOK_DRIVER=$L/libcuda.so LD_PRELOAD=$L/libcuda.so:$L/libpreload.so SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1 SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0"
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+KT="python scripts/sglang/fi_kernel_test.py"
+echo "== $(hostname) job=${PBS_JOBID:-} $(date +%T) head=$(git log --oneline -1 | cut -c1-60) parts=$PARTS sync=$MORPHX_SYNC_BACKEND"
+
+if [[ " $PARTS " == *" build "* ]]; then
+  step() { local n=$1 t=$2; shift 2; echo "-- build $n $(date +%T)"
+    timeout -k 10 "$t" "$@" > "$OUT/build-$n.log" 2>&1 || { echo "FAILED $n"; grep error "$OUT/build-$n.log" | head; exit 1; }; }
+  step pass-cfg 120 cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR="$MORPHX_LLVM_ROOT/lib/cmake/llvm"
+  step pass 300 cmake --build smsched-pass/build -j "$MAX_JOBS"
+  for v in "build:-DUSE_CUDA_LLM=OFF" "build-llm:-DUSE_CUDA_LLM=ON"; do
+    step "rt-${v%%:*}-cfg" 120 cmake -S runtime -B "runtime/${v%%:*}" "${v#*:}" -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" ${MORPHX_GDRCOPY_ROOT:+-DMORPHX_GDRCOPY_ROOT=$MORPHX_GDRCOPY_ROOT}
+    step "rt-${v%%:*}" 600 cmake --build "runtime/${v%%:*}" -j "$MAX_JOBS"
+  done
+  step sm90-cfg 300 cmake -S microbench -B "$SM90" -DSMSCHED_ENABLE_PASS=ON -DSMSCHED_LLVM_ROOT="$MORPHX_LLVM_ROOT" \
+    -DMORPHX_MYCUTLASS_ARCH=sm90 -DMORPHX_CUDA_ARCH=90a -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND"
+  step sm90 1500 cmake --build "$SM90" --target mycutlass -j "$MAX_JOBS"
+  echo "patched kernels in sm90 lib: $(cuobjdump -symbols "$SM90/libmycutlass.so" | grep -c '_pk$')"
+fi
+
+if [[ " $PARTS " == *" kernels "* ]]; then
+  echo "== kernels $(date +%T)"
+  env $STOCK_WS timeout -k 10 900 $KT --out "$OUT/kt-stock.pt" 2>&1 | grep -E "^\[fi-test\] (config|ragged|PASS|FAIL)"
+  env $FA3 timeout -k 10 1200 $KT --out "$OUT/kt-pass-fa3.pt" 2>&1 | grep -E "^\[fi-(test|err)\]"
+  $KT --compare "$OUT/kt-stock.pt" "$OUT/kt-pass-fa3.pt"
+  env $FA3 $LLMRT timeout -k 10 300 $KT --out "$OUT/kt-pass-fa3-rt.pt" > "$OUT/kt-pass-fa3-rt.log" 2>&1; echo "-- under runtime rc=$?"
+  $KT --compare "$OUT/kt-pass-fa3.pt" "$OUT/kt-pass-fa3-rt.pt"
+fi
+
+if [[ " $PARTS " == *" tokens "* ]]; then
+  echo "== tokens $(date +%T)"
+  env MYCUTLASS_LIB_DIR=$SM90 $STOCK_WS timeout -k 10 900 $CHECK --out "$OUT/tok-stock.pt" > "$OUT/tok-stock.log" 2>&1; echo "-- stock rc=$?"
+  env MYCUTLASS_LIB_DIR=$SM90 $FA3 timeout -k 10 900 $CHECK --out "$OUT/tok-pass.pt" > "$OUT/tok-pass.log" 2>&1; echo "-- pass rc=$?"
+  for c in "rt:" "rt66:SMSCHED_SPLIT_HINT=66 MORPHX_CI_THRESHOLD=0 MORPHX_CI_SATURATE=0"; do
+    env MYCUTLASS_LIB_DIR=$SM90 $FA3 $LLMRT MORPHX_SHORT_BYPASS_TOTAL=1 ${c#*:} timeout -k 10 600 $CHECK --out "$OUT/tok-${c%%:*}.pt" > "$OUT/tok-${c%%:*}.log" 2>&1
+    echo "-- ${c%%:*} rc=$? $(grep -h 'MorphX-profile\] summary' "$OUT/tok-${c%%:*}.log" | sed 's/.*summary //')"
+  done
+  for t in pass rt rt66; do $CHECK --compare "$OUT/tok-stock.pt" "$OUT/tok-$t.pt" | grep -E "greedy|logits"; done
+fi
+
+if [[ " $PARTS " == *" bench "* ]]; then
+  echo "== bench $(date +%T)"
+  J=$OUT/bench.jsonl; B="python scripts/sglang/fi_fa3_bench.py --shapes ${SHAPES:-4x2048,1x8192,16x512,1x1024} --iters 30 --out $J"
+  one() {  # tag backend target-pattern|- env...
+    local tag=$1 be=$2 pat=$3; shift 3
+    timeout -k 5 300 env "$@" $B --backend "$be" --tag "$tag-alone" > "$OUT/b-$tag-alone.log" 2>&1; echo "-- $tag alone rc=$?"; grep "^\[bench\] " "$OUT/b-$tag-alone.log" | tail -n +2
+    [[ $pat == - ]] && return
+    local RT="NEUTRINO_HOOK_DRIVER=$C/libcuda.so LD_PRELOAD=$C/libcuda.so:$C/libpreload.so SMSCHED_TARGET_PATTERNS=$pat SMSCHED_ONLY_WHITELIST=1"
+    timeout -k 5 300 env "$@" $RT $B --backend "$be" --tag "$tag-mx132" > "$OUT/b-$tag-mx132.log" 2>&1; echo "-- $tag MorphX 132 rc=$?"; grep "^\[bench\] " "$OUT/b-$tag-mx132.log" | tail -n +2
+    for s in 108 66; do
+      timeout -k 5 300 env "$@" $RT SMSCHED_SPLIT_HINT=$s $B --backend "$be" --two-streams --tag "$tag-mx$s" > "$OUT/b-$tag-mx$s.log" 2>&1
+      echo "-- $tag MorphX confined $s rc=$?"; grep "^\[bench\] " "$OUT/b-$tag-mx$s.log" | tail -n +2
+    done
+  }
+  one stock-fa3 fa3 - $STOCK_WS
+  one stock-fa2 fa2 - $STOCK_WS
+  one pass-fa2 fa2 BatchPrefillWithRaggedKVCacheKernel $LEGACY
+  one pass-fa3 fa3 PrefillWithKVCacheKernel $FA3
+  one pass-fa3p fa3 PrefillWithKVCacheKernel $FA3 MORPHX_FA3_PERSISTENT=1
+fi
+
+if [[ " $PARTS " == *" steps "* ]]; then
+  echo "== steps $(date +%T)"
+  run() { local tag=$1; shift
+    env "$@" timeout -k 10 600 $CHECK --bench --out "$OUT/st-$tag.pt" > "$OUT/st-$tag.log" 2>&1
+    echo "-- $tag rc=$? $(grep '^\[bench\]' "$OUT/st-$tag.log" | sed -E 's/\(n=.*//' | tr '\n' ' ')"
+    grep -h "MorphX-profile\] summary" "$OUT/st-$tag.log" | sed 's/.*summary /   /'
+    grep -h "MorphX-profile\] kernel" "$OUT/st-$tag.log" | grep -E "PrefillWithKVCache|RaggedKVCache" | sed -E 's/.*kernel /   /; s/name=(.{50}).*/name=\1/'
+  }
+  run sm80-fa2 MYCUTLASS_LIB_DIR=$SM80 $LEGACY
+  run sm90-stockfa3 MYCUTLASS_LIB_DIR=$SM90 $STOCK_WS
+  run sm90-fa3 MYCUTLASS_LIB_DIR=$SM90 $FA3
+  run sm90-fa3-rt-nosplit MYCUTLASS_LIB_DIR=$SM90 $FA3 $LLMRT MORPHX_SHORT_BYPASS_TOTAL=1 SMSCHED_SPLIT_HINT=108 MORPHX_CI_THRESHOLD=2
+  run sm90-fa3-rt-split108 MYCUTLASS_LIB_DIR=$SM90 $FA3 $LLMRT MORPHX_SHORT_BYPASS_TOTAL=1 SMSCHED_SPLIT_HINT=108
+  run sm80-fa2-rt-split108 MYCUTLASS_LIB_DIR=$SM80 $LEGACY $LLMRT SMSCHED_SPLIT_HINT=108
+  for t in sm90-fa3 sm90-fa3-rt-nosplit sm90-fa3-rt-split108; do $CHECK --compare "$OUT/st-sm90-stockfa3.pt" "$OUT/st-$t.pt" | grep greedy; done
+fi
+echo "== done $(date +%T)"

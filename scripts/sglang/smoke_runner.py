@@ -147,6 +147,8 @@ def build_origin(name):
         return "CuTe DSL (Python -> MLIR JIT)"
     if "(" not in name and "::" not in name and not name.startswith("void"):
         return "Triton JIT"
+    if "flashinfer" in lk and os.environ.get("MORPHX_FLASHINFER_PASS", "0") == "1":
+        return "FlashInfer CUDA C++ (clang + pass, MORPHX_FLASHINFER_PASS=1)"
     return "CUDA C++ source (rebuildable with clang + pass)"
 
 

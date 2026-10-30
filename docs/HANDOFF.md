@@ -1,5 +1,16 @@
 # MorphX H100/H200 port: handoff
 
+> **Default change (2026-10-28, branch `fa3-pass`): the LLM now runs sm90 mycutlass GEMMs
+> + pass-built FA3.** `scripts/ae/env-h100.sh` (and so `env-nscc2b.sh`) defaults
+> `MYCUTLASS_LIB_DIR` to `<repo>/microbench/build-model-sm90` (build it: `build-nscc2b.sh`
+> step `microbench`, `run_all.py`, or `fa3_checks.pbs` part `build`), and
+> `MORPHX_FLASHINFER_PASS=1` no longer pins FlashInfer to FA2: SGLang's ragged prefill runs
+> pass-built non-persistent FA3 (paged prefill and decode stay FA2, as in stock SGLang).
+> **Legacy setup** (all H200 results before this date: Sm80 mycutlass + pass-built FA2):
+> `MORPHX_LEGACY_SM80_FA2=1` (`qsub -v MORPHX_LEGACY_SM80_FA2=1 ...` for the job scripts).
+> Under the runtime, the FA3 prefill is only managed with `MORPHX_SHORT_BYPASS_TOTAL=1`
+> (opt-in, not default; see "FA3 through the pass" in section 9).
+
 Snapshot: 2026-10-26. Everything is stopped: no PBS jobs, transfers, agents or
 watchers are running for MorphX on hpcc or nscc2b. The full engineering record
 is [docs/h100-port-plan.md](h100-port-plan.md); this file says where things are
@@ -253,6 +264,329 @@ The argument, the evidence behind each reason and the experiments still needed a
   bypassed). Only the 4096-token prefill GEMM reaches CI ≥ 0.9; the rest are 0.17–0.66. No
   attention or other memory-intensive non-GEMM kernel is controllable.
 - §6: closed-source kernels can't be transformed; cuBLAS → CUTLASS is the stated workaround.
+
+### Pass-built FlashInfer (branch `h100-port-flashinfer-pass`, 2026-10-27, nscc2b)
+
+`MORPHX_FLASHINFER_PASS=1` (default off) builds SGLang's FlashInfer attention with
+clang 23 + the SMSched pass, so prefill/decode attention gets `_pk` clones.
+- How: FlashInfer 0.6.8.post1 JIT-builds its attention ops with ninja + nvcc into
+  `~/.cache/flashinfer/<ver>/90a/cached_ops` (`batch_prefill_*` = FA2 ragged/paged
+  + merge-states, `*_sm90` = FA3, `cascade`); no jit-cache/AOT package is installed and
+  `flashinfer-cubin` only holds trtllm-gen cubins SGLang doesn't use here.
+  `scripts/sglang/flashinfer_pass.py` (called by `runner.py` before sglang imports
+  flashinfer) sets `FLASHINFER_NVCC=scripts/sglang/fi_clang_nvcc.py` and a separate
+  workspace (`smsched-pass/build/flashinfer-ws`), refuses a jit-cache package, and pins
+  every prefill/decode wrapper to FA2 (SGLang's ragged prefill otherwise picks Hopper
+  FA3: warp-specialized/TMA/setmaxnreg, not supported by the pass; the A100 ran FA2).
+  `fi_clang_nvcc.py` translates nvcc flags to clang CUDA mode (same flags as the
+  microbench pass build, `sm_90a`, `-use_fast_math` → ftz + approx transcendentals,
+  not `-ffast-math`), force-includes `fi_clang_compat.h` (host `::min/::max`, which
+  nvcc provides) and compiles against a patched copy of FlashInfer's `include/` that
+  adds the `template` disambiguator on 29 dependent member-template calls. The pass
+  gets `-smsched-smem-handoff-barriers` (new, opt-in; Track S's barriers around the
+  dynamic-smem word-0 block-id hand-off, since FlashInfer writes smem from its first
+  instructions); mycutlass builds are unchanged. Cold JIT build ~10 s (24 CPUs).
+- Correctness (Qwen3-8B fp16, mycutlass, 8 prompts incl. two ~3k-token ones, 48
+  tokens; job 192350): pass-built FA2 vs stock nvcc FA2: logits bitwise identical,
+  384/384 tokens; + MorphX runtime (gdr): bitwise identical; vs stock default (FA3
+  ragged prefill): 384/384 tokens identical, logits max |diff| 0.047. Model-free kernel
+  test (`fi_kernel_test.py`, job 192309): ragged / paged-extend / tensor-core decode with
+  split-KV bitwise identical to stock FA2, with and without the runtime. Under the
+  runtime all FlashInfer kernels launch as `_pk` (140 clones in 2 modules); only
+  `create_flashinfer_kv_indices_triton` (Triton) and CuTe-DSL RMSNorm stay unpatched.
+- Step times, no runtime (4 x 2048-token prefill / decode batch 16, ctx 2048):
+  stock (FA3 ragged) 296.8 / 9.44 ms, stock FA2 299.5 / 9.71 ms, pass-built FA2
+  302.1 / 9.63 ms: +0.9% prefill vs stock FA2, +1.8% vs stock; decode within noise.
+  In the Fig 13 census run the FA2 ragged prefill averages 657 µs vs FA3 321 µs
+  per launch (11.4% vs 5.9% of GPU time), the decode kernel 445 vs 433 µs (+3%).
+- Fig 13 census (in-4096-out-128 at 18 req/s, 40 s, `n_fi_pass_check.pbs` part
+  census; nsys on the stream variant, MorphX profile log at split 108):
+
+  | | stock FlashInfer | pass-built FlashInfer |
+  |---|---:|---:|
+  | pass-built kernels launched | 7 (mycutlass) | 10 (+ ragged prefill, paged decode, merge-states) |
+  | first wave >= 50 µs (managed) | 7 | 8 (+ ragged prefill 162 µs, CI 1.0) |
+  | GPU time in pass-built kernels | 79.7% | **94.1%** |
+  | GPU time in managed kernels | 78.3% | **84.9%** (paper: 5 kernels, 85%) |
+  | GPU time in CI kernels (on [0, split)) | 37.4% | 46.5% |
+
+  Gap: the decode attention kernel (paged FA2, 7.8% of GPU time, 445 µs/launch) is
+  pass-built but **short-bypassed**: the runtime profiles each kernel name once, at
+  its first launch, which is a small warm-up batch (first wave 19 µs < 50 µs). Profiling
+  per (name, grid size) or skipping warm-up launches would make it a managed
+  memory-intensive kernel (legacy CI 0.41), the pairing the paper describes.
+  Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/check-{192309,192350}`.
+- **Per-grid profiling fix** (`MORPHX_PROFILE_PER_GRID=1`, default off, `cuda-llm.cpp`):
+  profile/CI/short-bypass key = (kernel name, power-of-two grid bucket), interned so
+  `gCI`, `gWaveTime` and the 50 µs check share it; at most `MORPHX_PROFILE_GRID_MAX`
+  (default 6) buckets profiled per name (Fig 13: 53 names, 121 keys). Managed launches
+  cache their CI entry so the agent thread never reads the map. `SMSCHED_PROFILE_LOG=1`
+  now also prints per-kernel counters (`[MorphX-profile] kernel launches=...`).
+  Greedy tokens under the runtime stay identical (384/384) with and without it.
+- **Fig 13 (job 192386, asp2b-gpu092, gdr, 60 s, split 108, pass-built FlashInfer FA2 +
+  mycutlass fp16)**, avg / p99 s per token, TTFT avg s:
+
+  | config | stream | MorphX | MorphX + per-grid | old stock-FlashInfer (FA3) refs |
+  |---|---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.117 / 0.151 / 0.176 | 0.209 / 0.234 / 0.201 | 0.193 / 0.204 / 0.208 | stream 0.067, MorphX 0.149, no-split 0.094 |
+  | in-4096-out-256-rps-6 | 0.108 / 0.126 / 0.531 | 0.128 / 0.136 / 0.199 | 0.120 / 0.130 / 0.312 | stream 0.099, no-split 0.106 |
+  | in-2048-out-256-rps-9 | 0.048 / 0.059 / 0.094 | 0.067 / 0.082 / 1.055 | 0.067 / 0.078 / 0.572 | stream 0.041, MorphX 0.053 |
+
+  Decode attention (paged FA2 kernel) launches, default → per-grid:
+  4096/128: managed 0 → 7955 of 13932 (moved to [108, 132) 7061, short-bypassed 5974);
+  4096/256: 0 → 13283 of 18792 (moved 5427); 2048/256: 0 → 27935 of 35280 (moved 11419).
+  Never CI-limited (it is memory-bound). Summaries (managed / CI-limited / moved):
+  4096/128 84632 / 25940 / 13988 → 99377 / 42984 / 37094; 4096/256 94455 / 28539 /
+  11332 → 119248 / 39321 / 29314; 2048/256 197602 / 0 / 0 → 225592 / 54447 / 58942
+  (per-grid also re-profiles the large-grid prefill GEMMs, which now count as CI at
+  2048 tokens). Per-grid helps MorphX by 0–8% avg and 5–13% p99 but MorphX stays
+  10–65% behind stream. Every variant is slower than with stock FlashInfer: stream
+  +75% at 4096/128. Likely the FA3 → FA2 pin (the ragged prefill kernel is ~2x slower,
+  321 → 657 µs per launch; the pass build itself was +0.9% per prefill step), not
+  confirmed: a stream run with `MORPHX_FLASHINFER_FA2=1` (stock nvcc FA2) would separate
+  the two. Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-192386`.
+- **FlashInfer cost + sm90 mycutlass (branch `h100-port-fi-sm90`, job 192442, asp2b-gpu092,
+  all on one node, 60 s, `scripts/baselines/n_fig13_fi_sm90.pbs`)**. avg / p99 s per token /
+  TTFT avg s. Part 1, stream only, Sm80 mycutlass:
+
+  | config | stock nvcc (FA3 ragged) | stock nvcc FA2 | pass-built FA2 |
+  |---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.073 / 0.108 / 0.164 | 0.097 / 0.130 / 0.171 | 0.117 / 0.151 / 0.176 |
+  | in-4096-out-256-rps-6 | 0.099 / 0.112 / 0.471 | 0.102 / 0.117 / 0.569 | 0.103 / 0.120 / 0.591 |
+  | in-2048-out-256-rps-9 | 0.044 / 0.056 / 0.090 | 0.046 / 0.058 / 0.092 | 0.047 / 0.058 / 0.093 |
+
+  Stock numbers match the old refs (0.067 / 0.099 / 0.041) within node variance. FA3 → FA2
+  costs +33% and the pass build another +21% at 4096/128 (the most prefill-bound,
+  queue-amplified point); at the other two points both are 2–4%.
+  Part 2, pass-built FA2 + **sm90 mycutlass** (CUTLASS 3 WGMMA/TMA, `microbench/build-model-sm90`,
+  12 `_pk` kernels, the compile line carries `-mllvm -smsched-smem-handoff-barriers`); greedy
+  tokens and logits identical to the Sm80 library and under the runtime (per-grid on):
+
+  | config | stream | MorphX + per-grid | MorphX |
+  |---|---|---|---|
+  | in-4096-out-128-rps-6 | 0.034 / 0.060 / 0.135 | 0.037 / 0.064 / 0.170 | 0.037 / 0.063 / 0.172 |
+  | in-4096-out-256-rps-6 | 0.054 / 0.067 / 0.142 | 0.063 / 0.082 / 0.151 | 0.061 / 0.077 / 0.169 |
+  | in-2048-out-256-rps-9 | 0.017 / 0.024 / 0.062 | 0.020 / 0.028 / 0.080 | 0.018 / 0.025 / 0.065 |
+
+  sm90 GEMMs cut stream latency 2.7–3.4x vs Sm80 (pass FA2), and MorphX is now 9–18% behind
+  stream (was 40–80%) because most sm90 GEMMs have first waves < 50 µs and are short-bypassed
+  (1–3 GEMM kernels managed). Summaries (managed / CI-limited / moved / full GPU), per-grid vs
+  default: 4096/128 22678 / 11339 / 0 / 11339 both; 4096/256 95251 / 11339 / 19542 / 64370 vs
+  46833 / 11303 / 7289 / 28241; 2048/256 80724 / 35350 / 2173 / 43201 vs 55078 / 0 / 0 / 55078.
+  Decode attention (paged FA2) managed with per-grid: 4096/128 0 of 73332 (all small grids),
+  4096/256 24191 of 41508 (moved 7048), 2048/256 3311 of 116928 (moved 725); default: 0 everywhere.
+  The ragged prefill kernel is managed and CI-limited on every launch at 4096 tokens.
+  Logs: `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/fig13-sm90-192442`.
+- **Sm80 vs sm90 library check (job 192556, `mycutlass_libcheck.py`)**: the two processes
+  map different files (Sm80 `MorphX/microbench/build-model/libmycutlass.so` 4.99 MB sha1
+  e1df95db…, sm90 `trackFI/microbench/build-model-sm90/libmycutlass.so` 1.46 MB sha1
+  3c6eb1b4…), yet `y = x W^T` is bitwise identical on all 24 Qwen3-8B shapes (T = 1…8192,
+  incl. lm_head 151936 x 2048), and both have the same max |err| vs fp32 as cuBLAS (0.002–
+  0.004); `check_mycutlass.py` gives identical per-layer error ratios (1.01) and e2e numbers
+  for both. Explanation: both kernels accumulate fp16 products in fp32 in the same
+  sequential k = 16 tensor-core steps over K (no split-K, one CTA per output tile), so the
+  arithmetic, not the code, is the same; the kernels differ (Sm80 `cutlass::Kernel` mma.sync
+  vs CUTLASS 3 `device_kernel<GemmUniversal>` WGMMA under the runtime) and sm90 is ~3x faster.
+- **Rate sweep to saturation (sm90 mycutlass + pass FA2, stream vs MorphX + per-grid, 60 s,
+  `n_fig13_sweep_sm90.pbs`)**, avg / p99 s per token / TTFT avg s (served / generated requests):
+
+  in-2048-out-256 (job 192556, asp2b-gpu182):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 6 | 0.012 / 0.025 / 0.058 (295/317) | 0.012 / 0.015 / 0.069 (295/317) |
+  | 12 | 0.038 / 0.047 / 0.090 (526/683) | 0.044 / 0.051 / 0.278 (516/683) |
+  | 18 | 0.066 / 0.104 / 5.81 (558/1049) | 0.070 / 0.101 / 6.03 (521/1049) |
+
+  in-4096-out-256 (job 192558, asp2b-gpu092):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 5 | 0.027 / 0.038 / 0.135 (248/263) | 0.029 / 0.040 / 0.151 (244/263) |
+  | 7.5 | 0.177 / 0.204 / 0.136 (50/399) | **0.109 / 0.161** / 0.318 (118/399) |
+
+  in-4096-out-128 (job 192557, asp2b-gpu131, stopped early): 5 rps stream 0.172 / 0.404 /
+  0.131 (9/263), MorphX 0.080 / 0.366 / 0.156 (48/263); 7.5 rps stream 0.149 / 0.214 / 0.142
+  (177/399), MorphX 0.268 / 0.332 / 0.174 (116/399); 10 rps stream 0.126 / 0.429 / 0.132.
+  Non-monotonic: near the knee the prefill-thread design is bistable (back-to-back prefills
+  starve decode, few requests finish, avg s/token is over finished requests only). Reruns
+  on two other nodes (192658 gpu096, 192663 gpu080) are monotonic and agree, so gpu131 was
+  the problem (served fraction in brackets):
+
+  | rps | stream | MorphX + per-grid |
+  |---|---|---|
+  | 5 | 0.022 / 0.040–0.041 (0.99) | 0.023–0.035 / 0.042–0.099 (0.99) |
+  | 6 | 0.032–0.033 / 0.056–0.058 (0.93) | 0.035–0.039 / 0.061–0.067 (0.93) |
+  | 7.5 | 0.110–0.115 / 0.137–0.142 (0.72–0.73) | 0.123 / 0.148–0.149 (0.71) |
+
+  Extra points: in-2048-out-256 rps 15 (192659): stream 0.056 / 0.078 / TTFT 3.1 (0.63),
+  MorphX 0.059 / 0.080 / 3.5 (0.60). in-4096-out-256 rps 6 (192661): both collapsed (served
+  fraction 0.03; stream 0.040 / 0.216, MorphX 0.041 / 0.211), so 6 rps is already past the
+  knee there and the 7.5 rps result above is the bistable regime too.
+  Summaries at the highest rates (managed / CI-limited / moved / full GPU): 2048/256 rps 18
+  225373 / 70197 / 56535 / 98641; 4096/256 rps 7.5 51223 / 8927 / 13609 / 28687. Decode
+  attention managed (moved): 2048 rps 6 0 of 184320, rps 12 44063 of 52992 (19189), rps 18
+  43523 of 47412 (18914); 4096/256 rps 5 0 of 84420, rps 7.5 11123 of 18216 (5464).
+  MorphX beats stream only in saturation at 4096/256 (avg -38%, p99 -21%, 2.4x the finished
+  requests, TTFT 2.3x worse) and on p99 at light load (2048 rps 6: 0.015 vs 0.025); at the
+  knee (2048 rps 12) it is +16% avg and 3x TTFT. Logs:
+  `nscc2b:~/scratch/morphx/trackFI/logs/20261027-fi-pass/sweep-<len>-<job>`.
+- Not done: SGLang `jit_kernel` ops (act_and_mul, rope, qknorm, store_kvcache; ~3%)
+  go through tvm-ffi, which hard-codes `$CUDA_HOME/bin/nvcc`; easiest path is a shim
+  CUDA_HOME (symlinked toolkit, `bin/nvcc` → the same wrapper) set only for those
+  builds. CuTe-DSL RMSNorm (1.6%) stays uncontrolled.
+
+### FA3 through the pass (branch `fa3-pass`, 2026-10-28, hpcc, memcpy backend)
+
+FlashInfer's Hopper FA3 prefill now builds with clang + the SMSched pass and runs under
+the MorphX runtime, together with the sm90 mycutlass GEMMs. Dev checkout
+`hpcc:~/morphx/trackFA3`, logs `hpcc:~/morphx/trackFA3/logs/fa3/` (`m1`–`m4`, kernel tests),
+dev jobs 95784 / 95790 (`scripts/baselines/fa3_dev.pbs`, a holder that runs step scripts
+from `devq/`). All checks in one job: `scripts/baselines/fa3_checks.pbs`.
+
+**How to enable.** Default since the second commit on `fa3-pass` (see the note at the top):
+`MORPHX_FLASHINFER_PASS=1` with `env-h100.sh` gives sm90 mycutlass + pass-built FA3. Before
+that commit (and to be explicit): `MORPHX_FLASHINFER_PASS=1 MORPHX_FLASHINFER_FA3=1
+MYCUTLASS_LIB_DIR=<repo>/microbench/build-model-sm90`. Legacy Sm80 + FA2:
+`MORPHX_LEGACY_SM80_FA2=1` (or `MORPHX_FLASHINFER_FA3=0` for FA2 with any library).
+Under the runtime also `MORPHX_SHORT_BYPASS_TOTAL=1`, or the FA3 prefill is short-bypassed
+(below). `MORPHX_FA3_PERSISTENT=1` keeps FlashInfer's persistent scheduler (comparison only).
+Flip check (job 95784 step 070): default `MORPHX_FLASHINFER_PASS=1` → `pass-fa3`, kernels
+bitwise identical to stock nvcc; `MORPHX_LEGACY_SM80_FA2=1` → `pass-fa2` in the old
+workspace, identical to stock FA2 except merge_state (4.9e-4, IEEE div in the FA2 build, as before).
+What SGLang then runs: the ragged prefill (`BatchPrefillWithRaggedKVCacheWrapper`,
+`backend="auto"`) picks FA3 on sm90; SGLang hard-codes `fa2` for its paged prefill
+(extend with a prefix) and decode wrappers, so those stay FA2 (pass-built), as in stock SGLang.
+
+**What was needed** (all in `scripts/sglang/fi_clang_nvcc.py` / `flashinfer_pass.py`, opt-in):
+1. **Persistent scheduler (obstacle 1, confirmed).** FlashInfer 0.6.8.post1 has no
+   non-persistent batch FA3 path (`BatchPrefillPersistentTileScheduler` /
+   `BatchPrefillTileScheduler`, grid = SM count; only single-request prefill uses
+   `SingleTileScheduler`). Fix: macro `MORPHX_FA3_NONPERSISTENT` patched into a separate copy
+   of FlashInfer's headers used only for the `*sm90*` sources: `PrefillSM90Plan` plans one CTA
+   per work tile (its cost heap then gives every CTA exactly one tile), records the CTA count as
+   a 10th `plan_info` element, `FromVector` hands it to the launcher through a `thread_local`,
+   and the launch uses it as the grid. The kernel is unchanged (its tile loop runs once). CUDA
+   graphs are refused in this mode (the grid varies per plan).
+2. **Re-entrant kernel body (new, the real blocker).** First runtime test hung (job 95784 step
+   034, `rc=124`). The persistent build ran (one body per agent) but the non-persistent one hung
+   from the second logical block an agent ran: FA3 leaves hardware named barriers half-arrived at
+   exit (`mma_init()`'s `kQueryEmpty` arrival for the producer, the warp-scheduler token between
+   the two consumer warpgroups). Harmless when the CTA exits; when the pass loops back into the
+   body, the next `mma_init()` lands in the stale phase and the warpgroups deadlock. Fix
+   (`MORPHX_FA3_REENTRANT`, on for every pass build of FA3): at the end of the body the producer
+   does the missing `kQueryEmpty` sync and the consumer warpgroups complete the scheduler-barrier
+   phases (`WarpScheduler::morphx_drain()`), as the next tile would. Any warp-specialized kernel
+   with unbalanced named barriers needs the same treatment before it can go through the pass.
+3. **Register reallocation (obstacle 2): no problem.** ptxas accepts the loop
+   (168 registers, 16 barriers, 48 `SETMAXREG` in the SASS, no "setmaxnreg ignored" warning).
+4. **Dynamic smem word 0 (obstacle 3):** `-smsched-smem-handoff-barriers` covers it; the pass
+   uses FlashInfer's own `extern __shared__` array, so its 1024-byte alignment is unchanged.
+   FA3's named barriers are 1 and 8–14 (CUTLASS adds 8 to user ids), so the pass's barrier 0
+   doesn't collide.
+5. **TMA descriptors (obstacle 4):** cute already sets `__grid_constant__` on the device side;
+   the wrapper defines `CUTE_GRID_CONSTANT`/`CUTLASS_GRID_CONSTANT` for both sides anyway, plus
+   the `PFN_cuTensorMapEncode*_v12000` aliases (CUTLASS sees CUDA 12.4) and three `template` /
+   `typename` disambiguators clang needs in `prefill_sm90.cuh` / `mainloop_mma.cuh`.
+6. **Numerics:** clang's default f32 div/sqrt are IEEE; nvcc `-use_fast_math` also means
+   `-prec-div=false -prec-sqrt=false`. With `-mllvm -nvptx-prec-divf32=1 -mllvm
+   -nvptx-prec-sqrtf32=0` (FA3 mode only; `MORPHX_FI_NVCC_DIV`) the clang build of FA3, FA2
+   and cascade is bitwise identical to stock nvcc; without them FA3 differs by up to 1.2e-4
+   and merge_state by 4.9e-4. The FA2-only build is left as it was.
+7. FA3 workspaces are keyed on a hash of `fi_clang_nvcc.py`
+   (`smsched-pass/build/flashinfer-ws-fa3-<hash>`), because flags the wrapper adds are
+   invisible to ninja. On hpcc the LLVM clang needs gcc 12.3's libstdc++ on `LD_LIBRARY_PATH`.
+
+**M1 (done): pass-built FA3 = stock nvcc FA3.** `fi_kernel_test.py` (ragged/paged FA3,
+FA2 decode, merge): bitwise identical to stock. Qwen3-8B fp16, sm90 mycutlass,
+`check_flashinfer_pass.py` (8 prompts, 48 tokens): 384/384 tokens, logits max |diff| 0.0000.
+
+**M2 (done): under the runtime.** Kernel test under `runtime/build-llm`: bitwise identical
+to no runtime. Qwen3-8B tokens 384/384 identical to stock FA3 with the runtime (default CI),
+with everything forced onto SMs [0, 66) (`MORPHX_CI_THRESHOLD=0`, 3558 / 23110 launches
+CI-limited), and in the step benchmark; no faults or hangs. **Catch:** with the default 50 µs
+short-kernel bypass the FA3 prefill is never managed (502 of 504 launches bypassed): the
+bypass looks at the first profile wave, and a non-persistent FA3 wave (132 one-tile CTAs) takes
+~16 µs although the launch takes ~300 µs. New opt-in `MORPHX_SHORT_BYPASS_TOTAL=1`
+(`cuda-llm.cpp`): compare the first wave scaled to the whole grid instead. With it, 467 of 504
+FA3 launches are managed (2 profiled, 35 small ones bypassed), tokens still identical. It also
+makes more of the sm90 GEMMs managed (12958 vs 11226 managed launches in the step benchmark),
+so it is not on by default.
+
+**M3 (done): ragged prefill microbenchmark** (`fi_fa3_bench.py`, µs per launch, causal,
+Qwen3-8B heads; MorphX = `runtime/build` with the kernel whitelisted; "108"/"66" = confined
+to SMs [0, n) via a second registered stream, as in Track S):
+
+| shape | stock FA3 | stock FA2 | pass FA2: alone / MX132 / 108 / 66 | pass FA3 non-persistent: alone / MX132 / 108 / 66 | pass FA3 persistent: alone / MX132 / 108 / 66 |
+|---|---:|---:|---|---|---|
+| 4×2048 | 252 | 417 | 531 / 535 / 631 / 987 | 302 / 355 / 426 / 670 | 280 / 291 / 529 / 539 |
+| 1×8192 | 840 | 1522 | 1883 / 1868 / 2222 / 3446 | 917 / 960 / 1137 / 1798 | 891 / 905 / 1629 / 1674 |
+| 16×512 | 103 | 136 | 189 / 200 / 235 / 363 | 159 / 207 / 245 / 386 | 142 / 138 / 246 / 249 |
+| 1×1024 | 29 | 49 | 61 / 67 / 78 / 106 | 41 / 47 / 53 / 74 | 38 / 43 / 60 / 74 |
+
+Non-persistent FA3 scales with the SMs it gets (108: 1.13–1.20×, 66: 1.57–1.89× of its
+132-SM MorphX time; ideal 1.22 / 2.0); persistent FA3 confined to 108 SMs is as slow as on 66
+(132 fixed work lists on 108 SMs = two rounds), as predicted. Costs: the clang build of FA3 is
+6–38% slower than nvcc even as a plain kernel (persistent pass vs stock; not investigated), the
+non-persistent grid adds another 3–12%, MorphX management 5–30% (small shapes worst).
+Pass FA3 confined to 108 SMs is still faster than pass FA2 on the whole GPU, except at 16×512.
+
+**M4 (done): SGLang step times** (`check_flashinfer_pass.py --bench`: prefill step = 4×2048
+tokens, decode batch 16 at ctx 2048+, median ms; memcpy backend):
+
+| setup | prefill | decode |
+|---|---:|---:|
+| Sm80 + pass FA2, no runtime | 305.9 | 15.46 |
+| sm90 + stock nvcc FA3, no runtime | 219.5 | 12.92 |
+| sm90 + pass FA3, no runtime | 221.0 | 13.06 |
+| sm90 + pass FA3, runtime, no split (FA3 bypassed) | 227.2 | 14.82 |
+| sm90 + pass FA3, runtime, split 108 (FA3 bypassed) | 228.5 | 14.88 |
+| sm90 + pass FA3, runtime + `SHORT_BYPASS_TOTAL`, no split | 231.1 | 15.03 |
+| sm90 + pass FA3, runtime + `SHORT_BYPASS_TOTAL`, split 108 | 245.5 | 14.27 |
+| sm90 + pass FA3, runtime + `SHORT_BYPASS_TOTAL`, everything on 66 SMs | 344.3 | 15.90 |
+| Sm80 + pass FA2, runtime, no split / split 108 | 311.3 / 347.5 | 17.74 / 18.18 |
+
+Greedy tokens identical to the no-runtime run in every runtime row. The sm90 + FA3 stack is
+28% faster per prefill step and 15% per decode step than Sm80 + FA2, and the runtime costs it
++3–11% prefill / +9–16% decode (memcpy backend; gdr on nscc2b should be cheaper).
+
+**Not done / open.** The FP8 FA3 kernels (`quantization/prefill_sm90.cuh`) get the
+non-persistent grid but not the re-entrant drain: don't use FP8 KV with the pass. The
+persistent pass build is only checked in the kernel test and the microbenchmark. The short-bypass policy for many-block
+kernels (`MORPHX_SHORT_BYPASS_TOTAL`) needs a decision before Fig 13/14 runs. The clang-vs-nvcc
+FA3 slowdown (6–37% per kernel, ~1% per prefill step) is unexplained. No Fig 13/14 run with
+this stack yet; nothing was run on nscc2b (down).
+
+
+#### On nscc2b, threshold tuning and Fig 13/14 (2026-10-28, gdr)
+
+- **Build and checks** (job 196219, `fa3_checks.pbs` with `ENV_SCRIPT=scripts/ae/env-nscc2b.sh`):
+  - FA3 kernels are bitwise identical to stock, with and without the runtime.
+  - Qwen3-8B: 384/384 tokens identical, including with all managed launches on 66 SMs.
+- **nscc2b job-script needs** (fixed in 1c224e4, 8308474, 73280a9):
+  - no `module purge`, which drops gcc-native/14 and leaves system gcc 11 (clashes with the
+    runtime's C11 atomics);
+  - `cuda/13.0` and `cmake/4.3.4` loaded on separate lines (system cmake 3.x can't drive
+    clang CUDA);
+  - nsys from the HPC SDK.
+  - Delete stale `CMakeCache.txt` files from a failed configure.
+- **Threshold census** (job 196378, stream, nsys):
+  - Pass-built kernels are ~90% of GPU time.
+  - 80% of GPU time is in pass-built launches of at least 36 µs (in-2048-out-256, 9 req/s) or
+    49 µs (in-4096-out-128, 6 req/s), judged by whole-kernel duration.
+  - Chosen: `MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=35`.
+- **Check** (job 196395):
+  - Estimated managed share 73–87% at 35 µs, 69–79% at 50 µs whole-kernel, ~6% with the
+    default first-wave rule.
+  - Tokens identical.
+  - Decode step +12.5% and prefill +6% over no runtime (prefill +16% with split 108).
+- **Fig 13/14** (jobs 196338–196401; results in the main checkout's
+  `docs/pd-investigation/FIGURES.md`):
+  - MorphX at 35 µs is behind stream at 28/30 points (4–40%).
+  - Stream with high-priority decode (`MORPHX_DECODE_STREAM_PRIORITY=-5`) is the best series,
+    up to 47% faster than stream.
+- **Defaults are unchanged** (50 µs, first wave). Turning on the tuned threshold made MorphX
+  slower in Fig 13/14.
 
 ### Backlog
 

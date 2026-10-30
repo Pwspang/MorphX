@@ -1,0 +1,120 @@
+#!/bin/bash
+# nscc2b: Fig 13 request-rate sweep to saturation, stream vs MorphX + MORPHX_PROFILE_PER_GRID=1,
+# pass-built FlashInfer + sm90 mycutlass (microbench/build-model-sm90, built by n_fig13_fi_sm90.pbs;
+# FA2 in jobs 192556-192663, FA3 prefill since the 2026-10-28 default change: MORPHX_LEGACY_SM80_FA2=1 for FA2),
+# split 108, default CI, 60 s per point. One length per job; rates = BASES x SCALE (Fig 13
+# rows), then EXTRA "scale:base" pairs; stops after the first rate where both variants are
+# saturated (TTFT avg > SAT_TTFT s, avg s/token > SAT_X x stream's first-rate avg, or under 50%
+# of the generated requests served within the run).
+#   qsub -v LEN=in-2048-out-256,SCALE=6,BASES="1 2 3 4 5",EXTRA="12:3 12:4 12:5",PARTS="libcheck sweep" scripts/baselines/n_fig13_sweep_sm90.pbs
+#   qsub -v LEN=in-4096-out-128,SCALE=5,BASES="1 1.5 2 2.5 3",EXTRA="10:2 10:2.5 10:3" scripts/baselines/n_fig13_sweep_sm90.pbs
+#PBS -N mx13-sweep
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=00:45:00
+#PBS -j oe
+set -uo pipefail
+: "${LEN:?set LEN, e.g. in-2048-out-256}"
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261027-fi-pass/sweep-$LEN-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0
+[[ -n "${CUDA_HOME:-}" ]] || { echo "module load cuda/13.0 failed"; exit 1; }
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+SM80=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
+SM90=$R/microbench/build-model-sm90
+export MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1
+PARTS=${PARTS:-sweep}
+SCALE=${SCALE:-5}; BASES=${BASES:-"1 1.5 2 2.5 3"}; EXTRA=${EXTRA:-}
+SAT_TTFT=${SAT_TTFT:-5}; SAT_X=${SAT_X:-4}
+SPLIT=${SPLIT:-108}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+RTB=$R/runtime/build-llm
+HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpreload.so"
+echo "== host=$(hostname) job=${PBS_JOBID:-} head=$(git log --oneline -1 | cut -c1-60) len=$LEN scale=$SCALE bases=$BASES extra=$EXTRA parts=$PARTS"
+[[ -f $SM90/libmycutlass.so && -f $RTB/libcuda.so && -f smsched-pass/build/libsmsched.so ]] || { echo "missing sm90 lib, runtime or pass"; exit 1; }
+
+if [[ " $PARTS " == *" libcheck "* ]]; then
+  echo "== libcheck $(date +%T)"
+  for lib in sm80 sm90; do
+    [[ $lib == sm80 ]] && d=$SM80 || d=$SM90
+    MYCUTLASS_LIB_DIR=$d timeout -k 10 300 python scripts/sglang/mycutlass_libcheck.py --out "$OUT/lib-$lib.pt" > "$OUT/libcheck-$lib.log" 2>&1
+    echo "-- $lib rc=$?"; grep -E "^\[lib\] (loaded|kernel)" "$OUT/libcheck-$lib.log" | cut -c1-200
+    grep -E "^\[lib\] N=" "$OUT/libcheck-$lib.log" | awk '{print $0}' | head -30
+  done
+  timeout 120 python scripts/sglang/mycutlass_libcheck.py --compare "$OUT/lib-sm80.pt" "$OUT/lib-sm90.pt"
+  for lib in sm80 sm90; do
+    [[ $lib == sm80 ]] && d=$SM80 || d=$SM90
+    MYCUTLASS_LIB_DIR=$d timeout -k 10 400 python scripts/sglang/check_mycutlass.py --model "$MODEL" > "$OUT/check-mycutlass-$lib.log" 2>&1
+    echo "-- check_mycutlass $lib rc=$?"; grep -E "^\[layer\] worst|^\[e2e\] (prefill|greedy|torch|mycutlass)" "$OUT/check-mycutlass-$lib.log" | cut -c1-220
+    MYCUTLASS_LIB_DIR=$d timeout -k 10 400 python scripts/sglang/check_flashinfer_pass.py --model "$MODEL" --out "$OUT/fi-$lib.pt" > "$OUT/check-fi-$lib.log" 2>&1
+    echo "-- check_flashinfer_pass $lib rc=$? $(grep -E '^\[fi\] libmycutlass mapped' "$OUT/check-fi-$lib.log" | cut -c1-300)"
+  done
+  timeout 120 python scripts/sglang/check_flashinfer_pass.py --compare "$OUT/fi-sm80.pt" "$OUT/fi-sm90.pt" | grep "^\[cmp\]"
+  echo "== libcheck done $(date +%T)"
+fi
+
+# row <dir>: "avg p99 ttft_avg served_fraction" of the run (stream or MorphX column)
+row() {
+  python - "$1" <<'EOF'
+import csv, glob, re, sys
+vals = ["nan", "nan", "nan"]
+for f in glob.glob(sys.argv[1] + "/tables/*.tsv"):
+    r = list(csv.DictReader(open(f), delimiter="\t"))
+    if r:
+        for v in ("stream", "MorphX"):
+            if r[0].get(f"{v}(avg)"):
+                vals = [r[0][f"{v}(avg)"], r[0][f"{v}(p99)"], r[0][f"{v}(ttft_avg)"]]
+# fraction of the generated requests served within the run (the driver's [final] line)
+frac = "nan"
+for f in glob.glob(sys.argv[1] + "/logs/pd-online/*/*/*.log"):
+    m = re.search(r"requests served: (\d+), total time: [\d.]+s, generated: (\d+)", open(f, errors="ignore").read())
+    if m:
+        frac = "%.2f" % (int(m.group(1)) / max(1, int(m.group(2))))
+print(*vals, frac)
+EOF
+}
+
+if [[ " $PARTS " == *" sweep "* ]]; then
+  pairs=""
+  for b in $BASES; do pairs="$pairs $SCALE:$b"; done
+  pairs="$pairs $EXTRA"
+  first_stream=""
+  for p in $pairs; do
+    s=${p%%:*}; b=${p#*:}
+    rate=$(python -c "v=$s*$b; print(int(round(v)) if abs(v-round(v))<1e-9 else ('%.3f' % v).rstrip('0').rstrip('.'))")
+    sat=0
+    for v in stream smsched; do
+      d="$OUT/rps-$rate-$v"
+      args=(python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}" --rps-scale "$s"
+            --only-table Figure13 --only-config "Figure13:$LEN-rps-$rate" --only-variant "$v" --no-update-latest-link
+            --run-timeout 300 --output-dir "$d")
+      [[ $v == smsched ]] && args+=(--override-split-hint "$SPLIT"
+            --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 MORPHX_PROFILE_PER_GRID=1")
+      timeout -k 10 420 "${args[@]}" > "$d.log" 2>&1
+      rc=$?
+      read -r avg p99 ttft served < <(row "$d")
+      echo "-- $LEN rps=$rate $v rc=$rc avg=$avg p99=$p99 ttft=$ttft served_frac=$served $(date +%T)"
+      [[ $v == stream && -z $first_stream ]] && first_stream=$avg
+      for f in "$d"/logs/pd-online/*/*/*.err; do
+        [[ -f $f ]] || continue
+        grep -h "MorphX-profile\] \(summary\|per-grid\)" "$f" | sed 's/.*\] /   /'
+        grep -h "MorphX-profile\] kernel" "$f" | grep -i "flashinfer" | sed -E 's/.*\] kernel /   fi: /' | cut -c1-170
+        grep -hE "Traceback|Error" "$f" | head -3
+      done
+      if python -c "import math,sys; a,t,f,s=float('$avg'),float('$ttft'),float('${first_stream:-nan}'),float('$served'); sys.exit(0 if (t>$SAT_TTFT or a>$SAT_X*f or s<0.5) else 1)" 2>/dev/null; then
+        sat=$((sat + 1))
+      fi
+    done
+    if [[ $sat == 2 ]]; then echo "== both variants saturated at rps $rate; skipping higher rates"; break; fi
+  done
+fi
+echo "== done $(date +%T)"

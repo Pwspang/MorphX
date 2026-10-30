@@ -21,7 +21,9 @@ module load cuda/13.0
 source /opt/rh/gcc-toolset-13/enable
 source "${SGLANG_ENV:-$HOME/morphx/envs/sglang-stock}/bin/activate"
 cd "$PBS_O_WORKDIR"
-export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/MorphX/microbench/build-model}
+# Track J4 ran the Sm80 library from the main checkout; env-h100.sh now defaults to this
+# checkout's sm90 library (MORPHX_LEGACY_SM80_FA2=1 for the old one)
+[[ "${MORPHX_LEGACY_SM80_FA2:-0}" == 1 ]] && export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/MorphX/microbench/build-model}
 source scripts/ae/env-h100.sh
 export MORPHX_PYTHON="$(command -v python)"
 if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi

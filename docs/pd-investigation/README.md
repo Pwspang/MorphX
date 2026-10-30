@@ -97,11 +97,15 @@ verification are in ../HOPPER_PD_ANALYSIS.md, under *Correction and fix*.
 **Decision (2026-10-28, revised): the default setup becomes sm90 GEMMs + pass-built FA3.**
 - This replaces the earlier same-day "Sm80 only" decision. Sm80 + FA2 stays available as a
   legacy option.
-- FA3 through the MorphX pass is being built on branch `fa3-pass` (hpcc). The defaults flip
-  once tokens match under the runtime.
-- Results so far use Sm80 + FA2 (Fig 13/14 after the fix) or sm90 + FA2 (earlier sweeps).
-- Caveat: with sm90 GEMMs most kernels fall under MorphX's 50 µs short-kernel cutoff, so
-  MorphX manages few launches.
+- Done: FA3 through the pass was built on branch `fa3-pass` and the defaults flipped (cf1af6d).
+  `fa3-pass` was merged into `h100-port-s-sm90` on 2026-10-30, which is now the branch for
+  native (sm90 + FA3) MorphX.
+- Attention follows stock SGLang's FlashInfer choices: FA3 for ragged prefill, FA2 for paged
+  prefill and decode.
+- Caveat: with sm90 GEMMs most kernels fall under MorphX's 50 µs short-kernel cutoff (default,
+  first-wave rule), so MorphX manages few launches. The tuned setting
+  `MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=35` manages 73–87% of GPU time but made
+  MorphX slower in Fig 13/14 (row 18), so it stays opt-in.
 
 - **Overload test (Sm80, H200 and A100):** run stream vs MorphX at loads matching the paper's (stream TTFT in seconds, 50–60% of requests served), 3 repeats × 180 s, ~1.5–2 GPU-hours per GPU. The paper's wins are all in that regime; our runs so far were lighter.
 
@@ -118,7 +122,7 @@ verification are in ../HOPPER_PD_ANALYSIS.md, under *Correction and fix*.
 
 ## Where things are
 
-- **Branches (local only, not pushed):**
+- **Branches** (`h100-port-s-sm90` and `fa3-pass` are pushed; the rest are local):
   - `h100-port`, `h100-port-s-sm90`, `track-s-phase2` (sm90 library);
   - `h100-port-bf16-mycutlass`, `h100-port-flashinfer-pass`, `h100-port-fi-sm90`;
   - `pd-blocking-analysis` (nsys analysis, priority and trace jobs);

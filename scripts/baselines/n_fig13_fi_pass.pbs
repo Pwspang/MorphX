@@ -1,0 +1,94 @@
+#!/bin/bash
+# nscc2b: Fig 13 stream vs MorphX with pass-built FlashInfer (MORPHX_FLASHINFER_PASS=1)
+# + mycutlass fp16, default MorphX settings (split hint 108, default CI), 60 s per point;
+# MorphX once as is and once with per-(name, grid) profiling (MORPHX_PROFILE_PER_GRID=1).
+#   cd ~/scratch/morphx/trackFI
+#   qsub scripts/baselines/n_fig13_fi_pass.pbs
+#   qsub -v CONFIGS="Figure13:in-2048-out-256-rps-9",VARIANTS="smsched-grid" scripts/baselines/n_fig13_fi_pass.pbs
+# Steps (each under a timeout; log tee'd live to $OUT/job-<id>.log):
+#   build    runtime/build-llm (gdr) unless SKIP_BUILD=1; the pass build and the
+#            FlashInfer JIT cache (smsched-pass/build) are reused, or built if missing
+#   prebuild FlashInfer JIT (check_flashinfer_pass.py, no runtime), then greedy tokens
+#            under the runtime, default and per-grid profiling
+#   runs     per config: stream, smsched (MorphX), smsched-grid (MorphX + per-grid)
+#PBS -N mx13-fi-pass
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261027-fi-pass/fig13-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0 cmake/4.3.4
+[[ -n "${CUDA_HOME:-}" ]] || { echo "module load cuda/13.0 failed"; exit 1; }
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+# libmycutlass: default sm90 (env-h100.sh: <checkout>/microbench/build-model-sm90, with pass FA3);
+# MORPHX_LEGACY_SM80_FA2=1: the main checkout's Sm80 library (read-only) + pass FA2, as in 2026-10-27
+[[ "${MORPHX_LEGACY_SM80_FA2:-0}" == 1 ]] && export MYCUTLASS_LIB_DIR=${MYCUTLASS_LIB_DIR:-$HOME/scratch/morphx/MorphX/microbench/build-model}
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+export MORPHX_FLASHINFER_PASS=1
+J=${NCPUS:-16}
+export MAX_JOBS=$J
+CONFIGS=${CONFIGS:-"Figure13:in-4096-out-128-rps-6 Figure13:in-4096-out-256-rps-6 Figure13:in-2048-out-256-rps-9"}
+VARIANTS=${VARIANTS:-"stream smsched smsched-grid"}
+SPLIT=${SPLIT:-108}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+RTB=$R/runtime/build-llm
+HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpreload.so"
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+echo "== host=$(hostname) job=${PBS_JOBID:-} ncpus=$J head=$(git log --oneline -1 | cut -c1-60) configs=$CONFIGS variants=$VARIANTS split=$SPLIT"
+
+step() {  # name timeout cmd...
+  local name=$1 t=$2; shift 2
+  echo "-- $name $(date +%T)"
+  if ! timeout -k 10 "$t" "$@" > "$OUT/build-$name.log" 2>&1; then
+    echo "FAILED: $name"; grep -E "error" "$OUT/build-$name.log" | head -20; tail -5 "$OUT/build-$name.log"; exit 1
+  fi
+}
+if [[ ! -f smsched-pass/build/libsmsched.so ]]; then
+  step pass-config 300 cmake -S smsched-pass -B smsched-pass/build -DLLVM_DIR="$MORPHX_LLVM_ROOT/lib/cmake/llvm"
+  step pass 600 cmake --build smsched-pass/build -j "$J"
+fi
+if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
+  rm -rf "$RTB"
+  step runtime-config 300 cmake -S runtime -B "$RTB" -DUSE_CUDA_LLM=ON -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+  step runtime 600 cmake --build "$RTB" -j "$J"
+  echo "runtime gdr imports: $(nm -D --undefined-only "$RTB/libcuda.so" | grep -cw gdr_open) $(date +%T)"
+fi
+
+# FlashInfer JIT (clang + pass) outside any measured window, then greedy tokens under the runtime.
+timeout -k 10 900 $CHECK --out "$OUT/pass.pt" > "$OUT/jit-prebuild.log" 2>&1
+echo "-- jit prebuild rc=$? $(grep -E '^\[fi\] (first|runner)' "$OUT/jit-prebuild.log" | tr '\n' ' ') $(date +%T)"
+for g in 0 1; do
+  env $HOOK MORPHX_PROFILE_PER_GRID=$g SMSCHED_PROFILE_LOG=1 timeout -k 10 600 $CHECK --out "$OUT/pass-rt-grid$g.pt" > "$OUT/check-rt-grid$g.log" 2>&1
+  echo "-- runtime check per_grid=$g rc=$? $(timeout 120 $CHECK --compare "$OUT/pass.pt" "$OUT/pass-rt-grid$g.pt" 2>&1 | grep 'greedy tokens') $(date +%T)"
+done
+
+for c in $CONFIGS; do
+  for v in $VARIANTS; do
+    args=(python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}"
+          --only-table "${c%%:*}" --only-config "$c" --only-variant "${v%%-*}" --no-update-latest-link --run-timeout 420
+          --output-dir "$OUT/${c#*:}-$v")
+    extra=; [[ $v == smsched-grid ]] && extra="MORPHX_PROFILE_PER_GRID=1"
+    [[ $v == smsched* ]] && args+=(--override-split-hint "$SPLIT"
+          --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1 $extra ${EXTRA_ENV:-}")
+    timeout -k 10 600 "${args[@]}" > "$OUT/${c#*:}-$v.log" 2>&1
+    echo "-- ${c#*:} $v rc=$? $(date +%T) $(tail -n +2 "$OUT/${c#*:}-$v"/tables/*.tsv 2>/dev/null | cut -f1-10 | head -n 1)"
+    for f in "$OUT/${c#*:}-$v"/logs/pd-online/*/*/*.err; do
+      [[ -f $f ]] || continue
+      grep -h "MorphX-profile\] \(summary\|per-grid\)" "$f" | sed 's/.*\] /   /'
+      grep -h "MorphX-profile\] kernel" "$f" | grep -iE "flashinfer" | sed -E 's/.*\] kernel /   fi: /' | cut -c1-230
+      grep -h "MorphX-profile\] kernel" "$f" | grep -v -i flashinfer | head -8 | sed -E 's/.*\] kernel /   gemm: /' | cut -c1-200
+      grep -hE "Traceback|Error" "$f" | head -3
+    done
+  done
+done
+echo "== done $(date +%T)"

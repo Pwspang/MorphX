@@ -1,0 +1,113 @@
+#!/bin/bash
+# nscc2b, one node: (1) FlashInfer cost check, stream only, Sm80 mycutlass fp16:
+# stock nvcc default (FA3 ragged prefill) vs stock nvcc FA2 vs pass-built FA2;
+# (2) sm90 mycutlass (CUTLASS 3 WGMMA/TMA, pass-built) + pass-built FlashInfer (FA2 in job
+# 192442; FA3 prefill since the 2026-10-28 default change, qsub -v MORPHX_LEGACY_SM80_FA2=1 for FA2): stream vs
+# MorphX + MORPHX_PROFILE_PER_GRID=1 vs MorphX, split 108, default CI. 60 s per point.
+#   cd ~/scratch/morphx/trackFI && qsub scripts/baselines/n_fig13_fi_sm90.pbs
+#   PARTS="fa sm90" (default); SM90_VARIANTS="stream smsched-grid smsched"
+# Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
+#PBS -N mx13-fi-sm90
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=01:15:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261027-fi-pass/fig13-sm90-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0 cmake/4.3.4
+[[ -n "${CUDA_HOME:-}" ]] || { echo "module load cuda/13.0 failed"; exit 1; }
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+source scripts/ae/env-nscc2b.sh
+export MORPHX_PYTHON="$(command -v python)"
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+J=${NCPUS:-16}
+export MAX_JOBS=$J
+unset MORPHX_FLASHINFER_PASS MORPHX_FLASHINFER_FA2
+# stock nvcc JIT output in this checkout too (MORPHX_FLASHINFER_PASS=1 runs use smsched-pass/build/flashinfer-ws)
+export FLASHINFER_WORKSPACE_BASE=$R/smsched-pass/fi-ws-stock
+SM80=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
+SM90=$R/microbench/build-model-sm90
+PARTS=${PARTS:-"fa sm90"}
+CONFIGS=${CONFIGS:-"Figure13:in-4096-out-128-rps-6 Figure13:in-4096-out-256-rps-6 Figure13:in-2048-out-256-rps-9"}
+SM90_VARIANTS=${SM90_VARIANTS:-"stream smsched-grid smsched"}
+SPLIT=${SPLIT:-108}
+MODEL=${MODEL:-$MORPHX_HF_CACHE/models--Qwen--Qwen3-8B/snapshots/2069b3fae1114555f3c020c81410e51fa0f656f2}
+RTB=$R/runtime/build-llm
+HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpreload.so"
+CHECK="python scripts/sglang/check_flashinfer_pass.py --model $MODEL"
+echo "== host=$(hostname) job=${PBS_JOBID:-} ncpus=$J head=$(git log --oneline -1 | cut -c1-60) parts=$PARTS"
+
+step() {  # name timeout cmd...
+  local name=$1 t=$2; shift 2
+  echo "-- $name $(date +%T)"
+  if ! timeout -k 10 "$t" "$@" > "$OUT/build-$name.log" 2>&1; then
+    echo "FAILED: $name"; grep -E "error" "$OUT/build-$name.log" | head -20; tail -5 "$OUT/build-$name.log"; exit 1
+  fi
+}
+[[ -f smsched-pass/build/libsmsched.so && -f "$RTB/libcuda.so" ]] || { echo "pass or runtime/build-llm missing"; exit 1; }
+
+# run <tag> <config> <variant: stream|smsched> [env...]: one Fig 13 point via run_pd_colocate_part2.py
+run() {
+  local tag=$1 c=$2 v=$3; shift 3
+  local d="$OUT/${c#*:}-$tag"
+  local args=(python scripts/ae/run_pd_colocate_part2.py --python "$MORPHX_PYTHON" --duration "${DURATION:-60}"
+        --only-table "${c%%:*}" --only-config "$c" --only-variant "$v" --no-update-latest-link --run-timeout 420 --output-dir "$d")
+  local extra=""
+  for e in "$@"; do [[ $e == MORPHX_PROFILE_PER_GRID=* ]] && extra="$extra $e"; done
+  [[ $v == smsched ]] && args+=(--override-split-hint "$SPLIT"
+        --smsched-env "$HOOK SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1$extra")
+  env "$@" timeout -k 10 600 "${args[@]}" > "$d.log" 2>&1
+  echo "-- ${c#*:} $tag rc=$? $(date +%T) $(tail -n +2 "$d"/tables/*.tsv 2>/dev/null | cut -f1-16 | head -n 1)"
+  for f in "$d"/logs/pd-online/*/*/*.err; do
+    [[ -f $f ]] || continue
+    grep -h "MorphX-profile\] \(summary\|per-grid\)" "$f" | sed 's/.*\] /   /'
+    grep -h "MorphX-profile\] kernel" "$f" | grep -i flashinfer | sed -E 's/.*\] kernel /   fi: /' | cut -c1-200
+    grep -hE "Traceback|Error" "$f" | head -3
+  done
+}
+
+if [[ " $PARTS " == *" fa "* ]]; then
+  echo "== part 1: FlashInfer cost, stream only, Sm80 mycutlass $(date +%T)"
+  for c in $CONFIGS; do
+    run stream-stock "$c" stream MYCUTLASS_LIB_DIR=$SM80
+    run stream-stockfa2 "$c" stream MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_FA2=1
+    # pass-built FA2 (the 2026-10-27 study): the legacy setup since FA3 became the default
+    run stream-pass "$c" stream MYCUTLASS_LIB_DIR=$SM80 MORPHX_FLASHINFER_PASS=1 MORPHX_LEGACY_SM80_FA2=1
+  done
+fi
+
+if [[ " $PARTS " == *" sm90 "* ]]; then
+  echo "== part 2: sm90 mycutlass $(date +%T)"
+  rm -rf "$SM90"
+  step sm90-config 300 cmake -S microbench -B "$SM90" -DSMSCHED_ENABLE_PASS=ON -DSMSCHED_LLVM_ROOT="$MORPHX_LLVM_ROOT" \
+    -DMORPHX_MYCUTLASS_ARCH=sm90 -DMORPHX_CUDA_ARCH=90a -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT"
+  step sm90 1200 cmake --build "$SM90" --target mycutlass -j "$J" --verbose
+  echo "sm90 compile commands with the hand-off barrier flag: $(grep -c 'smsched-smem-handoff-barriers' "$OUT/build-sm90.log") (of $(grep -c 'my_cutlass_gemm_sm90.cu' "$OUT/build-sm90.log") lines naming the source)"
+  grep -m1 'smsched-smem-handoff-barriers' "$OUT/build-sm90.log" | grep -oE "\-fpass-plugin=[^ ]+|-mllvm -smsched-smem-handoff-barriers|--cuda-gpu-arch=[^ ]+" | tr '\n' ' '; echo
+  echo "patched kernels in sm90 lib: $(cuobjdump -symbols "$SM90/libmycutlass.so" | grep -c '_pk$') $(date +%T)"
+  # tokens: sm90 no runtime vs Sm80 (reference) and vs sm90 under the runtime (per-grid on)
+  MORPHX_FLASHINFER_PASS=1 MYCUTLASS_LIB_DIR=$SM90 timeout -k 10 900 $CHECK --out "$OUT/sm90.pt" > "$OUT/check-sm90.log" 2>&1
+  echo "-- sm90 check rc=$? $(date +%T)"
+  MORPHX_FLASHINFER_PASS=1 MYCUTLASS_LIB_DIR=$SM80 timeout -k 10 900 $CHECK --out "$OUT/sm80.pt" > "$OUT/check-sm80.log" 2>&1
+  echo "-- sm80 check rc=$? $(date +%T)"
+  env MORPHX_FLASHINFER_PASS=1 MYCUTLASS_LIB_DIR=$SM90 MORPHX_PROFILE_PER_GRID=1 $HOOK timeout -k 10 600 $CHECK --out "$OUT/sm90-rt.pt" > "$OUT/check-sm90-rt.log" 2>&1
+  echo "-- sm90 runtime check rc=$? $(date +%T)"
+  for p in "sm80 sm90" "sm90 sm90-rt"; do set -- $p; timeout 120 $CHECK --compare "$OUT/$1.pt" "$OUT/$2.pt" 2>&1 | grep -E "greedy|logits"; done
+  for c in $CONFIGS; do
+    for v in $SM90_VARIANTS; do
+      case $v in
+        stream) run sm90-stream "$c" stream MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1 ;;
+        smsched-grid) run sm90-smsched-grid "$c" smsched MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1 MORPHX_PROFILE_PER_GRID=1 ;;
+        smsched) run sm90-smsched "$c" smsched MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1 ;;
+      esac
+    done
+  done
+fi
+echo "== done $(date +%T)"

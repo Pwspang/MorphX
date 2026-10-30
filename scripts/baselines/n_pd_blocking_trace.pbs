@@ -1,0 +1,76 @@
+#!/bin/bash
+# nscc2b, one node: short nsys traces of the Fig 13 *Stream* variant (prefill thread, no
+# runtime) at a sane load, for scripts/analysis/nsys_pd_blocking.py (decode queueing delay
+# behind prefill = the most MorphX could win back in PD co-location).
+#   in-4096-out-128, 6 req/s, 30 s:
+#     sm90   sm90 mycutlass (CUTLASS 3) + pass-built FlashInfer: FA3 prefill / FA2 decode, the
+#            default since 2026-10-28 (job 192442 part 2 and job 194398 used pass-built FA2:
+#            qsub -v MORPHX_LEGACY_SM80_FA2=1 for that FlashInfer setup; the GEMM library stays $SM90)
+#     sm80   Sm80 mycutlass + stock FlashInfer (FA3 ragged)  (no-split job 190815's stream setup)
+#   <kernels>-hipri  the same with decode on a high-priority stream (MORPHX_DECODE_STREAM_PRIORITY)
+#   <kernels>-mx     MorphX (runtime/build-llm, split 108, default CI); sm90-mx adds per-grid
+#                    profiling (job 192442's smsched-grid)
+#   sm80-mxnosplit   MorphX with MORPHX_CI_THRESHOLD=2: nothing confined (job 190815)
+#   e.g. VARIANTS="sm80 sm80-hipri sm80-mxnosplit sm80-mx sm90 sm90-hipri sm90-mx"
+# Run from a checkout that has microbench/build-model-sm90 (pass FlashInfer JIT builds on first use):
+#   cd ~/scratch/morphx/trackFI && qsub -v ANALYSIS=<path to nsys_pd_blocking.py> <this file>
+# Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
+#PBS -N mx-pd-block
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=00:40:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261028-pd-blocking/trace-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+source scripts/ae/env-nscc2b.sh
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* ]]; then export CUDA_VISIBLE_DEVICES=0; fi
+unset MORPHX_FLASHINFER_PASS MORPHX_FLASHINFER_FA2
+export FLASHINFER_WORKSPACE_BASE=$R/smsched-pass/fi-ws-stock
+NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.11/compilers/bin/nsys}
+SM80=${SM80:-$HOME/scratch/morphx/MorphX/microbench/build-model}  # read-only, main checkout
+SM90=${SM90:-$R/microbench/build-model-sm90}
+VARIANTS=${VARIANTS:-"sm90 sm80"}
+ANALYSIS=${ANALYSIS:-$R/scripts/analysis/nsys_pd_blocking.py}
+RPS=${RPS:-6}; DUR=${DUR:-30}
+python -c "import json; json.dump({'time': $DUR, 'model': 'llama-3-8b', 'type': 'poisson', 'rps': $RPS, 'input_length': 4096, 'output_length': 128}, open('$OUT/cfg.json', 'w'))"
+echo "== host=$(hostname) job=${PBS_JOBID:-} head=$(git log --oneline -1 | cut -c1-60) variants=$VARIANTS rps=$RPS dur=$DUR"
+nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,power.draw --format=csv,noheader
+
+RTB=$R/runtime/build-llm
+MX="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so SMSCHED_SPLIT_HINT=${SPLIT:-108} SMSCHED_LLM_TRICK_MODE=0 SMSCHED_LLM_TRACE_LIMIT=0 SMSCHED_PROFILE_LOG=1"
+for v in $VARIANTS; do
+  case $v in
+    sm90*) e="MYCUTLASS_LIB_DIR=$SM90 MORPHX_FLASHINFER_PASS=1" ;;
+    sm80*) e="MYCUTLASS_LIB_DIR=$SM80" ;;
+  esac
+  pre=""
+  case $v in
+    sm90|sm80) ;;
+    *-hipri) e="$e MORPHX_DECODE_STREAM_PRIORITY=-5" ;;
+    sm90-mx) e="$e $MX MORPHX_PROFILE_PER_GRID=1"; pre=$RTB/libcuda.so:$RTB/libpreload.so ;;
+    sm80-mx) e="$e $MX"; pre=$RTB/libcuda.so:$RTB/libpreload.so ;;
+    sm80-mxnosplit) e="$e $MX MORPHX_CI_THRESHOLD=2"; pre=$RTB/libcuda.so:$RTB/libpreload.so ;;
+    *) echo "unknown variant $v"; continue ;;
+  esac
+  echo "-- trace $v $(date +%T) ($e${pre:+ LD_PRELOAD=$pre})"
+  # The hook is preloaded inside the target only, ahead of nsys's own injection library.
+  env $e VLLM_PREFILL_THREAD=1 MX_PRE="$pre" timeout -k 10 300 "$NSYS" profile -t cuda -o "$OUT/stream-$v" -f true \
+    bash -c 'export LD_PRELOAD="$MX_PRE${MX_PRE:+${LD_PRELOAD:+:}}${LD_PRELOAD:-}"; exec python scripts/test-pd-online.py "$1"' _ "$OUT/cfg.json" \
+    > "$OUT/stream-$v.log" 2> "$OUT/stream-$v.err"
+  echo "nsys $v rc=$? $(date +%T) $(grep '^\[final\]' "$OUT/stream-$v.log" | grep -E 'TBT|served|first token' | tr '\n' ' ' | cut -c1-300)"
+  grep -h "MorphX-profile\] summary" "$OUT/stream-$v.err" | sed 's/.*\] /   /'
+  grep -hE "Traceback|Error" "$OUT/stream-$v.err" | head -3
+  timeout 300 "$NSYS" export -t sqlite -o "$OUT/stream-$v.sqlite" -f true "$OUT/stream-$v.nsys-rep" > /dev/null 2>&1
+  echo "export $v rc=$? $(date +%T)"
+done
+[[ -f $ANALYSIS ]] && timeout 300 python -I "$ANALYSIS" "$OUT"/stream-*.sqlite --out "$OUT/analysis" 2>&1
+echo "== done $(date +%T)"

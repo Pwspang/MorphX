@@ -45,6 +45,16 @@ Function* getNVVMFunc(Module *M, LLVMContext &ctx, const std::string &Name, Type
 
 cl::opt<bool> EnableDumpIR("enable-dump-ir", cl::desc("Enable dumping of IR"), cl::init(false));
 cl::opt<std::string> DumpIRDir("dump-ir-dir", cl::desc("Directory to dump IR"), cl::init("."));
+// Word 0 of dynamic smem carries the next logical block id from thread 0 to the
+// rest of the block. Kernels that use dynamic smem from their first instructions
+// (FlashInfer attention, CUTLASS 3 sm90) can overwrite it before every thread has
+// read it, or thread 0 can overwrite it while other threads still read the
+// previous body's smem. This adds a barrier after the id load and one before
+// thread 0 publishes the next id. Off by default: the existing pass-built
+// kernels (mycutlass) keep their code unchanged. Same change as Track S
+// (h100-port-s-sm90, afe2dc3), opt-in here.
+cl::opt<bool> SmemHandoffBarriers("smsched-smem-handoff-barriers",
+	cl::desc("Barrier around the dynamic-smem word-0 block-id hand-off"), cl::init(false));
 
 void checkAndWriteIR(Module &M, std::string prefix) {
 	if(!EnableDumpIR)
@@ -358,11 +368,6 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		Builder.CreateAlignedStore(atomicAdd, castStore, Align(4), false);
 		Builder.CreateBr(blockCheckBlock);
 
-		// Word 0 of dynamic smem belongs to the kernel (CUTLASS 3 sm90 kernels keep
-		// tiles or pipeline mbarriers there), so it is only ours between bodies:
-		// block_fin waits for every thread to finish the previous body before
-		// thread 0 writes the id, and the barrier after the load keeps the next
-		// body from writing word 0 before every thread has read the id.
 		auto createBarrier0 = [&]() {
 			CallInst *callBarrier0 = hasBarrier0 ? Builder.CreateCall(barrier0)
 				: Builder.CreateCall(barrier0, {Builder.getInt32(0)});
@@ -372,7 +377,8 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		createBarrier0();
 		Value *castLoad = Builder.CreateAddrSpaceCast(dynSmem, PointerType::get(ctx, 0));
 		LoadInst *loadBlockId = Builder.CreateAlignedLoad(Type::getInt32Ty(ctx), castLoad, Align(4));
-		createBarrier0();
+		if(SmemHandoffBarriers)
+			createBarrier0();
 		Value *cmpBlockId = Builder.CreateICmpSLT(loadBlockId, nBlocks);
 		Builder.CreateCondBr(cmpBlockId, oEntry, blockRet);
 
@@ -431,7 +437,8 @@ PreservedAnalyses SMSchedPass::run(Module &M, ModuleAnalysisManager &AM) {
 		RItoErase.clear();
 
 		Builder.SetInsertPoint(blockFin);
-		createBarrier0();
+		if(SmemHandoffBarriers)
+			createBarrier0();
 		Builder.CreateCondBr(cmpThreadZ, blockFinAdd, blockCheckBlock);
 
 		Builder.SetInsertPoint(blockFinAdd);

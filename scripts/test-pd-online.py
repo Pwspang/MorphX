@@ -236,7 +236,9 @@ def initialize_engine(model, input_length, output_length, enable_chunked_prefill
 def main(data, enable_chunked_prefill: bool = False):
     total_time = data.get("time")
 
-    stream = torch.cuda.Stream()
+    # MORPHX_DECODE_STREAM_PRIORITY < 0 raises this (decode) stream above the prefill thread's
+    # priority-0 stream, so the hardware dispatches decode blocks first (Stream-variant control).
+    stream = torch.cuda.Stream(priority=int(os.environ.get("MORPHX_DECODE_STREAM_PRIORITY", "0")))
     with torch.cuda.stream(stream):
         engine = initialize_engine(
             data.get("model"),

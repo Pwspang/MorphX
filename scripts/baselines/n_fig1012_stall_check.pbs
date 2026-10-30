@@ -1,0 +1,44 @@
+#!/bin/bash
+# nscc2b, one node: do the Fig 10-12 in-process schedulers hit the cross-thread CUDA stall?
+# nsys traces of the "stream" scheduler (LLM thread + GGNN/matmul worker thread in one
+# process, as run_colocate_part1.py runs it) at llm-4-ggnn-8 and llm-4-mm-12, 30 s each,
+# from the AE checkout (the runner as used for the published Fig 10-12, before the fix),
+# then scripts/analysis/nsys_thread_stalls.py on each trace.
+#   cd ~/scratch/morphx/MorphX && qsub -v ANALYSIS=<path to nsys_thread_stalls.py> <this file>
+#PBS -N mx1012-stall
+#PBS -P 12004493
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=1:mem=120gb
+#PBS -l walltime=00:25:00
+#PBS -j oe
+set -uo pipefail
+R=${PBS_O_WORKDIR:-$PWD}
+OUT=${OUT:-$R/logs/20261028-fig1012-stall/trace-${PBS_JOBID%%.*}}
+mkdir -p "$OUT"
+exec > >(tee -a "$OUT/job-${PBS_JOBID:-$$}.log") 2>&1
+echo "== start $(hostname) $(date +%T) out=$OUT"
+type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+module load cuda/13.0
+cd "$R"
+source "${MORPHX_VENV:-$HOME/scratch/morphx/envs/sglang-stock}/bin/activate"
+source scripts/ae/env-nscc2b.sh
+export CUDA_VISIBLE_DEVICES=0
+NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.11/compilers/bin/nsys}
+ANALYSIS=${ANALYSIS:?set ANALYSIS}
+DUR=${DUR:-30}
+echo "== host=$(hostname) job=${PBS_JOBID:-} head=$(git log --oneline -1 | cut -c1-60) dur=$DUR"
+cd scripts/colocate
+run() {  # run <tag> <args...>
+  local tag=$1; shift
+  echo "-- $tag $(date +%T)"
+  timeout -k 10 400 "$NSYS" profile -t cuda -o "$OUT/$tag" -f true \
+    python run.py --enable-llm --model llama-3-8b --dataset sharegpt --input-length 2048 --output-length 2048 \
+    --rps 4 --time "$DUR" "$@" > "$OUT/$tag.log" 2> "$OUT/$tag.err"
+  echo "nsys $tag rc=$? $(date +%T) $(grep -iE 'p99|tpot|throughput|completed' "$OUT/$tag.log" | tail -3 | tr '\n' ' ' | cut -c1-300)"
+  timeout 300 "$NSYS" export -t sqlite -o "$OUT/$tag.sqlite" -f true "$OUT/$tag.nsys-rep" > /dev/null 2>&1
+  echo "export $tag rc=$?"
+}
+run stream-ggnn-8 --enable-ggnn --ggnn-rps 8 --ggnn-base-size 1000000 --ggnn-query-size 10000
+run stream-mm-12 --enable-mm --mm-rps 12 --mm-size 8192
+timeout 600 python -I "$ANALYSIS" "$OUT"/stream-*.sqlite 2>&1
+echo "== done $(date +%T)"

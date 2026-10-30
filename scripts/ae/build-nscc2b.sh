@@ -49,6 +49,13 @@ if [[ " $STEPS " == *" microbench "* ]]; then
        -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT" > "$L/mb.log" 2>&1 \
      && cmake --build microbench/build-model --target bench -j "$J" >> "$L/mb.log" 2>&1; then log "microbench ok"; else log "microbench FAILED"; grep -E "error" "$L/mb.log" | head -20; fail=1; fi
   log "patched kernels in libmycutlass: $(cuobjdump -symbols microbench/build-model/libmycutlass.so 2>/dev/null | grep -c _pk)"
+  # the LLM's default GEMM library since 2026-10-28 (env-h100.sh MYCUTLASS_LIB_DIR)
+  rm -rf microbench/build-model-sm90
+  if cmake -S microbench -B microbench/build-model-sm90 -DSMSCHED_ENABLE_PASS=ON -DSMSCHED_LLVM_ROOT="$MORPHX_LLVM_ROOT" \
+       -DMORPHX_MYCUTLASS_ARCH=sm90 -DMORPHX_CUDA_ARCH=90a \
+       -DMORPHX_SYNC_BACKEND="$MORPHX_SYNC_BACKEND" -DMORPHX_GDRCOPY_ROOT="$MORPHX_GDRCOPY_ROOT" > "$L/mb-sm90.log" 2>&1 \
+     && cmake --build microbench/build-model-sm90 --target mycutlass -j "$J" >> "$L/mb-sm90.log" 2>&1; then log "microbench sm90 ok"; else log "microbench sm90 FAILED"; grep -E "error" "$L/mb-sm90.log" | head -20; fail=1; fi
+  log "patched kernels in sm90 libmycutlass: $(cuobjdump -symbols microbench/build-model-sm90/libmycutlass.so 2>/dev/null | grep -c _pk)"
 fi
 
 if [[ " $STEPS " == *" tgs "* ]]; then

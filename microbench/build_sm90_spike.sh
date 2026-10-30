@@ -24,6 +24,6 @@ FLAGS=(-x cuda "$REPO/microbench/src/sm90_spike.cu"
     -DPFN_cuTensorMapEncodeIm2col=PFN_cuTensorMapEncodeIm2col_v12000
     -L"$CUDA/lib64" -lcudart -lcublas -lcuda -ldl -Wl,-rpath,"$CUDA/lib64")
 "$MORPHX_LLVM_ROOT/bin/clang++" "${FLAGS[@]}" -o "$OUT/sm90_spike-nopass" & p1=$!
-"$MORPHX_LLVM_ROOT/bin/clang++" "${FLAGS[@]}" -fplugin="$PASS" -fpass-plugin="$PASS" -o "$OUT/sm90_spike-pass" & p2=$!
+"$MORPHX_LLVM_ROOT/bin/clang++" "${FLAGS[@]}" -fplugin="$PASS" -fpass-plugin="$PASS" -mllvm -smsched-smem-handoff-barriers -o "$OUT/sm90_spike-pass" & p2=$!
 wait $p1; wait $p2
 cuobjdump -symbols "$OUT/sm90_spike-pass" | grep -c "_pk$" | sed 's/^/patched kernels: /'

@@ -38,7 +38,14 @@ export MORPHX_SYNC_BACKEND="${MORPHX_SYNC_BACKEND:-memcpy}"
 _morphx_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export MORPHX_LLM_BACKEND="${MORPHX_LLM_BACKEND:-sglang}"
 export MORPHX_LLM_GEMM="${MORPHX_LLM_GEMM:-mycutlass}"
-export MYCUTLASS_LIB_DIR="${MYCUTLASS_LIB_DIR:-${_morphx_repo}/microbench/build-model}"
+# Default (2026-10-28): the sm90 library (CUTLASS 3 WGMMA/TMA, microbench/build-model-sm90),
+# with pass-built FA3 when MORPHX_FLASHINFER_PASS=1 (scripts/sglang/flashinfer_pass.py).
+# MORPHX_LEGACY_SM80_FA2=1: the earlier setup, Sm80 library (microbench/build-model) + FA2.
+if [[ "${MORPHX_LEGACY_SM80_FA2:-0}" == 1 ]]; then
+  export MYCUTLASS_LIB_DIR="${MYCUTLASS_LIB_DIR:-${_morphx_repo}/microbench/build-model}"
+else
+  export MYCUTLASS_LIB_DIR="${MYCUTLASS_LIB_DIR:-${_morphx_repo}/microbench/build-model-sm90}"
+fi
 # Gated Llama weights aren't downloaded yet: every LLM experiment runs on Qwen3-8B.
 export MORPHX_MODEL_ALIASES="${MORPHX_MODEL_ALIASES-llama-3-8b=qwen3-8b,llama-2-7b=qwen3-8b}"
 # Fig 13-14: the A100 request rates leave the H200 lightly loaded; 3x puts the
