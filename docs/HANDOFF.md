@@ -110,8 +110,9 @@ Run directory: `nscc2b:~/scratch/morphx/MorphX/logs/20261026-nscc2b` (shards per
 locally. hpcc is no longer used.
 
 1. **Fig 11: did the LLM's own GEMMs get confined by MorphX?** The Fig 11 MorphX env is
-   `SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1`. In the paper the LLM's linear
-   layers were cuBLAS (vLLM fork), so only the background matmul matched. In this port SGLang's
+   `SMSCHED_TARGET_PATTERNS=half_t SMSCHED_ONLY_WHITELIST=1`. In the paper the LLM ran bf16 on
+   CUTLASS swapped into PyTorch for cuBLAS (§5.1), so presumably no `half_t` names and only the
+   background matmul matched (see "What the paper says" below). In this port SGLang's
    linear layers are mycutlass, whose 56 kernels all contain `half_t`, so the LLM's GEMMs were
    also confined to `[0, split)` and paid the patched-launch cost (~145 GEMMs/token). Observed
    (gdr, Fig 11(a)): MorphX 14.2 vs stream 9.9 ms/token at 3 mm/s (+43%); 68.7 vs 63.0 at
@@ -128,7 +129,7 @@ locally. hpcc is no longer used.
    interfering with kernel launches.
 3. **Fig 10/12: same question for the GGNN tables.** Their MorphX env uses the default
    whitelist (`ggnn5query`), so the LLM's GEMMs aren't confined, but they are still patched and
-   managed by MorphX (in the paper they were cuBLAS and untouched). Check the MorphX column when
+   managed by MorphX (the paper's were CUTLASS too, so likely the same). Check the MorphX column when
    the shards finish; a MorphX-only re-run with `SMSCHED_ONLY_WHITELIST=1` may be needed.
 4. **Where does the remaining per-launch cost go?** GDRCopy removed the host-side cost, but a
    patched launch still adds ~9–13 µs end to end (persistent agents = occupancy × 132 SMs,
@@ -199,6 +200,59 @@ locally. hpcc is no longer used.
   variants are within a few ms. MorphX beats neither stream nor baseline on any of the 30
   points: +5–15% per-token latency and +20–35 ms TTFT (e.g. 0.177 vs 0.153 s), i.e. its
   overhead with nothing to win back. Confirms the H200 needs the ×3 load to reach contention.
+
+- **MPS(6:4) for Fig 10–12** (`mps-60`, an extra scheduler in `run_colocate_part1.py`, also
+  plotted; jobs 192549/192550/192551/192555, `morphx-nscc2b-shard.pbs` with `ONLY_SCHEDULER=mps-60`, 60 s per
+  point; nscc2b `logs/20261027-mps60`, merged tables and figures locally in
+  `logs/20261027-mps60/{tables,figures}`, Fig 10 drawn without LithOS and all with
+  `--autoscale-x`). LLM P99 stays flat and lowest of all methods (ggnn ×1 12.2–13.1 ms,
+  ×4 14.0–14.6; mm ×1 12.3–14.2, ×4 14.6–19.7), but background throughput tops out lowest:
+  GGNN 1.26–1.29 and MM 1.38 ×10⁵ op/s, vs MPS-50 1.66–1.69 and MorphX 1.78–1.90. MorphX gets
+  7–12% more background throughput than MPS-50 at a somewhat higher P99; no method dominates.
+
+### nscc2b node hangs
+
+Jobs intermittently hang at start-up on some nscc2b nodes (0 CPU, no log, `qdel` hangs). The incident log with job IDs is `docs/nscc2b-node-issues.md`.
+
+### Runner stall fix (2026-10-28) — read before using any earlier Fig 13/14 number
+
+With the prefill thread, the decode thread sat in `cudaEventCreate` for the whole prefill
+forward. The prefill thread was meanwhile in the blocking pageable copy behind `tolist()`, so
+decode was effectively paused during every prefill on both GPUs.
+
+- Fixed in `scripts/sglang/runner.py` on branch `runner-stall-fix` (4804b97): reused
+  per-stream events, and a pinned copy plus event polling instead of blocking syncs.
+- Verified by job 195305: no stall; high-priority decode now cuts TBT 55%.
+- Earlier Fig 13/14 results predate the fix.
+- Details: `docs/HOPPER_PD_ANALYSIS.md`, *Correction and fix*. H200 rerun: jobs
+  195358–195363.
+- nscc2b `trackFI` is patched in place. No further A100 runs (decision 2026-10-28); the A100
+  results predate the fix.
+
+### Why Stream beats MorphX for PD on the H200
+
+The argument, the evidence behind each reason and the experiments still needed are in
+`docs/HOPPER_PD_ANALYSIS.md`.
+
+### What the paper says (SOSP'26 PDF, `3830418.3843904.pdf` in the repo root, untracked)
+
+- §5.1: A100-40GB; PyTorch 2.6.0, vLLM 0.8.1, FlashInfer 0.2.2, all compiled with Clang 21.
+  "Since the cuBLAS used in PyTorch is closed-source, we replace it with the open-source
+  CUTLASS, using the optimal operators from our profiling results." So the paper's linear
+  layers were CUTLASS for every variant, like this port. Differences: theirs is inside PyTorch,
+  bf16 (reference log `dtype=torch.bfloat16`), per-shape tuned; ours is fp16 mycutlass with a
+  fixed tile set. Their FlashInfer attention was pass-built; ours is the stock wheel, so decode
+  attention (memory-intensive) can't be morphed here.
+- §5.3: Fig 13 is Qwen2.5-7B, Fig 14 Llama-3-8B (here both Qwen3-8B). vLLM was modified to put
+  prefill and decode on separate streams; Stream is the same split scheduled by the hardware.
+- §5.4: in the Fig 14 workload MorphX saw 26 kernels; 5 had first-wave latency above 50 µs
+  (85% of GPU time; 3 memory-, 2 compute-intensive) and only those were morphed, the other 21
+  ran unmodified. The runtime has this filter (`short-bypass` at 50 µs in cuda-llm.cpp).
+  Here (diag-fig13-profile, in-4096-out-128): only 8 kernels are pass-built, all mycutlass
+  GEMMs; 7 pass the 50 µs filter (first wave 58–142 µs; the 64x64x64 tile at 35 µs is
+  bypassed). Only the 4096-token prefill GEMM reaches CI ≥ 0.9; the rest are 0.17–0.66. No
+  attention or other memory-intensive non-GEMM kernel is controllable.
+- §6: closed-source kernels can't be transformed; cuBLAS → CUTLASS is the stated workaround.
 
 ### Backlog
 
