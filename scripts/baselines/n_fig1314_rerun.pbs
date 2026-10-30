@@ -9,6 +9,8 @@
 #   cd ~/scratch/morphx/trackFI && qsub -v TABLE=Figure13,LEN=in-2048-out-256 <this file>
 # SMS_EXTRA adds MorphX env, e.g. SMS_EXTRA=MORPHX_SHORT_BYPASS_TOTAL=1 so the non-persistent
 # FA3 prefill is managed instead of short-bypassed (docs/HANDOFF.md, "FA3 through the pass").
+# MORPHX_SGLANG_ATTENTION=fa3 (qsub -v, with VARIANTS="baseline stream"): stock SGLang's Hopper
+# attention (sgl-kernel FA3 for prefill and decode, prebuilt), as a reference; GEMMs unchanged.
 # Every step under a timeout; log tee'd live to $OUT/job-<id>.log.
 #PBS -N mx1314-fix
 #PBS -P 12004493
@@ -42,7 +44,7 @@ HOOK="NEUTRINO_HOOK_DRIVER=$RTB/libcuda.so LD_PRELOAD=$RTB/libcuda.so:$RTB/libpr
 VARIANTS=${VARIANTS:-"baseline stream smsched"}
 grep -q "_wait_stream" scripts/sglang/runner.py || { echo "runner.py lacks the stall fix"; exit 1; }
 [[ -f $LIB/libmycutlass.so && -f $RTB/libcuda.so ]] || { echo "missing $LIB/libmycutlass.so or runtime"; exit 1; }
-echo "== host=$(hostname) job=${PBS_JOBID:-} table=$TABLE len=$LEN variants=$VARIANTS pd_scale=$MORPHX_PD_RPS_SCALE lib=$LIB legacy=${MORPHX_LEGACY_SM80_FA2:-0}"
+echo "== host=$(hostname) job=${PBS_JOBID:-} table=$TABLE len=$LEN variants=$VARIANTS pd_scale=$MORPHX_PD_RPS_SCALE lib=$LIB legacy=${MORPHX_LEGACY_SM80_FA2:-0} attention=${MORPHX_SGLANG_ATTENTION:-flashinfer}"
 
 vargs=()
 for v in $VARIANTS; do vargs+=(--only-variant "$v"); done

@@ -149,7 +149,7 @@ class SglangRunner:
         mem_fraction_static: float = 0.85,
         stream: Optional[torch.cuda.Stream] = None,
         gpu_id: int = 0,
-        attention_backend: str = "flashinfer",
+        attention_backend: Optional[str] = None,
         dtype: str = "auto",
         log_level: str = "error",
         gemm: Optional[str] = None,
@@ -157,6 +157,9 @@ class SglangRunner:
         chunked_prefill: bool = False,
         **server_kwargs,
     ):
+        # Attention: "flashinfer" (pass-buildable JIT) by default; MORPHX_SGLANG_ATTENTION=fa3 gives
+        # stock SGLang's Hopper default (sgl-kernel FA3, prebuilt, so never managed by MorphX)
+        attention_backend = attention_backend or os.environ.get("MORPHX_SGLANG_ATTENTION", "flashinfer")
         # Dense linear layers: "torch" (cuBLASLt) or "mycutlass" (pass-buildable CUTLASS, fp16 only)
         self.gemm = (gemm or os.environ.get("MORPHX_LLM_GEMM", "torch")).strip().lower()
         if self.gemm not in ("torch", "mycutlass"):
