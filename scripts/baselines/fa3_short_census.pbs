@@ -11,7 +11,9 @@
 #            MORPHX_SHORT_BYPASS_TOTAL=1 with MORPHX_SHORT_KERNEL_US=50 and =T: runtime counters
 #            (managed launches, est_managed_share); greedy tokens at T vs no runtime
 #   steps    check_flashinfer_pass --bench step times: no runtime, and the runtime at 50 us
-#            (first wave, the plain default), 50 us whole-kernel, T whole-kernel; no split / split 108
+#            (first wave, the paper's rule), 50 us whole-kernel, T whole-kernel; no split / split 108
+#   default  the runtime's own threshold (no MORPHX_SHORT_* env; 35 us whole-kernel on sm90):
+#            --bench step times and greedy tokens vs no runtime, split 108
 #PBS -N fa3-short
 #PBS -P fs_ccds_dmitrii.ustiugov
 #PBS -q gpu_free
@@ -107,5 +109,15 @@ if [[ " $PARTS " == *" steps "* ]]; then
     run "totalT-$s" $MX $e MORPHX_SHORT_BYPASS_TOTAL=1 MORPHX_SHORT_KERNEL_US=$T
   done
   for t in wave50-nosplit totalT-nosplit totalT-split108; do $CHECK --compare "$OUT/st-none.pt" "$OUT/st-$t.pt" | grep greedy; done
+fi
+if [[ " $PARTS " == *" default "* ]]; then
+  for tag in none rt; do
+    e=""; [[ $tag == rt ]] && e="$MX SMSCHED_SPLIT_HINT=108"
+    env $e timeout -k 10 600 $CHECK --bench --out "$OUT/def-$tag.pt" > "$OUT/def-$tag.log" 2>&1
+    echo "-- default $tag rc=$? $(grep '^\[bench\]' "$OUT/def-$tag.log" | sed -E 's/\(n=.*//' | tr '\n' ' ')"
+    grep -h "MorphX-profile\] summary" "$OUT/def-$tag.log" | sed 's/.*summary /   /'
+    grep -hE "Traceback|illegal|Error" "$OUT/def-$tag.log" | head -3
+  done
+  $CHECK --compare "$OUT/def-none.pt" "$OUT/def-rt.pt" | grep greedy
 fi
 echo "== done $(date +%T)"
