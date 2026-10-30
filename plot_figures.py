@@ -28,6 +28,7 @@ PART1_METHODS = [
     # Extra methods (run_colocate_part1.py EXTRA_SCHEDULERS); plotted when present.
     (("orion-rt",), "Orion-RT", "#e377c2", "*"),
     (("lithos",), "LithOS-style", "#17becf", "h"),
+    (("mps-60",), "MPS-60", "#bcbd22", "<"),
 ]
 
 AUTOSCALE_X = False

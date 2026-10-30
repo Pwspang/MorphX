@@ -58,9 +58,11 @@ SCHEDULERS = (
 #             top of --use-orion stream priorities.
 #   lithos:   LithOS-style kernel slicing (runtime/build-lithos, cuda-lithos.cpp)
 #             with the same single-process setup as smsched.
+#   mps-60:   MPS with 60% of the SMs for the LLM, 40% for the background task.
 EXTRA_SCHEDULERS = (
     "orion-rt",
     "lithos",
+    "mps-60",
 )
 ALL_SCHEDULERS = SCHEDULERS + EXTRA_SCHEDULERS
 RUNTIME_VARIANT_DIRS = {

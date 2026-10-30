@@ -85,3 +85,5 @@ nvbit-tutorial/tools/*
 nvbit-tutorial/tools/mem_trace/*.o
 nvbit-tutorial/tools/mem_trace/*.so
 docs/sglang-kernel-census*.raw.md
+
+3830418.3843904.pdf
